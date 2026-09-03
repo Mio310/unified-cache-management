@@ -17,7 +17,7 @@ try:
 except ImportError:
     PoolName = None
     PoolTransfer = Any
-    PoolTransferResult = Any
+    PoolTransferResult = None
 
 try:
     from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -27,6 +27,8 @@ except ImportError:
 from ucm.integration.sglang.ucm_connector import SglangUcmConnector
 
 logger = logging.getLogger(__name__)
+
+_KV_POOL_NAME = "kv"
 
 
 class UnifiedCacheStore(HiCacheStorage):
@@ -58,6 +60,75 @@ class UnifiedCacheStore(HiCacheStorage):
             )
         return self.connector
 
+    @staticmethod
+    def _pool_name_value(pool_name: Any) -> str:
+        return str(getattr(pool_name, "value", pool_name))
+
+    def _is_kv_pool(self, pool_name: Any) -> bool:
+        if PoolName is not None and pool_name == PoolName.KV:
+            return True
+        return self._pool_name_value(pool_name) == _KV_POOL_NAME
+
+    def _create_pool_connector(
+        self,
+        host_pool: HostKVCache,
+        pool_name: Any,
+    ) -> SglangUcmConnector:
+        store_dir = self._pool_name_value(pool_name)
+        logger.info(
+            "Creating SGLang UCM side-pool connector: pool=%s, store_dir=%s",
+            store_dir,
+            store_dir,
+        )
+        return SglangUcmConnector.from_hicache(
+            self.storage_config,
+            host_pool,
+            store_dir=store_dir,
+        )
+
+    def _get_pool_connector(self, pool_name: Any) -> SglangUcmConnector:
+        if self._is_kv_pool(pool_name):
+            return self._ensure_initialized()
+
+        pool_key = self._pool_name_value(pool_name)
+        pool_connector = self.pool_connectors.get(pool_key)
+        if pool_connector is None:
+            raise ValueError(f"Unregistered SGLang UCM pool: {pool_name}")
+        return pool_connector
+
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> Dict[Any, List[bool]]:
+        self._ensure_initialized()
+        results: Dict[Any, List[bool]] = {}
+        op = "set" if is_set else "get"
+        for transfer in transfers:
+            pool_name = transfer.name
+            keys = list(transfer.keys or [])
+            if not keys:
+                results[str(pool_name)] = []
+                continue
+
+            pool_connector = self._get_pool_connector(pool_name)
+            logger.debug(
+                "Routing SGLang UCM v2 transfer to connector: op=%s, pool=%s, keys=%s",
+                op,
+                self._pool_name_value(pool_name),
+                len(keys),
+            )
+            if is_set:
+                results[pool_name] = pool_connector.batch_set_v1(
+                    keys, transfer.host_indices, extra_info
+                )
+            else:
+                results[pool_name] = pool_connector.batch_get_v1(
+                    keys, transfer.host_indices, extra_info
+                )
+        return results
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
         if mem_pool_host.layout != "page_first":
@@ -75,23 +146,25 @@ class UnifiedCacheStore(HiCacheStorage):
         self.mem_pool_host = mem_pool_host
         if self.connector is None:
             self.connector = SglangUcmConnector.from_hicache(
-                self.storage_config, mem_pool_host, store_dir="kv"
+                self.storage_config, mem_pool_host, store_dir=_KV_POOL_NAME
             )
             self.store = self.connector.store
         else:
             self.connector.mem_pool_host = mem_pool_host
 
-    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+    def register_mem_host_pool_v2(
+        self, host_pool: HostKVCache, host_pool_name
+    ) -> None:
         if self._is_kv_pool(host_pool_name):
             logger.debug("Skipping duplicate SGLang UCM KV pool registration.")
             return
 
         pool_name = self._pool_name_value(host_pool_name)
         self.registered_pools[pool_name] = host_pool
-        pool_connector = self.pool_connectors.get(pool_name)
-        if pool_connector is None:
-            pool_connector = self._create_pool_connector(host_pool, host_pool_name)
-            self.pool_connectors[pool_name] = pool_connector
+        if pool_name not in self.pool_connectors:
+            self.pool_connectors[pool_name] = self._create_pool_connector(
+                host_pool, host_pool_name
+            )
         logger.info(
             "Registering SGLang UCM v2 mem pool: pool=%s, host_pool_type=%s, "
             "page_size=%s, store_dir=%s",
@@ -127,7 +200,7 @@ class UnifiedCacheStore(HiCacheStorage):
                 continue
             if final_pages == 0:
                 break
-            pool_pages = self._get_pool_connector(transfer.name).batch_exists(
+            pool_pages = self._get_pool_connector(transfer.name).batch_exists_reverse(
                 keys[:kv_pages], extra_info
             )
             if pool_pages:
@@ -157,73 +230,6 @@ class UnifiedCacheStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, is_set=True, extra_info=extra_info)
-
-    @staticmethod
-    def _pool_name_value(pool_name: Any) -> str:
-        return str(getattr(pool_name, "value", pool_name))
-
-    def _is_kv_pool(self, pool_name: Any) -> bool:
-        if PoolName is not None and pool_name == PoolName.KV:
-            return True
-        return self._pool_name_value(pool_name) == "kv"
-
-    def _create_pool_connector(
-        self,
-        host_pool: HostKVCache,
-        pool_name: Any,
-    ) -> SglangUcmConnector:
-        store_dir = self._pool_name_value(pool_name)
-        logger.info(
-            "Creating SGLang UCM side-pool connector: pool=%s, store_dir=%s",
-            self._pool_name_value(pool_name),
-            store_dir,
-        )
-        return SglangUcmConnector.from_hicache(
-            self.storage_config,
-            host_pool,
-            store_dir=store_dir,
-        )
-
-    def _get_pool_connector(self, pool_name: Any) -> SglangUcmConnector:
-        if self._is_kv_pool(pool_name):
-            return self._ensure_initialized()
-        pool_key = self._pool_name_value(pool_name)
-        pool_connector = self.pool_connectors.get(pool_key)
-        if pool_connector is None:
-            raise ValueError(f"Unregistered SGLang UCM pool: {pool_name}")
-        return pool_connector
-
-    def _batch_io_v2(
-        self,
-        transfers: List[PoolTransfer],
-        is_set: bool,
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ):
-        self._ensure_initialized()
-        results: dict = {}
-        for transfer in transfers:
-            pool_name = transfer.name
-            keys = list(transfer.keys or [])
-            if not keys:
-                results[str(pool_name)] = []
-                continue
-
-            pool_connector = self._get_pool_connector(pool_name)
-            logger.debug(
-                "Routing SGLang UCM v2 transfer to connector: op=%s, pool=%s, keys=%s",
-                "set" if is_set else "get",
-                self._pool_name_value(pool_name),
-                len(keys),
-            )
-            if is_set:
-                results[pool_name] = pool_connector.batch_set_v1(
-                    keys, transfer.host_indices, extra_info
-                )
-            else:
-                results[pool_name] = pool_connector.batch_get_v1(
-                    keys, transfer.host_indices, extra_info
-                )
-        return results
 
     def batch_get_v1(
         self,
@@ -296,15 +302,15 @@ class UnifiedCacheStore(HiCacheStorage):
         return False
 
     def close(self) -> None:
-        connector = self.connector
-        if connector is not None:
-            connector.close()
-        closed_connector_ids = set()
+        if self.connector is not None:
+            self.connector.close()
+
+        closed_ids = set()
         for pool_connector in self.pool_connectors.values():
             connector_id = id(pool_connector)
-            if connector_id in closed_connector_ids:
+            if connector_id in closed_ids:
                 continue
-            closed_connector_ids.add(connector_id)
+            closed_ids.add(connector_id)
             pool_connector.close()
 
     def get_stats(self):

@@ -41,7 +41,7 @@ def _safe_dir_segment(value: Any) -> str:
 
 
 def _storage_backends_for_store(base_backends: List[str], store_dir: str) -> List[str]:
-    backends = []
+    backends: List[str] = []
     for backend in base_backends:
         path = Path(backend) / store_dir
         path.mkdir(parents=True, exist_ok=True)
@@ -194,11 +194,10 @@ class SglangUcmConnector:
         ucm_store_config = UnifiedCacheStoreConfig.load_from_config(
             storage_config, mem_pool_host
         )
-        store_config = (
-            _config_for_store_dir(ucm_store_config.config, store_dir)
-            if store_dir is not None
-            else ucm_store_config.config
-        )
+        if store_dir is not None:
+            store_config = _config_for_store_dir(ucm_store_config.config, store_dir)
+        else:
+            store_config = ucm_store_config.config
         logger.info(
             "Creating SGLang UCM store: connector=%s, store_dir=%s, backends=%s",
             ucm_store_config.name,
@@ -314,6 +313,17 @@ class SglangUcmConnector:
 
         encoded_keys = self._encode_keys(self._get_physical_keys(keys))
         return self.store.lookup_on_prefix(encoded_keys) + 1
+
+    def batch_exists_reverse(
+        self, keys: List[str], extra_info: Optional["HiCacheStorageExtraInfo"] = None
+    ) -> int:
+        if not keys:
+            return 0
+        if self.is_mla and self.tp_rank != 0:
+            return len(keys)
+
+        encoded_keys = self._encode_keys(self._get_physical_keys(keys))
+        return self.store.lookup_on_reverse(encoded_keys) + 1
 
     def get_stats(self):
         return None
