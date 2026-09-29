@@ -25,6 +25,16 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ucm.integration.vllm.device import create_device
+from ucm.integration.vllm.qsa_layout import (
+    QSA_FORMAT,
+    QSARecord,
+    QSATopology,
+    common_resume_index,
+    layer_index,
+    make_qsa_records,
+    qsa_role,
+    raw_boundary_key,
+)
 from ucm.integration.vllm.request_hasher import RequestHasher
 from ucm.integration.vllm.ucm_connector import (
     KVCacheLayout,
@@ -69,6 +79,8 @@ class HLARequestDispatchMeta(RequestDispatchMeta):
 
     load_full_attn_count: int = 0
     dump_full_attn_count: int = 0
+    load_qsa_records: list[QSARecord] = field(default_factory=list)
+    dump_qsa_records: list[QSARecord] = field(default_factory=list)
 
 
 def layer_name_to_kv_cache_spec(
@@ -101,6 +113,32 @@ def block_size_from_kv_cache_spec(spec: KVCacheSpec) -> int:
         block_size = spec.block_size
 
     return block_size
+
+
+def qsa_topology(kv_cache_config) -> Optional[QSATopology]:
+    specs = layer_name_to_kv_cache_spec(kv_cache_config)
+    if not any(qsa_role(name) for name in specs):
+        return None
+    names = {
+        name
+        for name, entries in specs.items()
+        if not qsa_role(name) and any(isinstance(s, FullAttentionSpec) for s in entries)
+    }
+    topology = QSATopology(kv_cache_config, names)
+    main_size = block_size_from_kv_cache_spec(
+        kv_cache_config.kv_cache_groups[topology.main_group].kv_cache_spec
+    )
+    for roles in topology.roles.values():
+        compressed = specs[roles["compressed"][0]][0]
+        raw = specs[roles["raw"][0]][0]
+        ratio = getattr(compressed, "tokens_per_state", 1)
+        if compressed.block_size != main_size or main_size % ratio:
+            raise ValueError("QSA compressed pages must cover one main attention block")
+        if type(raw).__name__ != "CircularBufferSpec" or main_size % raw.block_size:
+            raise ValueError(
+                "QSA raw cache must be an aligned per-request circular buffer"
+            )
+    return topology
 
 
 def is_mamba_align_kv_cache_spec(spec: KVCacheSpec) -> bool:
@@ -143,10 +181,11 @@ class GroupInfo:
     seed: bytes
     is_mamba_align: bool = False
     block_hasher: Optional[Callable[["Request"], list[bytes]]] = None
+    is_auxiliary: bool = False
 
     @property
     def is_full_attention(self) -> bool:
-        return not self.is_mamba_align
+        return not self.is_mamba_align and not self.is_auxiliary
 
 
 class KVCacheGroupManager:
@@ -162,6 +201,23 @@ class KVCacheGroupManager:
         self.groups_by_id: list[GroupInfo] = []
         self.full_attn_groups: list[GroupInfo] = []
         self.state_groups: list[GroupInfo] = []
+        self.qsa = qsa_topology(kv_cache_config)
+        if self.qsa is not None:
+            # Include the ordered spec schema, but never allocation counts or
+            # physical addresses, in the persistent format namespace.
+            schema = tuple(
+                (name, tuple(repr(s) for s in specs))
+                for name, specs in sorted(
+                    layer_name_to_kv_cache_spec(kv_cache_config).items()
+                )
+            )
+            pages = tuple(
+                sorted(
+                    (tuple(sorted(t.shared_by)), t.size // kv_cache_config.num_blocks)
+                    for t in kv_cache_config.kv_cache_tensors
+                )
+            )
+            base_seed = request_hasher((QSA_FORMAT, base_seed, schema, pages))
 
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
@@ -174,15 +230,17 @@ class KVCacheGroupManager:
                 layer_names=tuple(group.layer_names),
                 seed=seed,
                 is_mamba_align=is_mamba_align,
+                is_auxiliary=self.qsa is not None
+                and group_id in self.qsa.auxiliary_groups,
             )
-            if not is_mamba_align:
+            if info.is_full_attention:
                 info.block_hasher = request_hasher.make_request_block_hasher(
                     block_size, seed
                 )
             self.groups_by_id.append(info)
             if info.is_full_attention:
                 self.full_attn_groups.append(info)
-            else:
+            elif info.is_mamba_align:
                 self.state_groups.append(info)
 
         assert len(self.full_attn_groups) >= 1, (
@@ -221,6 +279,8 @@ class KVCacheGroupManager:
 
     def compute_block_hashes(self, group: GroupInfo, request: "Request") -> list[bytes]:
         """Hash a request at one group's block boundaries and chain seed."""
+        if group.is_auxiliary:
+            return []
         if group.is_mamba_align:
             # mamba-align pads block table with null blocks; no per-block hash.
             return [b""] * (len(request.all_token_ids) // group.block_size)
@@ -344,6 +404,48 @@ class KVCacheGroupManager:
         # the rightmost hit.  The min across state groups is the rightmost
         # position where ALL states are present.
         total_hit_tokens = num_computed_tokens + external_hit_tokens
+
+        if getattr(self, "qsa", None) is not None:
+            positions = list(
+                range(
+                    num_computed_tokens + self.lcm_block_size,
+                    total_hit_tokens + self.lcm_block_size,
+                    self.lcm_block_size,
+                )
+            )
+            primary = self.full_attn_groups[0]
+            chains = [
+                [
+                    raw_boundary_key(
+                        self.request_hasher,
+                        group_block_ids[primary.group_id][
+                            pos // primary.block_size - 1
+                        ],
+                    )
+                    for pos in positions
+                ]
+            ]
+            chains.extend(
+                [
+                    self.compute_mamba_align_state_hash(sg, pos, group_block_ids)
+                    for pos in positions
+                ]
+                for sg in self.state_groups
+            )
+            try:
+                idx = common_resume_index(chains, lookup_on_reverse)
+            except Exception as e:
+                logger.error(f"QSA resume lookup failed: {type(e).__name__}: {e}")
+                _record_counter("connector_lookup_errors_total")
+                return 0, 0, []
+            if idx < 0:
+                return 0, 0, []
+            hit = positions[idx] - num_computed_tokens
+            return (
+                hit,
+                hit // self.lcm_block_size,
+                [key for chain in chains for key in chain[: idx + 1]],
+            )
 
         if not self.state_groups:
             return (
@@ -678,6 +780,10 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         block_stride_lists.append(sizes)
 
     def _build_layout(self, kvcaches):
+        self.qsa = qsa_topology(self.kv_cache_config)
+        if self.qsa is not None:
+            self._build_qsa_layout(kvcaches)
+            return
         base_ptrs = []
         buffer_size_rows = []
         tensor_size_lists = []
@@ -746,6 +852,114 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             block_stride_lists,
         )
 
+    def _build_qsa_layout(self, kvcaches):
+        if not current_platform.is_cuda_alike() or self.pp_size != 1:
+            raise ValueError(
+                "QSA HLA currently requires CUDA and pipeline_parallel_size=1"
+            )
+        self.use_layerwise = False
+        bases, buffers, sizes, strides = [], [], [], []
+        self.layer_name_to_row = {}
+        self.qsa_row_groups = []
+        device = None
+        seen = set()
+        main_tensors = [
+            t
+            for t in self.kv_cache_config.kv_cache_tensors
+            if any(not qsa_role(n) for n in t.shared_by)
+        ]
+        main_tensors.sort(key=lambda t: min(layer_index(n) for n in t.shared_by))
+        for raw_tensor in main_tensors:
+            names = [n for n in raw_tensor.shared_by if not qsa_role(n)]
+            if not names:
+                continue
+            if len(names) != len(raw_tensor.shared_by):
+                raise ValueError(
+                    "QSA side caches must use separate raw tensors from main KV"
+                )
+            _, ptrs = self._collect_shared_tensor_info(raw_tensor, kvcaches)
+            if not ptrs:
+                raise ValueError(f"Missing main KV tensor for {names}")
+            attn_layers = [
+                layer_index(n) for n in names if layer_index(n) in self.qsa.roles
+            ]
+            if len(attn_layers) != 1 or attn_layers[0] in seen:
+                raise ValueError(
+                    "Each QSA main row must contain exactly one full-attention layer"
+                )
+            index = attn_layers[0]
+            seen.add(index)
+            row = len(bases)
+            self._append_contiguous_page_layout(
+                raw_tensor, ptrs, bases, buffers, sizes, strides
+            )
+            roles = self.qsa.roles[index]
+            self.qsa_row_groups.append((roles["compressed"][1], roles["raw"][1]))
+            for role in ("compressed", "raw"):
+                name, _ = roles[role]
+                tensor = kvcaches[name]
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.shape[0] != self.num_blocks
+                ):
+                    raise ValueError(f"QSA cache must be a block-first tensor: {name}")
+                if not tensor[0].is_contiguous():
+                    raise ValueError(f"QSA block must be contiguous: {name}")
+                copy_bytes = tensor[0].numel() * tensor.element_size()
+                stride = tensor.stride(0) * tensor.element_size()
+                if copy_bytes <= 0 or stride < copy_bytes:
+                    raise ValueError(f"Invalid QSA block stride: {name}")
+                if device is not None and device != tensor.device:
+                    raise ValueError("QSA caches must share one CUDA device")
+                device = tensor.device
+                bases[-1].append(tensor.data_ptr())
+                buffers[-1].append((self.num_blocks - 1) * stride + copy_bytes)
+                sizes[-1].append(copy_bytes)
+                strides[-1].append(stride)
+            for name in names:
+                self.layer_name_to_row[name] = row
+        if seen != set(self.qsa.roles):
+            raise ValueError("QSA main rows do not cover all attention layers")
+        self._finalize_layout_arrays(bases, buffers, sizes, strides)
+        # Disjoint per-segment scratch. Loads use one record at a time so no
+        # concurrent DMA writes alias discard destinations.
+        tail_bytes = sum(sum(row[1:]) for row in sizes)
+        self.qsa_zero = torch.zeros(tail_bytes, dtype=torch.uint8, device=device)
+        self.qsa_discard = torch.empty(tail_bytes, dtype=torch.uint8, device=device)
+        self.qsa_padding_offsets = []
+        offset = 0
+        for row in sizes:
+            self.qsa_padding_offsets.append((offset, offset + row[1]))
+            offset += row[1] + row[2]
+
+    def extract_qsa_addrs(self, records: list[QSARecord], *, is_load=False):
+        if is_load and len(records) != 1:
+            raise ValueError("QSA loads must serialize records sharing discard memory")
+        ptrs = self.extract_block_addrs([record.main_block for record in records])
+        scratch = self.qsa_discard if is_load else self.qsa_zero
+        for i, record in enumerate(records):
+            if not 0 < record.main_block < self.num_blocks:
+                raise ValueError("Invalid QSA main physical block")
+            for row, (compressed_gid, raw_gid) in enumerate(self.qsa_row_groups):
+                start = self.row_slices[row].start
+                for slot, gid, blocks in (
+                    (1, compressed_gid, record.compressed),
+                    (2, raw_gid, record.raw),
+                ):
+                    column = start + slot
+                    block = blocks.get(gid) if record.attention else None
+                    if block is None:
+                        ptrs[i, column] = (
+                            scratch.data_ptr() + self.qsa_padding_offsets[row][slot - 1]
+                        )
+                    else:
+                        if not 0 < block < self.num_blocks:
+                            raise ValueError("Invalid QSA auxiliary physical block")
+                        ptrs[i, column] = int(self.base_ptrs[column]) + block * int(
+                            self.block_stride_lists[column]
+                        )
+        return np.ascontiguousarray(ptrs)
+
 
 class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
     """UCM connector for hybrid multi-group KV cache layouts.
@@ -789,6 +1003,16 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig",
     ):
+        self.qsa = qsa_topology(kv_cache_config)
+        if self.qsa is not None:
+            if (
+                not current_platform.is_cuda_alike()
+                or vllm_config.parallel_config.pipeline_parallel_size != 1
+                or vllm_config.model_config.is_deepseek_mla
+            ):
+                raise ValueError(
+                    "QSA HLA requires CUDA GQA/MHA with pipeline_parallel_size=1"
+                )
         super().__init__(
             vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
         )
@@ -887,6 +1111,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 gpu_kv_buffer_set.add(key)
                 gpu_kv_buffer_addrs.append(key[0])
                 gpu_kv_buffer_sizes.append(key[1])
+            if getattr(kv_cache_layout, "qsa", None) is not None:
+                for tensor in (kv_cache_layout.qsa_zero, kv_cache_layout.qsa_discard):
+                    gpu_kv_buffer_addrs.append(tensor.data_ptr())
+                    gpu_kv_buffer_sizes.append(tensor.numel() * tensor.element_size())
             config["gpu_kv_buffer_addrs"] = gpu_kv_buffer_addrs
             config["gpu_kv_buffer_sizes"] = gpu_kv_buffer_sizes
             if cpu_affinity_cores:
@@ -1169,7 +1397,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         if need_load and external_hit_lcm_blocks > 0:
             # Pass 1: full-attention blocks first (for MLA rank-0-only dump)
             for gid, group in enumerate(groups_by_id):
-                if group.is_mamba_align:
+                if not group.is_full_attention:
                     continue
                 load_tok_start = hbm_hit_tokens
                 load_tok_end = total_hit_tokens
@@ -1210,7 +1438,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
             # Pass 1: full-attention blocks first
             for gid, group in enumerate(groups_by_id):
-                if group.is_mamba_align:
+                if not group.is_full_attention:
                     continue
                 start_blk = dump_tok_start // group.block_size
                 end_blk = dump_tok_end // group.block_size
@@ -1241,6 +1469,45 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         else:
             dump_full_attn_count = 0
 
+        load_qsa_records = []
+        dump_qsa_records = []
+        if self.group_manager.qsa is not None:
+            topology = self.group_manager.qsa
+            primary = self.group_manager.full_attn_groups[0]
+            hashes = req_meta.group_ucm_block_ids[primary.group_id]
+            if load_ucm_block_ids:
+                load_ucm_block_ids, load_vllm_block_ids, load_qsa_records = (
+                    make_qsa_records(
+                        topology,
+                        self.request_hasher,
+                        load_ucm_block_ids,
+                        load_vllm_block_ids,
+                        hashes,
+                        req_meta.group_vllm_block_ids,
+                        total_hit_tokens // primary.block_size - 1,
+                        is_load=True,
+                    )
+                )
+            if dump_ucm_block_ids:
+                actual_end = req_meta.token_processed + new_tokens
+                raw_index = (
+                    actual_end // primary.block_size - 1
+                    if actual_end <= req_meta.num_token_ids
+                    and actual_end % primary.block_size == 0
+                    else None
+                )
+                dump_ucm_block_ids, dump_vllm_block_ids, dump_qsa_records = (
+                    make_qsa_records(
+                        topology,
+                        self.request_hasher,
+                        dump_ucm_block_ids,
+                        dump_vllm_block_ids,
+                        hashes,
+                        req_meta.group_vllm_block_ids,
+                        raw_index,
+                    )
+                )
+
         req_meta.token_processed += new_tokens
 
         return HLARequestDispatchMeta(
@@ -1248,6 +1515,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_block_ids=(dump_ucm_block_ids, dump_vllm_block_ids),
             load_full_attn_count=load_full_attn_count,
             dump_full_attn_count=dump_full_attn_count,
+            load_qsa_records=load_qsa_records,
+            dump_qsa_records=dump_qsa_records,
         )
 
     def build_connector_meta(
@@ -1362,8 +1631,51 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         scoped = [self.request_hasher(b) for b in ucm_ids]
         return ucm_ids, scoped, vllm_ids
 
+    def _start_load_qsa(self) -> None:
+        metadata = self._get_connector_metadata()
+        self.device.synchronize()
+        loaded_bytes = 0
+        for request_id, request in metadata.request_meta.items():
+            keys, blocks = request.load_block_ids
+            if not keys:
+                continue
+            try:
+                records = request.load_qsa_records
+                if len(records) != len(keys):
+                    raise ValueError("QSA load metadata does not match store keys")
+                _, scoped, _ = self._scope_blocks(keys, blocks, 0, is_dump=False)
+                # Serial completion bounds scratch memory and prevents older
+                # records from racing the final raw-ring restore.
+                for key, rank0_key, record in zip(scoped, keys, records):
+                    ptrs = self.kv_cache_layout.extract_qsa_addrs(
+                        [record], is_load=True
+                    )
+                    task = self._rank_consistency.submit_load(
+                        self.store,
+                        {request_id: [rank0_key]},
+                        [key],
+                        [0],
+                        ptrs,
+                    )
+                    self._rank_consistency.wait_load(task)
+                    loaded_bytes += self.block_data_size
+            except Exception as e:
+                logger.error(
+                    f"QSA load failed for {request_id}: {type(e).__name__}: {e}"
+                )
+                self._record_load_error(
+                    "connector_load_wait_errors_total",
+                    blocks + request.dump_block_ids[1],
+                )
+                self._connector_worker_meta.mark_failed(request_id)
+        if loaded_bytes:
+            ucmmetrics.update_stats({"load_bytes_total": loaded_bytes})
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Bulk load override: MLA blocks shared hash, KDA blocks per-rank hash."""
+        if self.qsa is not None:
+            self._start_load_qsa()
+            return
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
         request_to_task: dict[str, Task] = {}
@@ -1461,6 +1773,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         total_vllm_block_ids: list[int] = []
         block_ids_by_request: dict[str, set[bytes]] = {}
         num_saved_block = 0
+        qsa_records = []
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -1474,13 +1787,21 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             num_saved_block += len(scoped_ucm)
             total_ucm_block_ids.extend(scoped_ucm)
             total_vllm_block_ids.extend(scoped_vllm)
+            if self.qsa is not None:
+                if len(request.dump_qsa_records) != len(scoped_ucm):
+                    raise ValueError("QSA dump metadata does not match store keys")
+                qsa_records.extend(request.dump_qsa_records)
 
         if not total_ucm_block_ids:
             return
 
         event_handle = 0
         try:
-            total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
+            total_ptrs = (
+                self.kv_cache_layout.extract_qsa_addrs(qsa_records)
+                if self.qsa is not None
+                else self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
+            )
             total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
             shard_indexs = [0] * len(total_ucm_block_ids)
             event_handle = self._get_dump_event_handle()
@@ -1542,7 +1863,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         super().__init__(vllm_config, role, kv_cache_config)
         self.launch_config = copy.deepcopy(self.launch_config)
         self.launch_config["use_layerwise"] = True
-        self.use_layerwise = True
+        self.use_layerwise = self.qsa is None
         self.load_tasks: dict[int, dict[str, Task]] = defaultdict(dict)
         self.dump_tasks: dict[int, list[PendingDumpTask]] = defaultdict(list)
         self.request_data: list[tuple[str, list[bytes], list[bytes], list[int]]] = []
@@ -1579,6 +1900,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if self.qsa is not None:
+            logger.info("QSA HLA uses whole-block transfers after forward completion")
+            self.use_layerwise = False
+            return super().register_kv_caches(kv_caches)
         if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
             for layer_name, value in kv_caches.items():
                 kv_cache, _ = value
@@ -1738,6 +2063,8 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         self._layerwise_load_bytes_recorded = True
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        if self.qsa is not None:
+            return super().start_load_kv(forward_context, **kwargs)
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
         self.load_tasks.clear()
@@ -1785,6 +2112,8 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 self._record_layerwise_load_bytes()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
+        if self.qsa is not None:
+            return
         if not self._connector_metadata or not self.need_load:
             return
         metadata = self._get_connector_metadata()
@@ -1817,6 +2146,8 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
+        if self.qsa is not None:
+            return
         if not self._connector_metadata:
             return
 
@@ -1910,6 +2241,8 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         )
 
     def wait_for_save(self) -> None:
+        if self.qsa is not None:
+            return super().wait_for_save()
         if not self.is_save:
             return
 
