@@ -423,10 +423,18 @@ class HybridLinearAttentionLayout(KVCacheLayout):
       across all physical blocks.
     - CUDA stores one contiguous page per physical block. The same bytes are
       viewed as either attention [K, V] or mamba [conv, ssm, padding].
+      Qwen3.8-Flash-Next also publishes ``compressed_key_cache`` and
+      ``raw_key_cache``. Whole-block CUDA transfers append those after the
+      shared page, so a full-attention block is
+      ``[k|v | compressed_key_cache | raw_key_cache]``. The compressed slice
+      holds ``block_size // compress_ratio`` keys for that block. Linear
+      attention keeps ``[conv|ssm|pad]`` in the same page and uses the QSA
+      tail as padding so its block length matches. Layerwise transfers stay
+      on the contiguous page.
 
     The store receives one unified tensor_size_list, so we expose the three
     physical slices for Ascend, while CUDA is exposed as one contiguous page
-    with a full-page stride.
+    with a full-page stride, plus the QSA tail on whole-block transfers.
     """
 
     def __init__(
@@ -538,15 +546,264 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             + self.base_ptrs[row_slice][None, :]
         )
 
+    @staticmethod
+    def _qsa_cache_role(layer_name: str) -> Optional[str]:
+        """Classify Flash-Next QSA side caches registered next to full attention."""
+        lowered = layer_name.lower()
+        if "compressed_key_cache" in lowered or "compress_key_cache" in lowered:
+            return "compressed"
+        if "raw_key_cache" in lowered:
+            return "raw"
+        return None
+
+    def _index_cuda_qsa_caches(self, kvcaches) -> dict[int, dict[str, list[str]]]:
+        """Map full-attention layer ids to compressed/raw cache names.
+
+        Pointers and per-block sizes are taken from the registered KV tensors,
+        the same source ``KVCacheLayout._tensor_infos`` uses. Caches whose
+        layer id is not a full-attention layer stay independent pages.
+        """
+        indexed: dict[int, dict[str, list[str]]] = {}
+        for layer_name in kvcaches:
+            role = self._qsa_cache_role(layer_name)
+            if role is None:
+                continue
+            layer_id = self.layer_name_to_id.get(layer_name)
+            if layer_id is None:
+                continue
+            indexed.setdefault(layer_id, {}).setdefault(role, []).append(layer_name)
+
+        layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
+        full_attn_ids: set[int] = set()
+        for layer_name, specs in layer_to_specs.items():
+            if self._qsa_cache_role(layer_name):
+                continue
+            if not any(isinstance(spec, FullAttentionSpec) for spec in specs):
+                continue
+            layer_id = self.layer_name_to_id.get(layer_name)
+            if layer_id is not None:
+                full_attn_ids.add(layer_id)
+
+        attached: dict[int, dict[str, list[str]]] = {}
+        unmatched: list[int] = []
+        for layer_id, roles in indexed.items():
+            if layer_id not in full_attn_ids:
+                unmatched.append(layer_id)
+                continue
+            attached[layer_id] = {role: sorted(names) for role, names in roles.items()}
+        if unmatched:
+            logger.warning(
+                "QSA caches were not attached to a full-attention layer and "
+                f"stay independent pages: layer_ids={sorted(unmatched)}"
+            )
+        return attached
+
+    def _qsa_compress_ratio(self, spec: KVCacheSpec, layer_id: int) -> int:
+        ratio = getattr(spec, "compress_ratio", None)
+        if ratio is None:
+            hf = getattr(
+                getattr(self.vllm_config, "model_config", None),
+                "hf_text_config",
+                None,
+            )
+            ratios = getattr(hf, "compress_ratios", None) if hf is not None else None
+            if isinstance(ratios, (list, tuple)):
+                ratio = ratios[layer_id] if 0 <= layer_id < len(ratios) else 1
+            elif hf is not None:
+                ratio = getattr(hf, "compress_ratio", 1)
+        try:
+            ratio_int = int(ratio)
+        except (TypeError, ValueError):
+            ratio_int = 1
+        return max(ratio_int, 1)
+
+    def _iter_block_tensors(self, kv_layer):
+        if isinstance(kv_layer, torch.Tensor):
+            if kv_layer.dim() == 5 and int(kv_layer.shape[0]) == 2:
+                yield kv_layer[0]
+                yield kv_layer[1]
+                return
+            yield kv_layer
+            return
+        if isinstance(kv_layer, (tuple, list)):
+            for item in kv_layer:
+                yield from self._iter_block_tensors(item)
+
+    @staticmethod
+    def _qsa_copy_and_stride(
+        tensor: torch.Tensor,
+        bytes_per_block: int,
+        block_size: int,
+        compress_ratio: int,
+        compressed: bool,
+    ) -> tuple[int, int]:
+        """Bytes copied for one full-attention block, and the stride to the next.
+
+        ``compressed_key_cache`` keeps ``block_size // compress_ratio`` keys of
+        that block. An allocation whose token dimension is already that count
+        is copied whole. A token-major allocation whose second dimension is
+        still ``block_size`` contributes only the leading compressed keys; the
+        stride stays the physical block. ``raw_key_cache`` is copied as
+        recorded by ``KVCacheLayout``.
+        """
+        stride = bytes_per_block
+        if (
+            not compressed
+            or compress_ratio <= 1
+            or block_size <= 0
+            or block_size % compress_ratio != 0
+            or tensor.dim() < 2
+            or bytes_per_block <= 0
+        ):
+            return bytes_per_block, stride
+        token_dim = int(tensor.shape[1])
+        compressed_tokens = block_size // compress_ratio
+        if token_dim != block_size:
+            return bytes_per_block, stride
+        copy_size = bytes_per_block * compressed_tokens // block_size
+        return copy_size, stride
+
+    def _cuda_qsa_tail_segments(
+        self,
+        layer_names: list[str],
+        qsa_by_layer: dict[int, dict[str, list[str]]],
+        kvcaches,
+    ) -> tuple[list[int], list[int], list[int], list[int], list[str]]:
+        """Record QSA caches with ``KVCacheLayout._tensor_infos`` metadata."""
+        layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
+        ptrs: list[int] = []
+        copy_sizes: list[int] = []
+        strides: list[int] = []
+        buffers: list[int] = []
+        attached: list[str] = []
+        seen_layers: set[int] = set()
+
+        for layer_name in layer_names:
+            layer_id = self.layer_name_to_id.get(layer_name)
+            if layer_id is None or layer_id in seen_layers:
+                continue
+            attn_spec = next(
+                (
+                    spec
+                    for spec in layer_to_specs.get(layer_name, [])
+                    if isinstance(spec, FullAttentionSpec)
+                ),
+                None,
+            )
+            if attn_spec is None:
+                continue
+            seen_layers.add(layer_id)
+            roles = qsa_by_layer.get(layer_id)
+            if not roles:
+                continue
+            compress_ratio = self._qsa_compress_ratio(attn_spec, layer_id)
+            block_size = int(getattr(attn_spec, "block_size", 0) or 0)
+            found_roles: set[str] = set()
+            for role in ("compressed", "raw"):
+                for cache_name in roles.get(role, []):
+                    kv_layer = kvcaches.get(cache_name)
+                    if kv_layer is None:
+                        logger.warning(
+                            "QSA cache tensor missing from registered KV caches: "
+                            f"layer={cache_name}"
+                        )
+                        continue
+                    recorded = False
+                    for tensor in self._iter_block_tensors(kv_layer):
+                        infos = self._tensor_infos(cache_name, tensor)
+                        if len(infos) != 1:
+                            logger.warning(
+                                "Skip unexpected QSA cache component count: "
+                                f"layer={cache_name}, count={len(infos)}"
+                            )
+                            continue
+                        info = infos[0]
+                        copy_size, stride = self._qsa_copy_and_stride(
+                            tensor,
+                            info.bytes_per_block,
+                            block_size,
+                            compress_ratio,
+                            role == "compressed",
+                        )
+                        if copy_size <= 0 or stride <= 0:
+                            continue
+                        ptrs.append(info.ptr)
+                        copy_sizes.append(copy_size)
+                        strides.append(stride)
+                        buffers.append(info.buffer_size)
+                        recorded = True
+                    if recorded:
+                        found_roles.add(role)
+                        attached.append(cache_name)
+            if found_roles and found_roles != {"compressed", "raw"}:
+                logger.warning(
+                    "CUDA QSA block is missing one side cache: "
+                    f"layer_id={layer_id}, found={sorted(found_roles)}, "
+                    f"block_size={block_size}, compress_ratio={compress_ratio}"
+                )
+        return ptrs, copy_sizes, strides, buffers, attached
+
+    def _append_cuda_qsa_page_layout(
+        self,
+        raw_tensor,
+        shared_ptrs: list[int],
+        layer_names: list[str],
+        qsa_by_layer: dict[int, dict[str, list[str]]],
+        kvcaches,
+        base_ptrs: list[list[int]],
+        buffer_size_rows: list[list[int]],
+        tensor_size_lists: list[list[int]],
+        block_stride_lists: list[list[int]],
+    ) -> list[str]:
+        """Whole-block CUDA layout ``[k|v|compressed_key_cache|raw_key_cache]``.
+
+        The shared page remains one contiguous slice. Full attention reads it
+        as ``[k|v]``; linear attention reads the same bytes as
+        ``[conv|ssm|pad]``. QSA caches are appended once, so the linear view
+        gains that tail as padding and both views have the same block length.
+        ``wait_for_save`` already copies every slice returned by
+        ``extract_block_addrs``.
+        """
+        self._append_contiguous_page_layout(
+            raw_tensor,
+            shared_ptrs,
+            base_ptrs,
+            buffer_size_rows,
+            tensor_size_lists,
+            block_stride_lists,
+        )
+        ptrs, copy_sizes, strides, buffers, attached = self._cuda_qsa_tail_segments(
+            layer_names, qsa_by_layer, kvcaches
+        )
+        if not ptrs:
+            return []
+        base_ptrs[-1].extend(ptrs)
+        buffer_size_rows[-1].extend(buffers)
+        tensor_size_lists[-1].extend(copy_sizes)
+        block_stride_lists[-1].extend(strides)
+        page_size = tensor_size_lists[-1][0]
+        tail_bytes = sum(copy_sizes)
+        logger.info(
+            "CUDA QSA whole-block layout "
+            "[k|v|compressed_key_cache|raw_key_cache]: "
+            f"layers={layer_names}, page_bytes={page_size}, "
+            f"qsa_tail_bytes={tail_bytes}, "
+            f"block_bytes={page_size + tail_bytes}, "
+            f"copy_sizes={copy_sizes}, strides={strides}"
+        )
+        return attached
+
     def _collect_shared_tensor_info(
         self,
         raw_tensor,
         kvcaches,
+        layer_names: Optional[list[str]] = None,
     ) -> tuple[list[KVCacheSpec], list[int]]:
         shared_specs: list[KVCacheSpec] = []
         shared_ptrs: list[int] = []
         layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
-        for layer_name in raw_tensor.shared_by:
+        names = raw_tensor.shared_by if layer_names is None else layer_names
+        for layer_name in names:
             kv_layer = kvcaches.get(layer_name)
             if kv_layer is None:
                 continue
@@ -685,13 +942,33 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         self.layer_name_to_row: dict[str, int] = {}
 
         is_npu = current_platform.device_type == "npu"
+        # QSA tails belong to the whole-block CUDA object. NPU and layerwise
+        # keep the previous page layout.
+        attach_qsa = (not is_npu) and (not self.use_layerwise)
+        qsa_by_layer = self._index_cuda_qsa_caches(kvcaches) if attach_qsa else {}
+        qsa_names = {
+            name
+            for roles in qsa_by_layer.values()
+            for role_names in roles.values()
+            for name in role_names
+        }
+        if qsa_by_layer:
+            logger.info(
+                "CUDA QSA caches attached to full-attention blocks: "
+                f"layers={sorted(qsa_by_layer)}"
+            )
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             if not raw_tensor.shared_by:
                 continue
+            if qsa_names and all(name in qsa_names for name in raw_tensor.shared_by):
+                continue
 
+            page_layer_names = [
+                name for name in raw_tensor.shared_by if name not in qsa_names
+            ]
             shared_specs, shared_ptrs = self._collect_shared_tensor_info(
-                raw_tensor, kvcaches
+                raw_tensor, kvcaches, page_layer_names
             )
 
             if not shared_ptrs:
@@ -704,6 +981,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             mamba_specs = [s for s in shared_specs if isinstance(s, MambaSpec)]
             attn_specs = [s for s in shared_specs if isinstance(s, FullAttentionSpec)]
 
+            attached_qsa: list[str] = []
             # Ascend: hybrid → component_major, attn-only → attn_only, else contiguous.
             if is_npu and mamba_specs and attn_specs:
                 self._append_ascend_component_major_layout(
@@ -726,6 +1004,18 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     tensor_size_lists,
                     block_stride_lists,
                 )
+            elif attach_qsa and attn_specs and qsa_by_layer:
+                attached_qsa = self._append_cuda_qsa_page_layout(
+                    raw_tensor,
+                    shared_ptrs,
+                    page_layer_names,
+                    qsa_by_layer,
+                    kvcaches,
+                    base_ptrs,
+                    buffer_size_rows,
+                    tensor_size_lists,
+                    block_stride_lists,
+                )
             else:
                 self._append_contiguous_page_layout(
                     raw_tensor,
@@ -736,7 +1026,9 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     block_stride_lists,
                 )
 
-            for layer_name in raw_tensor.shared_by:
+            for layer_name in page_layer_names:
+                self.layer_name_to_row[layer_name] = row_id
+            for layer_name in attached_qsa:
                 self.layer_name_to_row[layer_name] = row_id
 
         self._finalize_layout_arrays(
