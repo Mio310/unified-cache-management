@@ -234,6 +234,29 @@ def read_record(ptrs, sizes):
 
 
 class TestQSAHLA(unittest.TestCase):
+    def test_qsa_keys_match_original_hla_for_the_same_prefix(self):
+        f = fixture(1)
+        original_config = NS(
+            num_blocks=f.config.num_blocks,
+            kv_cache_tensors=f.config.kv_cache_tensors[:1],
+            kv_cache_groups=f.config.kv_cache_groups[:4],
+        )
+        original = SYMS["KVCacheGroupManager"](
+            original_config, Hasher(), b"seed"
+        )
+        hashes = original.compute_all_group_block_ids(
+            NS(all_token_ids=list(range(16)))
+        )
+        self.assertEqual(f.hashes[0], hashes[0])
+        for group, old_group in zip(f.manager.groups_by_id[:4], original.groups_by_id):
+            self.assertEqual(group.seed, old_group.seed)
+        for group, old_group in zip(f.manager.state_groups, original.state_groups):
+            for boundary in (4, 8, 12, 16):
+                self.assertEqual(
+                    f.manager.compute_mamba_align_state_hash(group, boundary, f.hashes),
+                    original.compute_mamba_align_state_hash(old_group, boundary, hashes),
+                )
+
     def test_non_qsa_layout_and_dispatch_keep_existing_behavior(self):
         f = fixture(1)
         f.config.kv_cache_groups = f.config.kv_cache_groups[:4]
@@ -264,25 +287,25 @@ class TestQSAHLA(unittest.TestCase):
         self.assertEqual(len(f.manager.full_attn_groups), 1)
         self.assertEqual(len(f.manager.state_groups), 3)
 
-    def test_only_final_variant_has_raw_and_mamba_has_zero_tails(self):
+    def test_only_final_original_key_has_raw_and_mamba_has_zero_tails(self):
         f = fixture()
         result = dispatch(f)
         keys, blocks = result.dump_block_ids
         records = result.dump_qsa_records
-        self.assertEqual(len(records), 8)  # 4 history + 3 state + 1 complete
-        self.assertEqual([bool(r.raw) for r in records], [False] * 7 + [True])
+        self.assertEqual(len(records), 7)  # 4 attention + 3 state
+        self.assertEqual([bool(r.raw) for r in records], [False] * 3 + [True] + [False] * 3)
         self.assertEqual(keys[:4], f.hashes[0])
-        self.assertEqual(keys[-1], qsa.raw_boundary_key(Hasher(), keys[3]))
+        self.assertEqual(len(set(keys)), 7)
         addresses = f.layout.extract_qsa_addrs(records)
         payloads = [read_record(p, f.layout.tensor_size_lists) for p in addresses]
         self.assertEqual({len(p) for p in payloads}, {336})
-        for payload in payloads[:4]:
+        for payload in payloads[:3]:
             self.assertEqual(payload[20:28], bytes(8))
         for payload in payloads[4:7]:
             self.assertEqual(payload[16:28], bytes(12))
         self.assertEqual(payloads[0][16:20], bytes([48]) * 4)  # compressed block 8
-        self.assertEqual(payloads[-1][16:20], bytes([51]) * 4)  # compressed block 11
-        self.assertEqual(payloads[-1][20:28], bytes([92]) * 8)  # raw block 12
+        self.assertEqual(payloads[3][16:20], bytes([51]) * 4)  # compressed block 11
+        self.assertEqual(payloads[3][20:28], bytes([92]) * 8)  # raw block 12
 
     def test_unaligned_end_never_labels_latest_ring_as_earlier_state(self):
         f = fixture(1)
@@ -294,9 +317,9 @@ class TestQSAHLA(unittest.TestCase):
         f = fixture(1)
         dispatch(f, 15)
         result = dispatch(f, 1, need_load=False)
-        self.assertEqual(result.dump_qsa_records[-1].raw, {5: 12})
+        self.assertEqual(result.dump_qsa_records[0].raw, {5: 12})
         self.assertEqual(
-            result.dump_block_ids[0][-1], qsa.raw_boundary_key(Hasher(), f.hashes[0][3])
+            result.dump_block_ids[0][0], f.hashes[0][3]
         )
 
     def test_tokens_past_prompt_do_not_claim_prompt_ring_snapshot(self):
@@ -304,7 +327,7 @@ class TestQSAHLA(unittest.TestCase):
         result = dispatch(f, 17)
         self.assertFalse(any(r.raw for r in result.dump_qsa_records))
 
-    def test_immutable_store_can_upgrade_padded_prefix_without_overwrite(self):
+    def test_immutable_store_retains_padding_without_an_extra_key(self):
         f = fixture(1)
         result = dispatch(f)
         store = dict(zip(result.dump_block_ids[0], result.dump_qsa_records))
@@ -315,12 +338,13 @@ class TestQSAHLA(unittest.TestCase):
         for key, record in zip(short.dump_block_ids[0], short.dump_qsa_records):
             store.setdefault(key, record)
         self.assertFalse(store[earlier_key].raw)
-        self.assertTrue(store[qsa.raw_boundary_key(Hasher(), earlier_key)].raw)
+        self.assertEqual(short.dump_block_ids[0][0], earlier_key)
+        self.assertTrue(short.dump_qsa_records[0].raw)
+        self.assertEqual(len(short.dump_block_ids[0]), 1)
 
-    def test_lookup_requires_raw_and_all_states_at_the_same_boundary(self):
+    def test_lookup_requires_original_attention_and_all_states(self):
         f = fixture(1)
         stored = set(f.hashes[0])
-        stored.add(qsa.raw_boundary_key(Hasher(), f.hashes[0][3]))
         for group in f.manager.state_groups:
             stored.add(f.manager.compute_mamba_align_state_hash(group, 16, f.hashes))
         reverse = lambda keys: max(
@@ -332,18 +356,10 @@ class TestQSAHLA(unittest.TestCase):
         self.assertEqual(
             f.manager.lookup_external_hit_tokens(0, f.hashes, prefix, reverse)[0], 16
         )
-        stored.remove(qsa.raw_boundary_key(Hasher(), f.hashes[0][3]))
+        stored.remove(f.manager.compute_mamba_align_state_hash(f.manager.state_groups[0], 16, f.hashes))
         self.assertEqual(
             f.manager.lookup_external_hit_tokens(0, f.hashes, prefix, reverse)[0], 0
         )
-
-    def test_sparse_state_chains_are_rechecked_after_boundary_shrinks(self):
-        chains = [[b"a0", b"a1", b"a2"], [b"b0", b"b1", b"b2"]]
-        hits = {b"a0", b"a2", b"b0", b"b1"}
-        reverse = lambda keys: max(
-            (i for i, k in enumerate(keys) if k in hits), default=-1
-        )
-        self.assertEqual(qsa.common_resume_index(chains, reverse), 0)
 
     def test_restore_uses_new_aux_block_tables_and_only_final_raw(self):
         f = fixture(1)
@@ -437,7 +453,7 @@ class TestQSAHLA(unittest.TestCase):
         c.store = object()
         c._rank_consistency = Transfers()
         c.wait_for_save()
-        self.assertEqual(len(stored), 8)
+        self.assertEqual(len(stored), 7)
         c.device.destroy_event_handle.assert_called_once_with(123)
         f.meta.total_hit_block_num = 4
         f.meta.group_vllm_block_ids = [
@@ -455,7 +471,7 @@ class TestQSAHLA(unittest.TestCase):
         raw = f.caches["model.layers.3.attn.raw_key_cache"].data
         self.assertEqual(raw[24].tobytes(), bytes([92]) * 8)
 
-    def test_nonzero_tp_rank_scopes_complete_key_together_with_history(self):
+    def test_nonzero_tp_rank_scopes_original_keys(self):
         f = fixture(1)
         result = dispatch(f)
         f.connector.tp_rank, f.connector.tp_size = 1, 2

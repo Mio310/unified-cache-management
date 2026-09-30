@@ -26,14 +26,11 @@ from vllm.v1.kv_cache_interface import (
 
 from ucm.integration.vllm.device import create_device
 from ucm.integration.vllm.qsa_layout import (
-    QSA_FORMAT,
     QSARecord,
     QSATopology,
-    common_resume_index,
     layer_index,
     make_qsa_records,
     qsa_role,
-    raw_boundary_key,
 )
 from ucm.integration.vllm.request_hasher import RequestHasher
 from ucm.integration.vllm.ucm_connector import (
@@ -202,23 +199,6 @@ class KVCacheGroupManager:
         self.full_attn_groups: list[GroupInfo] = []
         self.state_groups: list[GroupInfo] = []
         self.qsa = qsa_topology(kv_cache_config)
-        if self.qsa is not None:
-            # Include the ordered spec schema, but never allocation counts or
-            # physical addresses, in the persistent format namespace.
-            schema = tuple(
-                (name, tuple(repr(s) for s in specs))
-                for name, specs in sorted(
-                    layer_name_to_kv_cache_spec(kv_cache_config).items()
-                )
-            )
-            pages = tuple(
-                sorted(
-                    (tuple(sorted(t.shared_by)), t.size // kv_cache_config.num_blocks)
-                    for t in kv_cache_config.kv_cache_tensors
-                )
-            )
-            base_seed = request_hasher((QSA_FORMAT, base_seed, schema, pages))
-
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
             block_size = block_size_from_kv_cache_spec(spec)
@@ -404,48 +384,6 @@ class KVCacheGroupManager:
         # the rightmost hit.  The min across state groups is the rightmost
         # position where ALL states are present.
         total_hit_tokens = num_computed_tokens + external_hit_tokens
-
-        if getattr(self, "qsa", None) is not None:
-            positions = list(
-                range(
-                    num_computed_tokens + self.lcm_block_size,
-                    total_hit_tokens + self.lcm_block_size,
-                    self.lcm_block_size,
-                )
-            )
-            primary = self.full_attn_groups[0]
-            chains = [
-                [
-                    raw_boundary_key(
-                        self.request_hasher,
-                        group_block_ids[primary.group_id][
-                            pos // primary.block_size - 1
-                        ],
-                    )
-                    for pos in positions
-                ]
-            ]
-            chains.extend(
-                [
-                    self.compute_mamba_align_state_hash(sg, pos, group_block_ids)
-                    for pos in positions
-                ]
-                for sg in self.state_groups
-            )
-            try:
-                idx = common_resume_index(chains, lookup_on_reverse)
-            except Exception as e:
-                logger.error(f"QSA resume lookup failed: {type(e).__name__}: {e}")
-                _record_counter("connector_lookup_errors_total")
-                return 0, 0, []
-            if idx < 0:
-                return 0, 0, []
-            hit = positions[idx] - num_computed_tokens
-            return (
-                hit,
-                hit // self.lcm_block_size,
-                [key for chain in chains for key in chain[: idx + 1]],
-            )
 
         if not self.state_groups:
             return (
@@ -1479,7 +1417,6 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 load_ucm_block_ids, load_vllm_block_ids, load_qsa_records = (
                     make_qsa_records(
                         topology,
-                        self.request_hasher,
                         load_ucm_block_ids,
                         load_vllm_block_ids,
                         hashes,
@@ -1499,7 +1436,6 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 dump_ucm_block_ids, dump_vllm_block_ids, dump_qsa_records = (
                     make_qsa_records(
                         topology,
-                        self.request_hasher,
                         dump_ucm_block_ids,
                         dump_vllm_block_ids,
                         hashes,

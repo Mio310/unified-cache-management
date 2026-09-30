@@ -38,26 +38,29 @@ not exceed the request's persistence range. For example, a step ending at
 1024 can persist the raw ring at 1024; a step ending at 1000 cannot attach its
 ring to the historical block ending at 768.
 
-The store may deduplicate existing keys, so the connector never attempts an
-in-place upgrade of a padded record. It keeps the normal historical key and
-writes **one additional, equally sized complete record** under
-`hash(QSA_FORMAT, "RAW_VALID", historical_key)`. A later request ending at a
-previously padded boundary can create that complete variant without changing
-the old record. Padded writes cannot downgrade a complete variant.
+The final attention record uses its original key and carries the valid raw
+ring directly. No boundary key or duplicate attention record is generated.
+Earlier records retain zero padding in their raw segments.
 
-The hash namespace includes a QSA format version, cache specs, and physical
-page schema. Older HLA records are not reused by this layout.
+This deliberately leaves raw validity unresolved for deduplicating stores:
+if a key already contains zero padding, a later write of valid raw may be
+skipped. Key presence alone cannot establish raw validity. Such a hit is not
+a guarantee of correct recovery; overwrite/validity handling is deferred.
+
+QSA uses the original base seed and group hash rules without adding a format
+version, cache specs, or physical page schema. With identical hash inputs,
+attention and Mamba keys match the original HLA keys; keys do not distinguish
+the old and new storage layouts.
 
 ## Prefix-cache recovery
 
 Lookup first checks the historical attention chain. A usable recovery point
-must also have a complete raw-boundary record and every Mamba state at the
-same LCM-aligned position. Reverse lookup rechecks earlier state groups if a
-later group reduces the candidate position; taking independent last-hit
-positions is insufficient when state entries have holes.
+must also have the original attention record and every Mamba state at the
+same LCM-aligned position, using the original HLA lookup algorithm without
+a QSA-specific lookup branch.
 
-Load replaces the final historical attention key with its complete variant.
-Only that record restores the raw ring. Padding in all other records is
+Load uses the original attention keys. Only the final record restores the raw
+segment; there is currently no independent raw-validity check. Padding in all other records is
 written to discard memory, never to the live raw or compressed caches.
 
 ## Scope and tradeoffs
@@ -72,8 +75,8 @@ written to discard memory, never to the live raw or compressed caches.
 - Loads currently submit and wait for one record at a time. This bounds
   scratch memory and avoids concurrent writes to the discard buffer, at the
   cost of load parallelism. Dump still batches records.
-- The complete variant duplicates one attention record per saved boundary.
-  Intermediate raw snapshots and decode-state persistence are not added.
+- No additional boundary keys are written. Intermediate raw snapshots and
+  decode-state persistence are not added.
 
 CPU contract tests (no PyTorch/vLLM installation required):
 
