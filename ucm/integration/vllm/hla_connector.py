@@ -1275,6 +1275,12 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             )
             return
         if vllm_block_id == 0:
+            if reason == "dump":
+                logger.info(
+                    "HLA_DUMP_SKIP request_id=%s group_id=%s seq_len=%s "
+                    "state_idx=%s reason=null_block",
+                    request_id, gid, seq_len, vllm_state_idx,
+                )
             return
         ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
             group, seq_len, req_meta.group_ucm_block_ids
@@ -1288,6 +1294,13 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             return
         dst_ucm_block_ids.append(ucm_block_id)
         dst_vllm_block_ids.append(vllm_block_id)
+        if reason == "dump":
+            logger.info(
+                "HLA_DUMP_STATE request_id=%s group_id=%s seq_len=%s "
+                "block_size=%s state_idx=%s physical_block=%s key=%s",
+                request_id, gid, seq_len, group.block_size,
+                vllm_state_idx, vllm_block_id, ucm_block_id.hex(),
+            )
 
     def _generate_hla_dispatch_meta(
         self,
@@ -1373,6 +1386,14 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             )
             first_lcm_b = (dump_tok_start // lcm_block_size + 1) * lcm_block_size
             last_lcm_b = (dump_tok_end // lcm_block_size) * lcm_block_size
+            logger.info(
+                "HLA_DUMP_PLAN request_id=%s token_processed=%s new_tokens=%s "
+                "prompt_tokens=%s dump_end=%s lcm=%s first_boundary=%s "
+                "last_boundary=%s",
+                request_id, req_meta.token_processed, new_tokens,
+                req_meta.num_token_ids, dump_tok_end, lcm_block_size,
+                first_lcm_b, last_lcm_b,
+            )
 
             # Pass 1: full-attention blocks first
             for gid, group in enumerate(groups_by_id):
@@ -1394,6 +1415,13 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 if not group.is_mamba_align:
                     continue
                 if dump_tok_end != last_lcm_b or last_lcm_b < first_lcm_b:
+                    logger.info(
+                        "HLA_DUMP_SKIP request_id=%s group_id=%s dump_end=%s "
+                        "last_boundary=%s reason=%s",
+                        request_id, gid, dump_tok_end, last_lcm_b,
+                        "unaligned_end" if dump_tok_end != last_lcm_b
+                        else "no_new_boundary",
+                    )
                     continue
                 self._append_mamba_align_state_block(
                     dump_ucm_block_ids,
@@ -1406,6 +1434,11 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 )
         else:
             dump_full_attn_count = 0
+            logger.info(
+                "HLA_DUMP_SKIP request_id=%s token_processed=%s prompt_tokens=%s "
+                "reason=prompt_already_processed",
+                request_id, req_meta.token_processed, req_meta.num_token_ids,
+            )
 
         load_qsa_records = []
         dump_qsa_records = []
@@ -1727,6 +1760,16 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 if len(request.dump_qsa_records) != len(scoped_ucm):
                     raise ValueError("QSA dump metadata does not match store keys")
                 qsa_records.extend(request.dump_qsa_records)
+                for original, scoped, block, record in zip(
+                    rank0_ucm, scoped_ucm, scoped_vllm, request.dump_qsa_records
+                ):
+                    if not record.attention:
+                        logger.info(
+                            "HLA_DUMP_TRANSFER request_id=%s tp_rank=%s "
+                            "physical_block=%s key=%s store_key=%s",
+                            request_id, self.tp_rank, block,
+                            original.hex(), scoped.hex(),
+                        )
 
         if not total_ucm_block_ids:
             return
@@ -1750,6 +1793,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 total_ptrs,
                 event_handle,
             )
+            logger.info(
+                "HLA_DUMP_SUBMITTED tp_rank=%s requests=%s blocks=%s",
+                self.tp_rank, sorted(block_ids_by_request), len(total_ucm_block_ids),
+            )
         except Exception as e:
             logger.error(f"dump kv cache failed. {type(e).__name__}: {e}")
             if self.enable_event_sync and event_handle and self.device is not None:
@@ -1760,6 +1807,11 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         try:
             self._rank_consistency.wait_dump(task)
             save_end_time = time.perf_counter() * 1000
+            logger.info(
+                "HLA_DUMP_COMPLETED tp_rank=%s requests=%s blocks=%s duration_ms=%.3f",
+                self.tp_rank, sorted(block_ids_by_request), len(total_ucm_block_ids),
+                save_end_time - save_start_time,
+            )
         except Exception as e:
             logger.error_limit(
                 f"wait for dump kv cache failed. {type(e).__name__}: {e}"
