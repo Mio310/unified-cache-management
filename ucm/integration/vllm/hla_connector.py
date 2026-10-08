@@ -65,10 +65,21 @@ class HLARequestMeta(RequestMeta):
 
 @dataclass
 class HLARequestDispatchMeta(RequestDispatchMeta):
-    """Extends RequestDispatchMeta with full-attn block count for MLA rank scoping."""
+    """Extends RequestDispatchMeta with full-attn block count for MLA rank scoping.
+
+    When compressed or PLE pages are present, ``load_full_attn_count`` and
+    ``dump_full_attn_count`` are also the attention-record prefix length so
+    the worker can split the flat block list. Companion ids are parallel to
+    that prefix (compressed) and to the mamba suffix (PLE). A zero companion
+    id selects the zero sink.
+    """
 
     load_full_attn_count: int = 0
     dump_full_attn_count: int = 0
+    load_compressed_block_ids: list[int] = field(default_factory=list)
+    dump_compressed_block_ids: list[int] = field(default_factory=list)
+    load_ple_block_ids: list[int] = field(default_factory=list)
+    dump_ple_block_ids: list[int] = field(default_factory=list)
 
 
 def layer_name_to_kv_cache_spec(
@@ -132,6 +143,234 @@ def _normalize_tensor_size_list(tensor_size_list: Any) -> list[int]:
     return [int(tensor_size_list)]
 
 
+_RAW_LAYER_COMPONENT = "raw_key_cache"
+_COMPRESSED_LAYER_COMPONENT = "compressed_key_cache"
+_PLE_LAYER_COMPONENT = "ple"
+_SIDE_CACHE_ROLES = frozenset({"raw", "compressed", "ple"})
+
+
+def _layer_components(layer_name: str) -> tuple[str, ...]:
+    return tuple(part for part in str(layer_name).split(".") if part)
+
+
+def _layer_role(layer_name: str) -> str:
+    """Role of one layer from its name components.
+
+    ``ple`` matches only a whole component, so names such as ``complete`` stay
+    ordinary full-attention or mamba layers.
+    """
+    parts = _layer_components(layer_name)
+    if _RAW_LAYER_COMPONENT in parts:
+        return "raw"
+    if _COMPRESSED_LAYER_COMPONENT in parts:
+        return "compressed"
+    if _PLE_LAYER_COMPONENT in parts:
+        return "ple"
+    return ""
+
+
+def _layer_index(layer_name: str) -> Optional[int]:
+    parts = _layer_components(layer_name)
+    for idx, part in enumerate(parts[:-1]):
+        if part in ("layers", "layer") and parts[idx + 1].isdigit():
+            return int(parts[idx + 1])
+    return None
+
+
+def _spec_prefix_cacheable(spec: KVCacheSpec) -> bool:
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return all(
+            _spec_prefix_cacheable(child) for child in spec.kv_cache_specs.values()
+        )
+    return bool(getattr(spec, "prefix_cacheable", True))
+
+
+def _group_kind(layer_names, spec: KVCacheSpec) -> str:
+    """Classify a vLLM KV group for HLA dump and lookup.
+
+    Qwen3.8-Flash-Next keeps compressed history, the QSA raw ring, and the
+    PLE short-conv in their own groups. Those groups stay in ``groups_by_id``
+    so allocated block-id tuples stay aligned, but they are not full-attention
+    or mamba-align records.
+    """
+    roles = [_layer_role(name) for name in layer_names]
+    if roles and all(role and role == roles[0] for role in roles):
+        return roles[0]
+    if is_mamba_align_kv_cache_spec(spec):
+        return "mamba"
+    if not _spec_prefix_cacheable(spec):
+        return "raw"
+    return "full_attn"
+
+
+def _tensor_layers(raw_tensor) -> list[str]:
+    """Layer names stored on one ``KVCacheTensor``.
+
+    Current vLLM uses ``shared_by``. Newer block-outer configs expose the same
+    names on ``layers`` and leave ``shared_by`` empty.
+    """
+    shared = getattr(raw_tensor, "shared_by", None)
+    if shared:
+        return [str(name) for name in shared]
+    layers = getattr(raw_tensor, "layers", None)
+    if not layers:
+        return []
+    if isinstance(layers, dict):
+        return [str(name) for name in layers]
+    return [str(name) for name in layers]
+
+
+def _unwrap_kv_tensor(kv_layer) -> Optional[torch.Tensor]:
+    if isinstance(kv_layer, torch.Tensor):
+        return kv_layer
+    if isinstance(kv_layer, (tuple, list)):
+        for item in kv_layer:
+            if isinstance(item, torch.Tensor):
+                return item
+    return None
+
+
+def _block_stride_bytes(tensor: torch.Tensor) -> int:
+    if tensor.ndim < 1 or int(tensor.shape[0]) == 0:
+        return 0
+    return int(tensor.stride(0)) * int(tensor.element_size())
+
+
+def _view_region_bytes(tensor: torch.Tensor) -> int:
+    base = int(tensor.data_ptr())
+    try:
+        storage = tensor.untyped_storage()
+        storage_ptr = int(storage.data_ptr())
+        storage_size = int(storage.nbytes())
+        if storage_ptr and storage_size and storage_ptr <= base:
+            return storage_ptr + storage_size - base
+    except Exception:
+        pass
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _spec_page_bytes(spec: KVCacheSpec) -> int:
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        child = next(iter(spec.kv_cache_specs.values()), None)
+        return _spec_page_bytes(child) if child is not None else 0
+    try:
+        page = int(getattr(spec, "page_size_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        page = 0
+    if page > 0:
+        return page
+    if isinstance(spec, MambaSpec):
+        return sum(HybridLinearAttentionLayout._mamba_component_sizes(spec))
+    return 0
+
+
+def _ordered_role_layers(kv_cache_config, role: str) -> list[str]:
+    """Layers of the first group with ``role``, ordered by layer index."""
+    matched = []
+    for group in kv_cache_config.kv_cache_groups:
+        if _group_kind(group.layer_names, group.kv_cache_spec) == role:
+            matched.append(group)
+    if not matched:
+        return []
+    if len(matched) > 1:
+        logger.warning(
+            "HLA direct layout uses only the first %s group (group layers=%s); "
+            "%d additional %s groups are not given their own store segments.",
+            role,
+            list(matched[0].layer_names),
+            len(matched) - 1,
+            role,
+        )
+    names = []
+    seen = set()
+    for name in matched[0].layer_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    names.sort(
+        key=lambda name: (
+            _layer_index(name) is None,
+            _layer_index(name) or 0,
+            name,
+        )
+    )
+    return names
+
+
+def select_ple_carrier_group_id(
+    state_groups: list["GroupInfo"],
+    ple_groups: list["GroupInfo"],
+    kv_cache_config,
+) -> Optional[int]:
+    """Mamba-align group whose state record also carries the PLE page.
+
+    Prefer a kv tensor that lists the PLE layer together with a mamba layer.
+    Otherwise match the PLE layer index. Otherwise use the first state group.
+    """
+    if not ple_groups or not state_groups:
+        return None
+    ple_names = {name for group in ple_groups for name in group.layer_names}
+    mamba_owner: dict[str, int] = {}
+    for group in state_groups:
+        for name in group.layer_names:
+            mamba_owner.setdefault(name, group.group_id)
+    for raw_tensor in getattr(kv_cache_config, "kv_cache_tensors", []) or []:
+        layers = _tensor_layers(raw_tensor)
+        if not any(name in ple_names or _layer_role(name) == "ple" for name in layers):
+            continue
+        for name in layers:
+            owner = mamba_owner.get(name)
+            if owner is not None:
+                return owner
+    target_index = None
+    for group in ple_groups:
+        for name in group.layer_names:
+            target_index = _layer_index(name)
+            if target_index is not None:
+                break
+        if target_index is not None:
+            break
+    if target_index is not None:
+        for group in state_groups:
+            for name in group.layer_names:
+                if _layer_index(name) == target_index:
+                    return group.group_id
+    return state_groups[0].group_id
+
+
+def assemble_side_record_ptrs(
+    segment_kinds,
+    bases,
+    strides,
+    sink_ptr: int,
+    record_kind: str,
+    primary_block_id: int,
+    compressed_block_id: int,
+    ple_block_id: int,
+) -> list[int]:
+    """Device pointers for one uniform HLA store record.
+
+    Hybrid segments use ``primary_block_id``. Compressed segments are live
+    only on an attention record. The PLE segment is live only on the carrier
+    mamba record. Every unused side segment points at the zero sink so a load
+    cannot clobber another cache that shares the allocation.
+    """
+    ptrs: list[int] = []
+    for kind, base, stride in zip(segment_kinds, bases, strides):
+        if kind == "compressed":
+            block_id = int(compressed_block_id) if record_kind == "attn" else 0
+        elif kind == "ple":
+            block_id = int(ple_block_id) if record_kind == "mamba" else 0
+        else:
+            block_id = int(primary_block_id)
+        if kind in ("compressed", "ple") and block_id == 0:
+            ptrs.append(int(sink_ptr))
+        else:
+            ptrs.append(int(base) + block_id * int(stride))
+    return ptrs
+
+
 @dataclass
 class GroupInfo:
     """Per-group metadata used by :class:`KVCacheGroupManager`."""
@@ -142,11 +381,14 @@ class GroupInfo:
     # Independent hash chain seed per group (see ``KVCacheGroupManager``).
     seed: bytes
     is_mamba_align: bool = False
+    # full_attn, mamba, compressed, ple, or raw. Default keeps older tests
+    # that only set ``is_mamba_align`` on a full-attention-shaped group.
+    kind: str = "full_attn"
     block_hasher: Optional[Callable[["Request"], list[bytes]]] = None
 
     @property
     def is_full_attention(self) -> bool:
-        return not self.is_mamba_align
+        return self.kind == "full_attn" and not self.is_mamba_align
 
 
 class KVCacheGroupManager:
@@ -162,11 +404,14 @@ class KVCacheGroupManager:
         self.groups_by_id: list[GroupInfo] = []
         self.full_attn_groups: list[GroupInfo] = []
         self.state_groups: list[GroupInfo] = []
+        self.compressed_groups: list[GroupInfo] = []
+        self.ple_groups: list[GroupInfo] = []
 
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
             block_size = block_size_from_kv_cache_spec(spec)
-            is_mamba_align = is_mamba_align_kv_cache_spec(spec)
+            kind = _group_kind(group.layer_names, spec)
+            is_mamba_align = kind == "mamba"
             seed = request_hasher((b"UCM_GROUP_SEED", base_seed, group_id))
             info = GroupInfo(
                 group_id=group_id,
@@ -174,29 +419,37 @@ class KVCacheGroupManager:
                 layer_names=tuple(group.layer_names),
                 seed=seed,
                 is_mamba_align=is_mamba_align,
+                kind=kind,
             )
-            if not is_mamba_align:
+            if kind == "full_attn":
                 info.block_hasher = request_hasher.make_request_block_hasher(
                     block_size, seed
                 )
             self.groups_by_id.append(info)
-            if info.is_full_attention:
+            if kind == "full_attn":
                 self.full_attn_groups.append(info)
-            else:
+            elif kind == "mamba":
                 self.state_groups.append(info)
+            elif kind == "compressed":
+                self.compressed_groups.append(info)
+            elif kind == "ple":
+                self.ple_groups.append(info)
 
         assert len(self.full_attn_groups) >= 1, (
             "UCMHybridLinearAttentionConnector expects at least one full-attention group in "
             "kv_cache_config.kv_cache_groups."
         )
 
-        # Resume points must align to the LCM of all group block_sizes.
-        all_block_sizes = [g.block_size for g in self.groups_by_id]
-        self.lcm_block_size: int = math.lcm(*all_block_sizes)
-
-        for g in self.groups_by_id:
-            assert self.lcm_block_size % g.block_size == 0, (
-                f"group {g.group_id} block_size={g.block_size} does not "
+        # The QSA raw ring is not prefix-cacheable and must not change the
+        # resume grid. Compressed history and PLE still have to land on it.
+        scheduled_groups = self.full_attn_groups + self.state_groups
+        self.lcm_block_size: int = math.lcm(
+            *[g.block_size for g in scheduled_groups]
+        )
+        for group in scheduled_groups + self.compressed_groups + self.ple_groups:
+            assert self.lcm_block_size % group.block_size == 0, (
+                f"group {group.group_id} kind={group.kind} "
+                f"block_size={group.block_size} does not "
                 f"divide LCM={self.lcm_block_size}"
             )
         for sg in self.state_groups:
@@ -206,23 +459,59 @@ class KVCacheGroupManager:
                 f"state groups."
             )
 
+        self.compressed_group = (
+            self.compressed_groups[0] if self.compressed_groups else None
+        )
+        self.ple_group = self.ple_groups[0] if self.ple_groups else None
+        primary = self.full_attn_groups[0]
+        self.compressed_index_aligned = False
+        if self.compressed_group is not None:
+            if self.compressed_group.block_size != primary.block_size:
+                raise ValueError(
+                    "compressed_key_cache block_size must match the primary "
+                    "full-attention block_size, got "
+                    f"{self.compressed_group.block_size} vs {primary.block_size}"
+                )
+            self.compressed_index_aligned = True
+        if len(self.compressed_groups) > 1:
+            logger.warning(
+                "Multiple compressed_key_cache groups found; dump/load pairs "
+                "block ids from group %s only.",
+                self.compressed_group.group_id if self.compressed_group else None,
+            )
+        self.ple_carrier_group_id = select_ple_carrier_group_id(
+            self.state_groups, self.ple_groups, kv_cache_config
+        )
+
         logger.info(
             "KVCacheGroupManager initialized: "
             f"lcm_block_size={self.lcm_block_size}, "
             f"full_attn_groups="
             f"{[(g.group_id, g.block_size) for g in self.full_attn_groups]}, "
             f"state_groups="
-            f"{[(g.group_id, g.block_size, g.is_mamba_align) for g in self.state_groups]}"
+            f"{[(g.group_id, g.block_size, g.is_mamba_align) for g in self.state_groups]}, "
+            f"compressed_groups="
+            f"{[(g.group_id, g.block_size) for g in self.compressed_groups]}, "
+            f"ple_groups="
+            f"{[(g.group_id, g.block_size) for g in self.ple_groups]}, "
+            f"ple_carrier_group_id={self.ple_carrier_group_id}"
         )
 
     @property
     def num_groups(self) -> int:
         return len(self.groups_by_id)
 
+    @property
+    def has_side_caches(self) -> bool:
+        """True when attention/mamba records must also carry compressed or PLE."""
+        return self.compressed_group is not None or self.ple_group is not None
+
     def compute_block_hashes(self, group: GroupInfo, request: "Request") -> list[bytes]:
         """Hash a request at one group's block boundaries and chain seed."""
-        if group.is_mamba_align:
-            # mamba-align pads block table with null blocks; no per-block hash.
+        if group.is_mamba_align or group.kind in _SIDE_CACHE_ROLES:
+            # mamba-align, PLE, compressed, and the raw ring do not own a
+            # prefix-hash chain. Compressed pages reuse the full-attention
+            # block hash; PLE rides on the carrier mamba state hash.
             return [b""] * (len(request.all_token_ids) // group.block_size)
 
         assert group.block_hasher is not None
@@ -423,6 +712,9 @@ class HybridLinearAttentionLayout(KVCacheLayout):
       across all physical blocks.
     - CUDA stores one contiguous page per physical block. The same bytes are
       viewed as either attention [K, V] or mamba [conv, ssm, padding].
+    - CUDA direct mode appends Qwen3.8-Flash-Next compressed-key and PLE
+      segments after those hybrid pages. The raw QSA ring is not stored.
+      Layerwise mode keeps one row per raw tensor and does not add them.
 
     The store receives one unified tensor_size_list, so we expose the three
     physical slices for Ascend, while CUDA is exposed as one contiguous page
@@ -546,7 +838,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         shared_specs: list[KVCacheSpec] = []
         shared_ptrs: list[int] = []
         layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
-        for layer_name in raw_tensor.shared_by:
+        for layer_name in _tensor_layers(raw_tensor):
             kv_layer = kvcaches.get(layer_name)
             if kv_layer is None:
                 continue
@@ -677,18 +969,107 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         tensor_size_lists.append(sizes)
         block_stride_lists.append(sizes)
 
+    def _note_hybrid_segments(self, tensor_size_lists, before: int) -> None:
+        added = sum(len(row) for row in tensor_size_lists) - before
+        if added > 0:
+            self.segment_kinds.extend(["hybrid"] * added)
+
+    def _append_role_segments(
+        self,
+        kvcaches,
+        role: str,
+        base_ptrs: list[list[int]],
+        buffer_size_rows: list[list[int]],
+        tensor_size_lists: list[list[int]],
+        block_stride_lists: list[list[int]],
+    ) -> None:
+        """One store segment per layer, addressed by that group's block id."""
+        layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
+        names = _ordered_role_layers(self.kv_cache_config, role)
+        found = 0
+        for name in names:
+            tensor = _unwrap_kv_tensor(kvcaches.get(name))
+            if tensor is None:
+                logger.warning("HLA side segment missing kv tensor for %s", name)
+                continue
+            specs = layer_to_specs.get(name, [])
+            spec = specs[0] if specs else None
+            stride = _block_stride_bytes(tensor)
+            page = _spec_page_bytes(spec) if spec is not None else 0
+            if page <= 0:
+                page = stride
+            region = _view_region_bytes(tensor)
+            if stride <= 0 or page <= 0:
+                logger.warning(
+                    "HLA side segment has no positive stride for %s "
+                    "(stride=%s, page=%s)",
+                    name,
+                    stride,
+                    page,
+                )
+                continue
+            if page > stride or page > region:
+                raise ValueError(
+                    f"HLA {role} page for {name} is {page} bytes, but the "
+                    f"layer view stride is {stride} and the registered "
+                    f"region is {region}. Refusing to truncate the page."
+                )
+            base_ptrs.append([int(tensor.data_ptr())])
+            buffer_size_rows.append([int(region)])
+            tensor_size_lists.append([int(page)])
+            block_stride_lists.append([int(stride)])
+            self.segment_kinds.append(role)
+            found += 1
+        if names and found == 0:
+            logger.warning(
+                "HLA direct layout found no device tensors for %s layers %s",
+                role,
+                names,
+            )
+
+    def record_ptrs(
+        self,
+        record_kind: str,
+        primary_block_id: int,
+        compressed_block_id: int,
+        ple_block_id: int,
+    ) -> list[int]:
+        return assemble_side_record_ptrs(
+            self.segment_kinds,
+            [int(value) for value in self.base_ptrs.tolist()],
+            [int(value) for value in self.block_stride_lists.tolist()],
+            int(self.sink_ptr),
+            record_kind,
+            int(primary_block_id),
+            int(compressed_block_id),
+            int(ple_block_id),
+        )
+
     def _build_layout(self, kvcaches):
         base_ptrs = []
         buffer_size_rows = []
         tensor_size_lists = []
         block_stride_lists = []
         self.layer_name_to_row: dict[str, int] = {}
+        self.segment_kinds: list[str] = []
+        self.has_side_segments = False
+        self.sink_ptr = 0
+        self.sink_bytes = 0
+        self._sink_tensor = None
 
         is_npu = current_platform.device_type == "npu"
+        # Layerwise keeps one row per raw tensor. Side-cache segments are
+        # part of the direct (whole-block) store object only.
+        emit_side = (not self.use_layerwise) and (not is_npu)
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
-            if not raw_tensor.shared_by:
+            layer_names = _tensor_layers(raw_tensor)
+            if not layer_names:
                 continue
+            if emit_side:
+                roles = {_layer_role(name) for name in layer_names}
+                if roles and roles <= _SIDE_CACHE_ROLES:
+                    continue
 
             shared_specs, shared_ptrs = self._collect_shared_tensor_info(
                 raw_tensor, kvcaches
@@ -696,13 +1077,14 @@ class HybridLinearAttentionLayout(KVCacheLayout):
 
             if not shared_ptrs:
                 logger.warning(
-                    f"no kv cache tensor found for shared layers {raw_tensor.shared_by}"
+                    f"no kv cache tensor found for shared layers {layer_names}"
                 )
                 continue
 
             row_id = len(base_ptrs)
             mamba_specs = [s for s in shared_specs if isinstance(s, MambaSpec)]
             attn_specs = [s for s in shared_specs if isinstance(s, FullAttentionSpec)]
+            size_count = sum(len(row) for row in tensor_size_lists)
 
             # Ascend: hybrid → component_major, attn-only → attn_only, else contiguous.
             if is_npu and mamba_specs and attn_specs:
@@ -735,9 +1117,61 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     tensor_size_lists,
                     block_stride_lists,
                 )
+            self._note_hybrid_segments(tensor_size_lists, size_count)
 
-            for layer_name in raw_tensor.shared_by:
+            for layer_name in layer_names:
                 self.layer_name_to_row[layer_name] = row_id
+
+        if emit_side:
+            self._append_role_segments(
+                kvcaches,
+                "compressed",
+                base_ptrs,
+                buffer_size_rows,
+                tensor_size_lists,
+                block_stride_lists,
+            )
+            self._append_role_segments(
+                kvcaches,
+                "ple",
+                base_ptrs,
+                buffer_size_rows,
+                tensor_size_lists,
+                block_stride_lists,
+            )
+
+        flat_count = sum(len(row) for row in tensor_size_lists)
+        if len(self.segment_kinds) != flat_count:
+            raise RuntimeError(
+                "HLA segment kinds do not match the flattened layout: "
+                f"kinds={len(self.segment_kinds)}, segments={flat_count}"
+            )
+        self.has_side_segments = any(
+            kind in ("compressed", "ple") for kind in self.segment_kinds
+        )
+        if self.has_side_segments:
+            width = max(int(size) for row in tensor_size_lists for size in row)
+            device = None
+            for value in kvcaches.values():
+                tensor = _unwrap_kv_tensor(value)
+                if tensor is not None:
+                    device = tensor.device
+                    break
+            if device is None:
+                raise RuntimeError(
+                    "HLA side-cache segments were built without a kv cache device."
+                )
+            self._sink_tensor = torch.zeros(width, dtype=torch.uint8, device=device)
+            self.sink_ptr = int(self._sink_tensor.data_ptr())
+            self.sink_bytes = width
+            logger.info(
+                "Hybrid direct layout side segments: "
+                f"hybrid={self.segment_kinds.count('hybrid')}, "
+                f"compressed={self.segment_kinds.count('compressed')}, "
+                f"ple={self.segment_kinds.count('ple')}, "
+                f"block_bytes={sum(int(size) for row in tensor_size_lists for size in row)}, "
+                f"sink_bytes={self.sink_bytes}"
+            )
 
         self._finalize_layout_arrays(
             base_ptrs,
@@ -753,6 +1187,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
     Merges the former UCMHMAConnector logic (group-aware hashing, two-stage
     lookup, per-group dispatch) with the HybridLinearAttentionLayout
     specialization for shared KV tensor pages.
+
+    Direct mode stores Qwen3.8-Flash-Next compressed-key pages in the
+    full-attention record and the PLE short-conv in the same-layer mamba
+    state record. The QSA raw ring is left out of the store and the LCM.
     """
 
     @classmethod
@@ -770,7 +1208,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         for raw_tensor in kv_cache_config.kv_cache_tensors:
             shared_specs = [
                 spec
-                for layer_name in raw_tensor.shared_by
+                for layer_name in _tensor_layers(raw_tensor)
                 for spec in layer_to_specs.get(layer_name, [])
             ]
             if any(
@@ -887,6 +1325,14 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 gpu_kv_buffer_set.add(key)
                 gpu_kv_buffer_addrs.append(key[0])
                 gpu_kv_buffer_sizes.append(key[1])
+            sink_ptr = int(getattr(kv_cache_layout, "sink_ptr", 0) or 0)
+            sink_bytes = int(getattr(kv_cache_layout, "sink_bytes", 0) or 0)
+            if sink_ptr and sink_bytes:
+                sink_key = (sink_ptr, sink_bytes)
+                if sink_key not in gpu_kv_buffer_set:
+                    gpu_kv_buffer_set.add(sink_key)
+                    gpu_kv_buffer_addrs.append(sink_key[0])
+                    gpu_kv_buffer_sizes.append(sink_key[1])
             config["gpu_kv_buffer_addrs"] = gpu_kv_buffer_addrs
             config["gpu_kv_buffer_sizes"] = gpu_kv_buffer_sizes
             if cpu_affinity_cores:
@@ -1087,7 +1533,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         gid: int,
         seq_len: int,
         reason: str,
-    ) -> None:
+    ) -> bool:
         group = self.group_manager.groups_by_id[gid]
         state_idx = max((seq_len - 1) // group.block_size, 0)
         vllm_state_idx = state_idx
@@ -1107,9 +1553,9 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 f"vllm_state_idx={vllm_state_idx}, "
                 f"num_vllm_blocks={len(req_meta.group_vllm_block_ids[gid])}"
             )
-            return
+            return False
         if vllm_block_id == 0:
-            return
+            return False
         ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
             group, seq_len, req_meta.group_ucm_block_ids
         )
@@ -1119,9 +1565,136 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 f"request_id={request_id}, group_id={gid}, reason={reason}, "
                 f"seq_len={seq_len}, state_idx={state_idx}"
             )
-            return
+            return False
         dst_ucm_block_ids.append(ucm_block_id)
         dst_vllm_block_ids.append(vllm_block_id)
+        return True
+
+    def _tracked_full_attn_count(self, record_count: int) -> int:
+        """Attention-record prefix length visible to the worker.
+
+        Non-MLA models historically left this at 0 because rank scoping does
+        not split the flat list. Side-cache loads need the split so compressed
+        ids stay aligned with attention records.
+        """
+        manager = self.group_manager
+        if self.is_mla or (manager is not None and manager.has_side_caches):
+            return record_count
+        return 0
+
+    def _vllm_block_at(self, req_meta: "HLARequestMeta", gid: int, index: int) -> int:
+        block_ids = req_meta.group_vllm_block_ids[gid]
+        if index < 0 or index >= len(block_ids):
+            return 0
+        return int(block_ids[index])
+
+    def _ple_state_block_id(
+        self,
+        req_meta: "HLARequestMeta",
+        request_id: str,
+        seq_len: int,
+        reason: str,
+    ) -> int:
+        """PLE physical block paired with one carrier mamba state record."""
+        manager = self.group_manager
+        assert manager is not None
+        ple = manager.ple_group
+        if ple is None:
+            return 0
+        state_idx = max((seq_len - 1) // ple.block_size, 0)
+        vllm_state_idx = state_idx
+        block_ids = req_meta.group_vllm_block_ids[ple.group_id]
+        if reason == "load":
+            for i in range(len(block_ids) - 1, -1, -1):
+                if block_ids[i] != 0:
+                    vllm_state_idx = i
+                    break
+        if vllm_state_idx < 0 or vllm_state_idx >= len(block_ids):
+            logger.error(
+                "HLA PLE vLLM block missing: "
+                f"request_id={request_id}, group_id={ple.group_id}, "
+                f"reason={reason}, seq_len={seq_len}, state_idx={state_idx}, "
+                f"vllm_state_idx={vllm_state_idx}, num_vllm_blocks={len(block_ids)}"
+            )
+            return 0
+        return int(block_ids[vllm_state_idx])
+
+    def _append_full_attn_window(
+        self,
+        dst_ucm: list[bytes],
+        dst_vllm: list[int],
+        dst_compressed: list[int],
+        req_meta: "HLARequestMeta",
+        tok_start: int,
+        tok_end: int,
+    ) -> None:
+        manager = self.group_manager
+        assert manager is not None
+        primary_gid = manager.full_attn_groups[0].group_id
+        compressed = manager.compressed_group
+        collect_side = manager.has_side_caches
+        for group in manager.groups_by_id:
+            if group.kind != "full_attn":
+                continue
+            start_blk = tok_start // group.block_size
+            end_blk = tok_end // group.block_size
+            if start_blk >= end_blk:
+                continue
+            ucm_ids = req_meta.group_ucm_block_ids[group.group_id][start_blk:end_blk]
+            vllm_ids = req_meta.group_vllm_block_ids[group.group_id][start_blk:end_blk]
+            for offset, (ucm_id, vllm_id) in enumerate(zip(ucm_ids, vllm_ids)):
+                if vllm_id == 0:
+                    continue
+                dst_ucm.append(ucm_id)
+                dst_vllm.append(vllm_id)
+                if not collect_side:
+                    continue
+                comp_id = 0
+                if (
+                    manager.compressed_index_aligned
+                    and compressed is not None
+                    and group.group_id == primary_gid
+                ):
+                    comp_id = self._vllm_block_at(
+                        req_meta, compressed.group_id, start_blk + offset
+                    )
+                dst_compressed.append(comp_id)
+
+    def _append_mamba_window(
+        self,
+        dst_ucm: list[bytes],
+        dst_vllm: list[int],
+        dst_ple: list[int],
+        req_meta: "HLARequestMeta",
+        request_id: str,
+        seq_len: int,
+        reason: str,
+    ) -> None:
+        manager = self.group_manager
+        assert manager is not None
+        for group in manager.groups_by_id:
+            if group.kind != "mamba":
+                continue
+            appended = self._append_mamba_align_state_block(
+                dst_ucm,
+                dst_vllm,
+                req_meta,
+                request_id,
+                group.group_id,
+                seq_len,
+                reason,
+            )
+            if not appended or not manager.has_side_caches:
+                continue
+            ple_id = 0
+            if (
+                manager.ple_group is not None
+                and group.group_id == manager.ple_carrier_group_id
+            ):
+                ple_id = self._ple_state_block_id(
+                    req_meta, request_id, seq_len, reason
+                )
+            dst_ple.append(ple_id)
 
     def _generate_hla_dispatch_meta(
         self,
@@ -1134,7 +1707,6 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
     ) -> HLARequestDispatchMeta:
         """Build a flat (ucm, vllm) block id pair list across all groups."""
         assert self.group_manager is not None
-        groups_by_id = self.group_manager.groups_by_id
         num_groups = self.group_manager.num_groups
         lcm_block_size = self.group_manager.lcm_block_size
 
@@ -1157,8 +1729,12 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
         load_ucm_block_ids: list[bytes] = []
         load_vllm_block_ids: list[int] = []
+        load_compressed_block_ids: list[int] = []
+        load_ple_block_ids: list[int] = []
         dump_ucm_block_ids: list[bytes] = []
         dump_vllm_block_ids: list[int] = []
+        dump_compressed_block_ids: list[int] = []
+        dump_ple_block_ids: list[int] = []
 
         external_hit_lcm_blocks = (
             req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
@@ -1167,36 +1743,29 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         total_hit_tokens = req_meta.total_hit_block_num * lcm_block_size
 
         if need_load and external_hit_lcm_blocks > 0:
-            # Pass 1: full-attention blocks first (for MLA rank-0-only dump)
-            for gid, group in enumerate(groups_by_id):
-                if group.is_mamba_align:
-                    continue
-                load_tok_start = hbm_hit_tokens
-                load_tok_end = total_hit_tokens
-                start_blk = load_tok_start // group.block_size
-                end_blk = load_tok_end // group.block_size
-                if start_blk >= end_blk:
-                    continue
-                extend_non_null(
-                    load_ucm_block_ids,
-                    load_vllm_block_ids,
-                    req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
-                    req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
-                )
-            load_full_attn_count = len(load_ucm_block_ids) if self.is_mla else 0
-            # Pass 2: mamba state blocks
-            for gid, group in enumerate(groups_by_id):
-                if not group.is_mamba_align:
-                    continue
-                self._append_mamba_align_state_block(
-                    load_ucm_block_ids,
-                    load_vllm_block_ids,
-                    req_meta,
-                    request_id,
-                    gid,
-                    total_hit_tokens,
-                    "load",
-                )
+            # Pass 1: full-attention blocks first (for MLA rank-0-only dump).
+            # Compressed pages share these hashes and are not their own records.
+            self._append_full_attn_window(
+                load_ucm_block_ids,
+                load_vllm_block_ids,
+                load_compressed_block_ids,
+                req_meta,
+                hbm_hit_tokens,
+                total_hit_tokens,
+            )
+            load_full_attn_count = self._tracked_full_attn_count(
+                len(load_ucm_block_ids)
+            )
+            # Pass 2: mamba state blocks. PLE is attached to the carrier only.
+            self._append_mamba_window(
+                load_ucm_block_ids,
+                load_vllm_block_ids,
+                load_ple_block_ids,
+                req_meta,
+                request_id,
+                total_hit_tokens,
+                "load",
+            )
         else:
             load_full_attn_count = 0
 
@@ -1208,33 +1777,24 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             first_lcm_b = (dump_tok_start // lcm_block_size + 1) * lcm_block_size
             last_lcm_b = (dump_tok_end // lcm_block_size) * lcm_block_size
 
-            # Pass 1: full-attention blocks first
-            for gid, group in enumerate(groups_by_id):
-                if group.is_mamba_align:
-                    continue
-                start_blk = dump_tok_start // group.block_size
-                end_blk = dump_tok_end // group.block_size
-                if start_blk >= end_blk:
-                    continue
-                extend_non_null(
+            self._append_full_attn_window(
+                dump_ucm_block_ids,
+                dump_vllm_block_ids,
+                dump_compressed_block_ids,
+                req_meta,
+                dump_tok_start,
+                dump_tok_end,
+            )
+            dump_full_attn_count = self._tracked_full_attn_count(
+                len(dump_ucm_block_ids)
+            )
+            if dump_tok_end == last_lcm_b and last_lcm_b >= first_lcm_b:
+                self._append_mamba_window(
                     dump_ucm_block_ids,
                     dump_vllm_block_ids,
-                    req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
-                    req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
-                )
-            dump_full_attn_count = len(dump_ucm_block_ids) if self.is_mla else 0
-            # Pass 2: mamba state blocks
-            for gid, group in enumerate(groups_by_id):
-                if not group.is_mamba_align:
-                    continue
-                if dump_tok_end != last_lcm_b or last_lcm_b < first_lcm_b:
-                    continue
-                self._append_mamba_align_state_block(
-                    dump_ucm_block_ids,
-                    dump_vllm_block_ids,
+                    dump_ple_block_ids,
                     req_meta,
                     request_id,
-                    gid,
                     last_lcm_b,
                     "dump",
                 )
@@ -1248,6 +1808,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_block_ids=(dump_ucm_block_ids, dump_vllm_block_ids),
             load_full_attn_count=load_full_attn_count,
             dump_full_attn_count=dump_full_attn_count,
+            load_compressed_block_ids=load_compressed_block_ids,
+            dump_compressed_block_ids=dump_compressed_block_ids,
+            load_ple_block_ids=load_ple_block_ids,
+            dump_ple_block_ids=dump_ple_block_ids,
         )
 
     def build_connector_meta(
@@ -1362,6 +1926,59 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         scoped = [self.request_hasher(b) for b in ucm_ids]
         return ucm_ids, scoped, vllm_ids
 
+    def _uses_side_records(self) -> bool:
+        layout = getattr(self, "kv_cache_layout", None)
+        if not getattr(layout, "has_side_segments", False):
+            return False
+        if self.is_mla:
+            if not getattr(self, "_side_mla_warned", False):
+                logger.warning(
+                    "Flash-Next side-cache records are not combined with MLA "
+                    "rank scoping; using one block id for every segment."
+                )
+                self._side_mla_warned = True
+            return False
+        return True
+
+    def _side_record_ptrs(
+        self,
+        request,
+        vllm_block_ids: list[int],
+        full_attn_count: int,
+        is_dump: bool,
+    ) -> np.ndarray:
+        attn_count = int(full_attn_count or 0)
+        if is_dump:
+            compressed_ids = list(
+                getattr(request, "dump_compressed_block_ids", []) or []
+            )
+            ple_ids = list(getattr(request, "dump_ple_block_ids", []) or [])
+        else:
+            compressed_ids = list(
+                getattr(request, "load_compressed_block_ids", []) or []
+            )
+            ple_ids = list(getattr(request, "load_ple_block_ids", []) or [])
+        rows = []
+        for index, block_id in enumerate(vllm_block_ids):
+            if index < attn_count:
+                compressed_id = (
+                    compressed_ids[index] if index < len(compressed_ids) else 0
+                )
+                rows.append(
+                    self.kv_cache_layout.record_ptrs(
+                        "attn", block_id, compressed_id, 0
+                    )
+                )
+            else:
+                ple_index = index - attn_count
+                ple_id = ple_ids[ple_index] if ple_index < len(ple_ids) else 0
+                rows.append(
+                    self.kv_cache_layout.record_ptrs("mamba", block_id, 0, ple_id)
+                )
+        if not rows:
+            return np.zeros((0, 0), dtype=np.uint64)
+        return np.asarray(rows, dtype=np.uint64)
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Bulk load override: MLA blocks shared hash, KDA blocks per-rank hash."""
         metadata = self._get_connector_metadata()
@@ -1397,8 +2014,13 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 continue
             num_loaded_block -= len(request.load_block_ids[0]) - len(scoped_ucm)
             try:
-                ptrs = self.kv_cache_layout.extract_block_addrs(scoped_vllm)
-                ptrs = ptrs.reshape(ptrs.shape[0], -1)
+                if self._uses_side_records():
+                    ptrs = self._side_record_ptrs(
+                        request, scoped_vllm, n, is_dump=False
+                    )
+                else:
+                    ptrs = self.kv_cache_layout.extract_block_addrs(scoped_vllm)
+                    ptrs = ptrs.reshape(ptrs.shape[0], -1)
                 shard_indexs = [0] * len(scoped_ucm)
                 task = self._rank_consistency.submit_load(
                     self.store,
@@ -1459,8 +2081,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
         total_ucm_block_ids: list[bytes] = []
         total_vllm_block_ids: list[int] = []
+        total_ptr_chunks: list[np.ndarray] = []
         block_ids_by_request: dict[str, set[bytes]] = {}
         num_saved_block = 0
+        use_side_records = self._uses_side_records()
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -1474,14 +2098,23 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             num_saved_block += len(scoped_ucm)
             total_ucm_block_ids.extend(scoped_ucm)
             total_vllm_block_ids.extend(scoped_vllm)
+            if use_side_records:
+                total_ptr_chunks.append(
+                    self._side_record_ptrs(request, scoped_vllm, n, is_dump=True)
+                )
 
         if not total_ucm_block_ids:
             return
 
         event_handle = 0
         try:
-            total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
-            total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+            if use_side_records:
+                total_ptrs = np.concatenate(total_ptr_chunks, axis=0)
+            else:
+                total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                    total_vllm_block_ids
+                )
+                total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
             shard_indexs = [0] * len(total_ucm_block_ids)
             event_handle = self._get_dump_event_handle()
             save_start_time = time.perf_counter() * 1000
