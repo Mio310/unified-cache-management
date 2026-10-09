@@ -391,6 +391,24 @@ class GroupInfo:
         return self.kind == "full_attn" and not self.is_mamba_align
 
 
+def _layout_group_infos(kv_cache_config) -> list[GroupInfo]:
+    """Group roles for layout construction. Hashes are not needed here."""
+    infos = []
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        kind = _group_kind(group.layer_names, group.kv_cache_spec)
+        infos.append(
+            GroupInfo(
+                group_id=group_id,
+                block_size=block_size_from_kv_cache_spec(group.kv_cache_spec),
+                layer_names=tuple(group.layer_names),
+                seed=b"",
+                is_mamba_align=kind == "mamba",
+                kind=kind,
+            )
+        )
+    return infos
+
+
 class KVCacheGroupManager:
     """Group-aware hashing and two-stage lookup for hybrid (HLA) connectors."""
 
@@ -969,11 +987,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         tensor_size_lists.append(sizes)
         block_stride_lists.append(sizes)
 
-    def _note_hybrid_segments(self, tensor_size_lists, before: int) -> None:
-        added = sum(len(row) for row in tensor_size_lists) - before
-        if added > 0:
-            self.segment_kinds.extend(["hybrid"] * added)
-
     def _append_role_segments(
         self,
         kvcaches,
@@ -1018,7 +1031,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             buffer_size_rows.append([int(region)])
             tensor_size_lists.append([int(page)])
             block_stride_lists.append([int(stride)])
-            self.segment_kinds.append(role)
+            self.row_segment_kinds.append([role])
             found += 1
         if names and found == 0:
             logger.warning(
@@ -1045,6 +1058,186 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             int(ple_block_id),
         )
 
+    def row_record_ptrs(
+        self,
+        row_id: int,
+        record_kind: str,
+        primary_block_id: int,
+        compressed_block_id: int,
+        ple_block_id: int,
+    ) -> list[int]:
+        """Pointers for one layerwise row of one attention or mamba record."""
+        if row_id < 0 or row_id >= len(self.row_segment_kinds):
+            raise ValueError(
+                f"Invalid hybrid row_id={row_id}; "
+                f"row_count={len(self.row_segment_kinds)}"
+            )
+        row_slice = self.row_slices[row_id]
+        kinds = self.row_segment_kinds[row_id]
+        bases = [int(value) for value in self.base_ptrs[row_slice].tolist()]
+        strides = [int(value) for value in self.block_stride_lists[row_slice].tolist()]
+        if len(kinds) != len(bases):
+            raise RuntimeError(
+                "Layerwise row segment kinds do not match the row layout: "
+                f"row_id={row_id}, kinds={len(kinds)}, segments={len(bases)}"
+            )
+        return assemble_side_record_ptrs(
+            kinds,
+            bases,
+            strides,
+            int(self.sink_ptr),
+            record_kind,
+            int(primary_block_id),
+            int(compressed_block_id),
+            int(ple_block_id),
+        )
+
+    def _layer_view_segment(self, kvcaches, layer_name: str):
+        """Return ``(base, stride, page, region)`` for one layer view."""
+        tensor = _unwrap_kv_tensor(kvcaches.get(layer_name))
+        if tensor is None:
+            logger.warning("HLA side segment missing kv tensor for %s", layer_name)
+            return None
+        specs = layer_name_to_kv_cache_spec(self.kv_cache_config).get(layer_name, [])
+        spec = specs[0] if specs else None
+        stride = _block_stride_bytes(tensor)
+        page = _spec_page_bytes(spec) if spec is not None else 0
+        if page <= 0:
+            page = stride
+        region = _view_region_bytes(tensor)
+        if stride <= 0 or page <= 0 or page > stride or page > region:
+            raise ValueError(
+                f"HLA page for {layer_name} is {page} bytes, but the layer "
+                f"view stride is {stride} and the registered region is {region}."
+            )
+        return int(tensor.data_ptr()), int(stride), int(page), int(region)
+
+    def _augment_layerwise_side_rows(
+        self,
+        kvcaches,
+        base_ptrs,
+        buffer_size_rows,
+        tensor_size_lists,
+        block_stride_lists,
+    ) -> None:
+        """Append identical compressed and PLE slots to every CUDA hybrid row.
+
+        Slots that a row does not own stay at pointer 0 here and are retargeted
+        at the zero sink after that buffer exists. A stride of 0 keeps every
+        block id on that sink.
+        """
+        infos = _layout_group_infos(self.kv_cache_config)
+        compressed_groups = [group for group in infos if group.kind == "compressed"]
+        ple_groups = [group for group in infos if group.kind == "ple"]
+        state_groups = [group for group in infos if group.kind == "mamba"]
+        if not compressed_groups and not ple_groups:
+            return
+        if not tensor_size_lists:
+            return
+
+        compressed_by_index: dict[int, str] = {}
+        for group in compressed_groups:
+            for name in group.layer_names:
+                layer_index = _layer_index(name)
+                if layer_index is not None:
+                    compressed_by_index[layer_index] = name
+
+        carrier_layers: set[str] = set()
+        carrier_id = select_ple_carrier_group_id(
+            state_groups, ple_groups, self.kv_cache_config
+        )
+        if carrier_id is not None:
+            carrier_layers = set(infos[carrier_id].layer_names)
+
+        compressed_views: dict[str, tuple[int, int, int]] = {}
+        compressed_page = 0
+        for name in compressed_by_index.values():
+            view = self._layer_view_segment(kvcaches, name)
+            if view is None:
+                continue
+            base, stride, page, region = view
+            if compressed_page == 0:
+                compressed_page = page
+            elif page != compressed_page:
+                raise ValueError(
+                    "CUDA layerwise compressed pages must share one copy size: "
+                    f"{name} page={page}, expected={compressed_page}"
+                )
+            compressed_views[name] = (base, stride, region)
+        if compressed_groups and compressed_page <= 0:
+            raise ValueError(
+                "CUDA layerwise layout found compressed_key_cache groups "
+                "but no device page."
+            )
+
+        ple_page = 0
+        ple_view = None
+        ple_names = [name for group in ple_groups for name in group.layer_names]
+        if ple_names:
+            ple_view = self._layer_view_segment(kvcaches, ple_names[0])
+            if ple_view is not None:
+                ple_page = ple_view[2]
+        if ple_groups and ple_page <= 0:
+            raise ValueError(
+                "CUDA layerwise layout found a PLE group but no device page."
+            )
+
+        for row_id, layer_names in enumerate(self._row_layers):
+            if compressed_page > 0:
+                matched = None
+                for name in layer_names:
+                    if _layer_role(name):
+                        continue
+                    matched = compressed_by_index.get(_layer_index(name))
+                    if matched:
+                        break
+                view = compressed_views.get(matched) if matched else None
+                if view is not None and compressed_page <= view[1]:
+                    base, stride, region = view
+                    base_ptrs[row_id].append(base)
+                    buffer_size_rows[row_id].append(region)
+                    block_stride_lists[row_id].append(stride)
+                else:
+                    if view is not None and compressed_page > view[1]:
+                        raise ValueError(
+                            f"CUDA layerwise compressed page {compressed_page} "
+                            f"exceeds stride {view[1]} for {matched}"
+                        )
+                    base_ptrs[row_id].append(0)
+                    buffer_size_rows[row_id].append(0)
+                    block_stride_lists[row_id].append(0)
+                    self._sink_slots.append((row_id, len(base_ptrs[row_id]) - 1))
+                tensor_size_lists[row_id].append(compressed_page)
+                self.row_segment_kinds[row_id].append("compressed")
+            if ple_page > 0:
+                is_carrier = any(name in carrier_layers for name in layer_names)
+                if is_carrier and ple_view is not None and ple_page <= ple_view[1]:
+                    base, stride, _page, region = ple_view
+                    base_ptrs[row_id].append(base)
+                    buffer_size_rows[row_id].append(region)
+                    block_stride_lists[row_id].append(stride)
+                else:
+                    if (
+                        is_carrier
+                        and ple_view is not None
+                        and ple_page > ple_view[1]
+                    ):
+                        raise ValueError(
+                            f"CUDA layerwise PLE page {ple_page} exceeds "
+                            f"stride {ple_view[1]}"
+                        )
+                    base_ptrs[row_id].append(0)
+                    buffer_size_rows[row_id].append(0)
+                    block_stride_lists[row_id].append(0)
+                    self._sink_slots.append((row_id, len(base_ptrs[row_id]) - 1))
+                tensor_size_lists[row_id].append(ple_page)
+                self.row_segment_kinds[row_id].append("ple")
+        logger.info(
+            "CUDA layerwise side slots: "
+            f"rows={len(tensor_size_lists)}, compressed_page={compressed_page}, "
+            f"ple_page={ple_page}, carrier_layers={len(carrier_layers)}"
+        )
+
     def _build_layout(self, kvcaches):
         base_ptrs = []
         buffer_size_rows = []
@@ -1052,21 +1245,24 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         block_stride_lists = []
         self.layer_name_to_row: dict[str, int] = {}
         self.segment_kinds: list[str] = []
+        self.row_segment_kinds: list[list[str]] = []
+        self._row_layers: list[list[str]] = []
+        self._sink_slots: list[tuple[int, int]] = []
         self.has_side_segments = False
         self.sink_ptr = 0
         self.sink_bytes = 0
         self._sink_tensor = None
 
         is_npu = current_platform.device_type == "npu"
-        # Layerwise keeps one row per raw tensor. Side-cache segments are
-        # part of the direct (whole-block) store object only.
+        # Direct mode appends compressed and PLE as their own record segments.
+        # CUDA layerwise keeps one hybrid row and appends those pages onto it.
         emit_side = (not self.use_layerwise) and (not is_npu)
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             layer_names = _tensor_layers(raw_tensor)
             if not layer_names:
                 continue
-            if emit_side:
+            if not is_npu:
                 roles = {_layer_role(name) for name in layer_names}
                 if roles and roles <= _SIDE_CACHE_ROLES:
                     continue
@@ -1084,7 +1280,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             row_id = len(base_ptrs)
             mamba_specs = [s for s in shared_specs if isinstance(s, MambaSpec)]
             attn_specs = [s for s in shared_specs if isinstance(s, FullAttentionSpec)]
-            size_count = sum(len(row) for row in tensor_size_lists)
 
             # Ascend: hybrid → component_major, attn-only → attn_only, else contiguous.
             if is_npu and mamba_specs and attn_specs:
@@ -1117,7 +1312,8 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     tensor_size_lists,
                     block_stride_lists,
                 )
-            self._note_hybrid_segments(tensor_size_lists, size_count)
+            self.row_segment_kinds.append(["hybrid"] * len(tensor_size_lists[-1]))
+            self._row_layers.append(list(layer_names))
 
             for layer_name in layer_names:
                 self.layer_name_to_row[layer_name] = row_id
@@ -1139,6 +1335,18 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 tensor_size_lists,
                 block_stride_lists,
             )
+
+        if self.use_layerwise and not is_npu:
+            self._augment_layerwise_side_rows(
+                kvcaches,
+                base_ptrs,
+                buffer_size_rows,
+                tensor_size_lists,
+                block_stride_lists,
+            )
+        self.segment_kinds = [
+            kind for row in self.row_segment_kinds for kind in row
+        ]
 
         flat_count = sum(len(row) for row in tensor_size_lists)
         if len(self.segment_kinds) != flat_count:
@@ -1164,8 +1372,11 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             self._sink_tensor = torch.zeros(width, dtype=torch.uint8, device=device)
             self.sink_ptr = int(self._sink_tensor.data_ptr())
             self.sink_bytes = width
+            for row_idx, seg_idx in self._sink_slots:
+                base_ptrs[row_idx][seg_idx] = int(self.sink_ptr)
+                buffer_size_rows[row_idx][seg_idx] = int(self.sink_bytes)
             logger.info(
-                "Hybrid direct layout side segments: "
+                "Hybrid side-cache layout: "
                 f"hybrid={self.segment_kinds.count('hybrid')}, "
                 f"compressed={self.segment_kinds.count('compressed')}, "
                 f"ple={self.segment_kinds.count('ple')}, "
@@ -1190,7 +1401,9 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
     Direct mode stores Qwen3.8-Flash-Next compressed-key pages in the
     full-attention record and the PLE short-conv in the same-layer mamba
-    state record. The QSA raw ring is left out of the store and the LCM.
+    state record. CUDA layerwise keeps one row per hybrid pool and appends
+    those pages as extra segments on that row. The QSA raw ring is left out
+    of the store and the LCM.
     """
 
     @classmethod
@@ -2303,6 +2516,50 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         self._failure_req_ids.add(request_id)
         self._connector_worker_meta.mark_failed(request_id)
 
+    def _layerwise_row_ptrs(
+        self,
+        request,
+        vllm_block_ids: list[int],
+        full_attn_count: int,
+        row_id: int,
+        is_dump: bool,
+    ) -> np.ndarray:
+        """Row pointers, with compressed and PLE selected per record."""
+        layout = self.kv_cache_layout
+        if not getattr(layout, "has_side_segments", False):
+            return layout.extract_block_addrs_for_row(vllm_block_ids, row_id)
+        attn_count = int(full_attn_count or 0)
+        if is_dump:
+            compressed_ids = list(
+                getattr(request, "dump_compressed_block_ids", []) or []
+            )
+            ple_ids = list(getattr(request, "dump_ple_block_ids", []) or [])
+        else:
+            compressed_ids = list(
+                getattr(request, "load_compressed_block_ids", []) or []
+            )
+            ple_ids = list(getattr(request, "load_ple_block_ids", []) or [])
+        rows = []
+        for index, block_id in enumerate(vllm_block_ids):
+            if index < attn_count:
+                compressed_id = (
+                    compressed_ids[index] if index < len(compressed_ids) else 0
+                )
+                rows.append(
+                    layout.row_record_ptrs(
+                        row_id, "attn", block_id, compressed_id, 0
+                    )
+                )
+            else:
+                ple_index = index - attn_count
+                ple_id = ple_ids[ple_index] if ple_index < len(ple_ids) else 0
+                rows.append(
+                    layout.row_record_ptrs(row_id, "mamba", block_id, 0, ple_id)
+                )
+        if not rows:
+            return np.zeros((0, 0), dtype=np.uint64)
+        return np.asarray(rows, dtype=np.uint64)
+
     def _submit_request_load_tasks_for_row(
         self,
         row_id: int,
@@ -2317,9 +2574,19 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             if request_id in self._failure_req_ids:
                 continue
             try:
-                row_ptrs = self.kv_cache_layout.extract_block_addrs_for_row(
-                    vllm_block_ids, row_id
-                )
+                request_meta = metadata.request_meta[request_id]
+                if getattr(self.kv_cache_layout, "has_side_segments", False):
+                    row_ptrs = self._layerwise_row_ptrs(
+                        request_meta,
+                        vllm_block_ids,
+                        getattr(request_meta, "load_full_attn_count", 0),
+                        row_id,
+                        is_dump=False,
+                    )
+                else:
+                    row_ptrs = self.kv_cache_layout.extract_block_addrs_for_row(
+                        vllm_block_ids, row_id
+                    )
                 shard_indexs = [row_id] * len(store_block_ids)
                 task = self._rank_consistency.submit_load(
                     self.store,
@@ -2379,6 +2646,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         self._submitted_load_rows.clear()
         self._dumped_row_ids.clear()
         self._dump_transfer_data = None
+        self._dump_row_inputs = []
         self.need_load = False
         self._layerwise_load_bytes = 0
         self._layerwise_load_bytes_recorded = False
@@ -2481,9 +2749,22 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
 
         self.is_save = True
 
-        row_ptrs = self.kv_cache_layout.extract_block_addrs_for_row(
-            total_vllm_block_ids, row_id
-        )
+        if getattr(self.kv_cache_layout, "has_side_segments", False):
+            row_ptr_chunks = [
+                self._layerwise_row_ptrs(
+                    request, vllm_ids, full_attn_count, row_id, is_dump=True
+                )
+                for request, vllm_ids, full_attn_count in self._dump_row_inputs
+            ]
+            row_ptrs = (
+                np.concatenate(row_ptr_chunks, axis=0)
+                if row_ptr_chunks
+                else np.zeros((0, 0), dtype=np.uint64)
+            )
+        else:
+            row_ptrs = self.kv_cache_layout.extract_block_addrs_for_row(
+                total_vllm_block_ids, row_id
+            )
         shard_indexs = [row_id] * len(total_ucm_block_ids)
         try:
             row_ptrs = np.ascontiguousarray(row_ptrs)
@@ -2522,6 +2803,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         total_vllm_block_ids: list[int] = []
         dump_request_ids: set[str] = set()
         block_ids_by_request: dict[str, set[bytes]] = {}
+        self._dump_row_inputs = []
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -2535,6 +2817,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             block_ids_by_request[request_id] = set(rank0_ucm)
             total_ucm_block_ids.extend(scoped_ucm)
             total_vllm_block_ids.extend(scoped_vllm)
+            self._dump_row_inputs.append((request, list(scoped_vllm), int(n or 0)))
         return (
             total_ucm_block_ids,
             total_vllm_block_ids,

@@ -4,9 +4,12 @@ import pytest
 
 pytest.importorskip("vllm")
 
+import numpy as np
+
 from ucm.integration.vllm.hla_connector import (
     GroupInfo,
     HLARequestMeta,
+    HybridLinearAttentionLayout,
     KVCacheGroupManager,
     UCMHybridLinearAttentionConnector,
     _group_kind,
@@ -277,3 +280,18 @@ def test_legacy_hla_dispatch_keeps_full_attn_count_at_zero():
     assert meta.dump_block_ids[1] == [11, 31]
     assert meta.dump_compressed_block_ids == []
     assert meta.dump_ple_block_ids == []
+
+
+def test_layerwise_row_pointers_follow_the_record_kind():
+    layout = HybridLinearAttentionLayout.__new__(HybridLinearAttentionLayout)
+    layout.row_segment_kinds = [["hybrid", "compressed", "ple"]]
+    layout.row_slices = [slice(0, 3)]
+    layout.base_ptrs = np.array([1000, 3000, 4000], dtype=np.uint64)
+    layout.block_stride_lists = np.array([100, 50, 80], dtype=np.uint64)
+    layout.sink_ptr = 9
+
+    attention = layout.row_record_ptrs(0, "attn", 2, 4, 0)
+    mamba = layout.row_record_ptrs(0, "mamba", 3, 4, 5)
+
+    assert attention == [1200, 3200, 9]
+    assert mamba == [1300, 9, 4400]
