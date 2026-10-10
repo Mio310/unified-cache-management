@@ -30,14 +30,31 @@ def _log_once(key, message: str, *args) -> None:
 
 
 def _attn_metadata(layer_name: str):
+    """Return ``(metadata, reason)``. ``reason`` is ``ok`` when this layer is present."""
     from vllm.forward_context import get_forward_context
 
     metadata = get_forward_context().attn_metadata
     if isinstance(metadata, list):
         metadata = metadata[0] if metadata else None
-    if not isinstance(metadata, dict) or layer_name not in metadata:
-        return None
-    return metadata[layer_name]
+    if metadata is None:
+        return None, "attn_metadata_none"
+    if not isinstance(metadata, dict):
+        return None, f"attn_metadata_type={type(metadata).__name__}"
+    if layer_name not in metadata:
+        sample = list(metadata)[:4]
+        return None, f"layer_missing_in_attn_metadata sample={sample}"
+    return metadata[layer_name], "ok"
+
+
+def _row_save_state(connector, layer_name: str) -> str:
+    inner = getattr(connector, "connector", connector)
+    save_layers = getattr(inner, "row_save_layer", None)
+    if not isinstance(save_layers, dict):
+        return "row_save_layer_missing"
+    if layer_name in save_layers.values():
+        return "in_row_save_layer"
+    sample = list(save_layers.values())[:4]
+    return f"not_row_save_layer sample={sample}"
 
 
 def _install_layer_hook(layer_cls, method_name: str, layer_name_of, *, eager: bool):
@@ -60,10 +77,25 @@ def _install_layer_hook(layer_cls, method_name: str, layer_name_of, *, eager: bo
     @wraps(original)
     def wrapped(self, *args, **kwargs):
         layer_name = layer_name_of(self)
-        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        _log_once(
+            ("enter", method_name, layer_name),
+            "HLA qwen4 hook enter: method=%s layer=%s eager=%s",
+            method_name,
+            layer_name,
+            eager,
+        )
+        if not has_kv_transfer_group():
             _log_once(
                 ("skip", method_name, layer_name, "no_kv_transfer_group"),
                 "HLA qwen4 hook skip: method=%s layer=%s reason=no_kv_transfer_group",
+                method_name,
+                layer_name,
+            )
+            return original(self, *args, **kwargs)
+        if not is_v1_kv_transfer_group():
+            _log_once(
+                ("skip", method_name, layer_name, "not_v1"),
+                "HLA qwen4 hook skip: method=%s layer=%s reason=not_v1_kv_transfer_group",
                 method_name,
                 layer_name,
             )
@@ -79,25 +111,28 @@ def _install_layer_hook(layer_cls, method_name: str, layer_name_of, *, eager: bo
             )
             return original(self, *args, **kwargs)
 
-        attn_metadata = _attn_metadata(layer_name)
+        attn_metadata, meta_reason = _attn_metadata(layer_name)
         if attn_metadata is None:
             _log_once(
-                ("skip", method_name, layer_name, "no_attn_metadata"),
-                "HLA qwen4 hook skip: method=%s layer=%s reason=no_attn_metadata",
+                ("skip", method_name, layer_name, meta_reason),
+                "HLA qwen4 hook skip: method=%s layer=%s reason=%s",
                 method_name,
                 layer_name,
+                meta_reason,
             )
             return original(self, *args, **kwargs)
 
+        row_state = _row_save_state(connector, layer_name)
         # Load before this layer writes its cache. save_kv_layer itself ignores
         # every name except the hybrid row's last layer.
         connector.wait_for_layer_load(layer_name)
         result = original(self, *args, **kwargs)
         _log_once(
-            ("save", method_name, layer_name),
-            "HLA qwen4 hook save_kv_layer: method=%s layer=%s",
+            ("save", method_name, layer_name, row_state),
+            "HLA qwen4 hook save_kv_layer: method=%s layer=%s row_save=%s",
             method_name,
             layer_name,
+            row_state,
         )
         connector.save_kv_layer(
             layer_name, getattr(self, "kv_cache", None), attn_metadata
