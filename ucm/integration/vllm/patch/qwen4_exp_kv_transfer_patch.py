@@ -1,14 +1,15 @@
 """Connect CUDA Qwen3.8-Flash-Next QSA and GDN layers to UCM layerwise KV hooks.
 
-Same contract as the MiniMax M3 CUDA patch: before the layer writes its cache,
-``wait_for_layer_load``; after the write, ``save_kv_layer``. QSA full attention
-does not go through ``maybe_save_kv_layer_to_connector``. GDN reaches its cache
-update from ``_forward_core``, which the standard attention op never calls.
+QSA full attention is the row-save layer (indices 3, 7, 11, ... 47). Its
+``forward`` is inlined by ``torch.compile``, so a wrapper on ``forward`` never
+runs again after the warmup trace. The KV write itself is ``_run_qsa``, which
+vLLM already marks ``@eager_break_during_capture``. The save hook has to sit
+*inside* that decorator: breakable CUDA-graph replay calls only the inner
+function, and a wrapper outside the decorator is recorded into the graph and
+skipped on replay.
 
-``UCMHybridLinearAttentionLayerWiseConnector.save_kv_layer`` still ignores every
-layer except the row's last registered name. QSA ``forward`` is wrapped with
-``torch.compiler.disable`` so ``torch.compile`` cannot delete that call when a
-warmup trace sees no connector metadata.
+GDN reaches its cache update from ``_forward_core``, which is already a custom
+op and still runs as Python.
 """
 
 from functools import wraps
@@ -20,6 +21,7 @@ logger = init_logger(__name__)
 
 _PATCHED = "_ucm_kv_hooks_patched"
 _LOGGED = set()
+_OPS_READY = False
 
 
 def _log_once(key, message: str, *args) -> None:
@@ -27,6 +29,15 @@ def _log_once(key, message: str, *args) -> None:
         return
     _LOGGED.add(key)
     logger.info(message, *args)
+
+
+def _layer_index(layer_name: str) -> str:
+    parts = layer_name.split(".")
+    if "layers" in parts:
+        idx = parts.index("layers") + 1
+        if idx < len(parts):
+            return parts[idx]
+    return "?"
 
 
 def _attn_metadata(layer_name: str):
@@ -57,7 +68,219 @@ def _row_save_state(connector, layer_name: str) -> str:
     return f"not_row_save_layer sample={sample}"
 
 
-def _install_layer_hook(layer_cls, method_name: str, layer_name_of, *, eager: bool):
+def _qsa_module(layer_name: str):
+    from vllm.forward_context import get_forward_context
+
+    layers = getattr(get_forward_context(), "no_compile_layers", None)
+    if isinstance(layers, dict):
+        return layers.get(layer_name)
+    return None
+
+
+def _qsa_connector(layer_name: str):
+    """Return ``(connector, attn_metadata, reason)`` or ``(None, None, reason)``."""
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+        is_v1_kv_transfer_group,
+    )
+
+    if not has_kv_transfer_group():
+        return None, None, "no_kv_transfer_group"
+    if not is_v1_kv_transfer_group():
+        return None, None, "not_v1_kv_transfer_group"
+    connector = get_kv_transfer_group()
+    if not connector.has_connector_metadata():
+        return None, None, "no_connector_metadata"
+    attn_metadata, meta_reason = _attn_metadata(layer_name)
+    if attn_metadata is None:
+        return None, None, meta_reason
+    return connector, attn_metadata, "ok"
+
+
+def _qsa_wait(layer_name: str) -> None:
+    connector, _, reason = _qsa_connector(layer_name)
+    if connector is None:
+        _log_once(
+            ("qsa-skip", "begin", layer_name, reason),
+            "HLA qwen4 qsa op skip: phase=begin layer_idx=%s layer=%s reason=%s",
+            _layer_index(layer_name),
+            layer_name,
+            reason,
+        )
+        return
+    _log_once(
+        ("qsa-begin", layer_name),
+        "HLA qwen4 qsa op: phase=begin layer_idx=%s layer=%s",
+        _layer_index(layer_name),
+        layer_name,
+    )
+    connector.wait_for_layer_load(layer_name)
+
+
+def _qsa_save(layer_name: str) -> None:
+    connector, attn_metadata, reason = _qsa_connector(layer_name)
+    if connector is None:
+        _log_once(
+            ("qsa-skip", "end", layer_name, reason),
+            "HLA qwen4 qsa op skip: phase=end layer_idx=%s layer=%s reason=%s",
+            _layer_index(layer_name),
+            layer_name,
+            reason,
+        )
+        return
+    module = _qsa_module(layer_name)
+    row_state = _row_save_state(connector, layer_name)
+    _log_once(
+        ("qsa-save", layer_name, row_state),
+        "HLA qwen4 qsa op save_kv_layer: layer_idx=%s layer=%s row_save=%s",
+        _layer_index(layer_name),
+        layer_name,
+        row_state,
+    )
+    connector.save_kv_layer(
+        layer_name,
+        getattr(module, "kv_cache", None) if module is not None else None,
+        attn_metadata,
+    )
+
+
+def _register_qsa_ops() -> bool:
+    """Custom ops stay in the compiled graph when ``_run_qsa`` is inlined."""
+    global _OPS_READY
+    if _OPS_READY:
+        return True
+    try:
+        import torch
+        from vllm.utils.torch_utils import direct_register_custom_op
+    except ImportError:
+        logger.warning("Skip Qwen4Exp QSA KV ops: vLLM custom-op helper is missing")
+        return False
+
+    def begin(layer_name: str, output: torch.Tensor) -> torch.Tensor:
+        _qsa_wait(layer_name)
+        return output
+
+    def end(layer_name: str, output: torch.Tensor) -> torch.Tensor:
+        _qsa_save(layer_name)
+        return output
+
+    def fake_begin(layer_name: str, output: torch.Tensor) -> torch.Tensor:
+        return output
+
+    def fake_end(layer_name: str, output: torch.Tensor) -> torch.Tensor:
+        return output
+
+    tags = ()
+    if hasattr(torch, "Tag") and hasattr(torch.Tag, "cudagraph_unsafe"):
+        tags = (torch.Tag.cudagraph_unsafe,)
+
+    def _define(op_name: str, op_func, fake_impl) -> None:
+        kwargs = {
+            "op_name": op_name,
+            "op_func": op_func,
+            "mutates_args": ["output"],
+            "fake_impl": fake_impl,
+        }
+        try:
+            direct_register_custom_op(**kwargs, tags=tags)
+        except TypeError:
+            direct_register_custom_op(**kwargs)
+
+    try:
+        _define("ucm_qwen4_kv_layer_begin", begin, fake_begin)
+        _define("ucm_qwen4_kv_layer_end", end, fake_end)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "already" in message or "duplicate" in message or "exists" in message:
+            _OPS_READY = True
+            return True
+        logger.warning("UCM Qwen4Exp QSA KV op registration failed: %s", exc)
+        return False
+    _OPS_READY = True
+    return True
+
+
+def _qsa_output(args, kwargs):
+    import torch
+
+    output = kwargs.get("output")
+    if isinstance(output, torch.Tensor):
+        return output
+    # _run_qsa(projected_qk, positions, query, key, value, output, ...)
+    if len(args) >= 6 and isinstance(args[5], torch.Tensor):
+        return args[5]
+    return None
+
+
+def _eager_break_cell(fn):
+    """Closure cell of ``@eager_break_during_capture`` that replay invokes."""
+    code = getattr(fn, "__code__", None)
+    closure = getattr(fn, "__closure__", None)
+    qualname = getattr(fn, "__qualname__", "")
+    if (
+        code is None
+        or closure is None
+        or "eager_break_during_capture" not in qualname
+        or "fn" not in code.co_freevars
+    ):
+        return None
+    idx = code.co_freevars.index("fn")
+    if idx >= len(closure):
+        return None
+    return closure[idx]
+
+
+def _install_qsa_run_hook(layer_cls) -> bool:
+    current = getattr(layer_cls, "_run_qsa", None)
+    if not callable(current):
+        raise RuntimeError(
+            "UCM Qwen4Exp KV hooks require Qwen4ExpQSAAttention._run_qsa; "
+            "check compatibility with the installed vLLM version."
+        )
+    if getattr(current, _PATCHED, False):
+        return False
+
+    cell = _eager_break_cell(current)
+    original = cell.cell_contents if cell is not None else current
+    if getattr(original, _PATCHED, False):
+        return False
+    use_op = _register_qsa_ops()
+
+    def hooked(self, *args, **kwargs):
+        # Unconditional op calls. A Python ``if`` here is deleted when the
+        # warmup trace has no connector metadata.
+        layer_name = self.layer_name
+        output = _qsa_output(args, kwargs)
+        if use_op and output is not None:
+            import torch
+
+            torch.ops.vllm.ucm_qwen4_kv_layer_begin(layer_name, output)
+            result = original(self, *args, **kwargs)
+            torch.ops.vllm.ucm_qwen4_kv_layer_end(layer_name, output)
+            return result
+        _qsa_wait(layer_name)
+        result = original(self, *args, **kwargs)
+        _qsa_save(layer_name)
+        return result
+
+    setattr(hooked, _PATCHED, True)
+    if cell is not None:
+        cell.cell_contents = hooked
+        where = "inside eager_break_during_capture"
+    else:
+        setattr(layer_cls, "_run_qsa", hooked)
+        where = "Qwen4ExpQSAAttention._run_qsa"
+    setattr(current, _PATCHED, True)
+    logger.info(
+        "UCM Qwen4Exp QSA KV hooks applied on %s (custom_op=%s)",
+        where,
+        use_op,
+    )
+    return True
+
+
+def _install_layer_hook(layer_cls, method_name: str, layer_name_of) -> bool:
     original = getattr(layer_cls, method_name, None)
     if not callable(original):
         raise RuntimeError(
@@ -79,10 +302,9 @@ def _install_layer_hook(layer_cls, method_name: str, layer_name_of, *, eager: bo
         layer_name = layer_name_of(self)
         _log_once(
             ("enter", method_name, layer_name),
-            "HLA qwen4 hook enter: method=%s layer=%s eager=%s",
+            "HLA qwen4 hook enter: method=%s layer=%s",
             method_name,
             layer_name,
-            eager,
         )
         if not has_kv_transfer_group():
             _log_once(
@@ -123,8 +345,6 @@ def _install_layer_hook(layer_cls, method_name: str, layer_name_of, *, eager: bo
             return original(self, *args, **kwargs)
 
         row_state = _row_save_state(connector, layer_name)
-        # Load before this layer writes its cache. save_kv_layer itself ignores
-        # every name except the hybrid row's last layer.
         connector.wait_for_layer_load(layer_name)
         result = original(self, *args, **kwargs)
         _log_once(
@@ -139,10 +359,6 @@ def _install_layer_hook(layer_cls, method_name: str, layer_name_of, *, eager: bo
         )
         return result
 
-    if eager:
-        import torch
-
-        wrapped = torch.compiler.disable(wrapped)
     setattr(wrapped, _PATCHED, True)
     setattr(layer_cls, method_name, wrapped)
     return True
@@ -156,13 +372,7 @@ def patch_qwen4_exp_qsa_kv_hooks(mod):
             "UCM Qwen4Exp KV hooks require Qwen4ExpQSAAttention; "
             "check compatibility with the installed vLLM version."
         )
-    if _install_layer_hook(
-        layer_cls, "forward", lambda self: self.layer_name, eager=True
-    ):
-        logger.info(
-            "UCM Qwen4Exp QSA KV hooks applied: "
-            "wait_for_layer_load / save_kv_layer on Qwen4ExpQSAAttention.forward"
-        )
+    _install_qsa_run_hook(layer_cls)
 
 
 @when_imported("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
@@ -176,7 +386,7 @@ def patch_qwen_gdn_kv_hooks(mod):
     hooked = [
         name
         for name in ("_forward_core", "_forward_core_fused_norm_packed")
-        if _install_layer_hook(layer_cls, name, lambda self: self.prefix, eager=False)
+        if _install_layer_hook(layer_cls, name, lambda self: self.prefix)
     ]
     if hooked:
         logger.info("UCM Qwen GDN KV hooks applied on %s", ", ".join(hooked))
