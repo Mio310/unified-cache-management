@@ -214,15 +214,19 @@ def _qsa_output(args, kwargs):
 
 
 def _eager_break_cell(fn):
-    """Closure cell of ``@eager_break_during_capture`` that replay invokes."""
+    """Closure cell of ``@eager_break_during_capture`` that replay invokes.
+
+    ``functools.wraps`` replaces ``__qualname__`` with ``_run_qsa``'s, so the
+    wrapper has to be recognized by its code object instead.
+    """
     code = getattr(fn, "__code__", None)
     closure = getattr(fn, "__closure__", None)
-    qualname = getattr(fn, "__qualname__", "")
+    if code is None or closure is None or "fn" not in code.co_freevars:
+        return None
+    filename = (code.co_filename or "").replace("\\", "/")
     if (
-        code is None
-        or closure is None
-        or "eager_break_during_capture" not in qualname
-        or "fn" not in code.co_freevars
+        "breakable_cudagraph" not in filename
+        and "BreakableCUDAGraphCapture" not in code.co_names
     ):
         return None
     idx = code.co_freevars.index("fn")
@@ -272,10 +276,13 @@ def _install_qsa_run_hook(layer_cls) -> bool:
         setattr(layer_cls, "_run_qsa", hooked)
         where = "Qwen4ExpQSAAttention._run_qsa"
     setattr(current, _PATCHED, True)
+    code = getattr(current, "__code__", None)
     logger.info(
-        "UCM Qwen4Exp QSA KV hooks applied on %s (custom_op=%s)",
+        "UCM Qwen4Exp QSA KV hooks applied on %s (custom_op=%s file=%s qual=%s)",
         where,
         use_op,
+        getattr(code, "co_filename", ""),
+        getattr(current, "__qualname__", ""),
     )
     return True
 
@@ -364,8 +371,10 @@ def _install_layer_hook(layer_cls, method_name: str, layer_name_of) -> bool:
     return True
 
 
-@when_imported("vllm.models.qwen4_exp.nvidia.qsa")
-def patch_qwen4_exp_qsa_kv_hooks(mod):
+def _patch_qsa_module(mod) -> None:
+    logger.info(
+        "UCM Qwen4Exp QSA module imported: %s", getattr(mod, "__file__", mod)
+    )
     layer_cls = getattr(mod, "Qwen4ExpQSAAttention", None)
     if layer_cls is None:
         raise RuntimeError(
@@ -373,6 +382,14 @@ def patch_qwen4_exp_qsa_kv_hooks(mod):
             "check compatibility with the installed vLLM version."
         )
     _install_qsa_run_hook(layer_cls)
+
+
+@when_imported("vllm.models.qwen4_exp.nvidia.qsa")
+def patch_qwen4_exp_qsa_kv_hooks(mod):
+    _patch_qsa_module(mod)
+
+
+logger.info("UCM Qwen4Exp KV patch loaded")
 
 
 @when_imported("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
