@@ -318,6 +318,10 @@ def apply_all_patches() -> None:
         import ucm.integration.vllm.patch.v0270.vllm.models.kimi_k3.nvidia.kimi_k3_mla_kv_hook_patch
         import ucm.integration.vllm.patch.v0271.vllm.minimax_m3_kv_transfer_patch
 
+        # Qwen3.8-Flash-Next QSA / GDN bypass maybe_save_kv_layer_to_connector.
+        # @when_imported fires only when those vLLM modules exist.
+        import ucm.integration.vllm.patch.qwen4_exp_kv_transfer_patch
+
         logger.info("UCM patch initialization completed!")
 
     except Exception as e:
