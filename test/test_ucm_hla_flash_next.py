@@ -118,7 +118,8 @@ def test_compressed_key_inside_full_attention_group_uses_that_block_id():
             )
         ]
     )
-    assert manager.compressed_groups == []
+    assert manager.compressed_groups == [manager.full_attn_groups[0]]
+    assert manager.compressed_group is manager.full_attn_groups[0]
     assert manager.compressed_shares_full_attn_blocks
     assert manager.compressed_layer_names == [
         "model.layers.0.self_attn.compressed_key_cache"

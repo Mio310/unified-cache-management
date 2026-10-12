@@ -473,6 +473,11 @@ class KVCacheGroupManager:
             self.groups_by_id.append(info)
             if kind == "full_attn":
                 self.full_attn_groups.append(info)
+                # compressed_key_cache lives in this same group, so kind is
+                # full_attn. Also record it here; otherwise compressed_groups
+                # stays empty and the compressed pages are never addressed.
+                if any(_layer_role(name) == "compressed" for name in info.layer_names):
+                    self.compressed_groups.append(info)
             elif kind == "mamba":
                 self.state_groups.append(info)
             elif kind == "compressed":
