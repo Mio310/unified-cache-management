@@ -70,6 +70,16 @@ def test_layer_role_matches_components_not_substrings():
         == "raw"
     )
     assert _group_kind(["model.layers.0.self_attn"], _spec(16)) == "full_attn"
+    assert (
+        _group_kind(
+            [
+                "model.layers.0.self_attn",
+                "model.layers.0.self_attn.compressed_key_cache",
+            ],
+            _spec(16),
+        )
+        == "full_attn"
+    )
 
 
 def test_raw_ring_is_excluded_from_lcm_and_lookup_groups():
@@ -94,6 +104,50 @@ def test_raw_ring_is_excluded_from_lcm_and_lookup_groups():
     assert manager.compute_block_hashes(manager.groups_by_id[1], request) == [b""]
     assert manager.compute_block_hashes(manager.groups_by_id[3], request) == [b""]
     assert manager.compute_block_hashes(manager.groups_by_id[4], request) == [b""]
+
+
+def test_compressed_key_inside_full_attention_group_uses_that_block_id():
+    manager, _ = _manager(
+        [
+            _group(
+                [
+                    "model.layers.0.self_attn",
+                    "model.layers.0.self_attn.compressed_key_cache",
+                ],
+                16,
+            )
+        ]
+    )
+    assert manager.compressed_groups == []
+    assert manager.compressed_shares_full_attn_blocks
+    assert manager.compressed_layer_names == [
+        "model.layers.0.self_attn.compressed_key_cache"
+    ]
+
+    connector = UCMHybridLinearAttentionConnector.__new__(
+        UCMHybridLinearAttentionConnector
+    )
+    connector.group_manager = manager
+    connector.is_mla = False
+    req_meta = HLARequestMeta(
+        ucm_block_ids=[b"attn0"],
+        hbm_hit_block_num=0,
+        total_hit_block_num=0,
+        num_token_ids=16,
+        token_processed=0,
+        group_ucm_block_ids=[[b"attn0"]],
+        group_vllm_block_ids=[[11]],
+    )
+    meta = connector._generate_hla_dispatch_meta(
+        req_meta,
+        16,
+        ([11],),
+        need_load=False,
+        request_id="req",
+        incoming_block_ids_are_full=True,
+    )
+    assert meta.dump_block_ids[1] == [11]
+    assert meta.dump_compressed_block_ids == [11]
 
 
 def test_compressed_block_size_must_match_primary_attention():

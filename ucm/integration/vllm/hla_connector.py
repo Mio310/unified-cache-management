@@ -194,16 +194,17 @@ def _spec_prefix_cacheable(spec: KVCacheSpec) -> bool:
 def _group_kind(layer_names, spec: KVCacheSpec) -> str:
     """Classify a vLLM KV group for HLA dump and lookup.
 
-    Qwen3.8-Flash-Next keeps compressed history, the QSA raw ring, and the
-    PLE short-conv in their own groups. Those groups stay in ``groups_by_id``
-    so allocated block-id tuples stay aligned, but they are not full-attention
-    or mamba-align records.
+    ``compressed_key_cache`` shares the full-attention group and its block
+    table. A mixed group stays ``full_attn`` so those layers are not dropped.
+    A group whose layers are only compressed, raw, or PLE keeps that role.
     """
     roles = [_layer_role(name) for name in layer_names]
     if roles and all(role and role == roles[0] for role in roles):
         return roles[0]
     if is_mamba_align_kv_cache_spec(spec):
         return "mamba"
+    if any(not role for role in roles) or any(role == "compressed" for role in roles):
+        return "full_attn"
     if not _spec_prefix_cacheable(spec):
         return "raw"
     return "full_attn"
@@ -294,6 +295,26 @@ def _ordered_role_layers(kv_cache_config, role: str) -> list[str]:
             continue
         seen.add(name)
         names.append(name)
+    names.sort(
+        key=lambda name: (
+            _layer_index(name) is None,
+            _layer_index(name) or 0,
+            name,
+        )
+    )
+    return names
+
+
+def _compressed_layer_names(kv_cache_config) -> list[str]:
+    """Every compressed-key layer, including ones inside a full-attention group."""
+    names = []
+    seen = set()
+    for group in kv_cache_config.kv_cache_groups:
+        for name in group.layer_names:
+            if _layer_role(name) != "compressed" or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
     names.sort(
         key=lambda name: (
             _layer_index(name) is None,
@@ -486,10 +507,17 @@ class KVCacheGroupManager:
         self.compressed_group = (
             self.compressed_groups[0] if self.compressed_groups else None
         )
+        self.compressed_layer_names = [
+            name
+            for group in self.full_attn_groups
+            for name in group.layer_names
+            if _layer_role(name) == "compressed"
+        ]
+        self.compressed_shares_full_attn_blocks = bool(self.compressed_layer_names)
         self.ple_group = self.ple_groups[0] if self.ple_groups else None
         primary = self.full_attn_groups[0]
-        self.compressed_index_aligned = False
-        if self.compressed_group is not None:
+        self.compressed_index_aligned = self.compressed_shares_full_attn_blocks
+        if self.compressed_group is not None and not self.compressed_shares_full_attn_blocks:
             if self.compressed_group.block_size != primary.block_size:
                 raise ValueError(
                     "compressed_key_cache block_size must match the primary "
@@ -516,6 +544,7 @@ class KVCacheGroupManager:
             f"{[(g.group_id, g.block_size, g.is_mamba_align) for g in self.state_groups]}, "
             f"compressed_groups="
             f"{[(g.group_id, g.block_size) for g in self.compressed_groups]}, "
+            f"compressed_in_full_attn={self.compressed_layer_names}, "
             f"ple_groups="
             f"{[(g.group_id, g.block_size) for g in self.ple_groups]}, "
             f"ple_carrier_group_id={self.ple_carrier_group_id}"
@@ -528,7 +557,11 @@ class KVCacheGroupManager:
     @property
     def has_side_caches(self) -> bool:
         """True when attention/mamba records must also carry compressed or PLE."""
-        return self.compressed_group is not None or self.ple_group is not None
+        return (
+            bool(getattr(self, "compressed_shares_full_attn_blocks", False))
+            or getattr(self, "compressed_group", None) is not None
+            or getattr(self, "ple_group", None) is not None
+        )
 
     def compute_block_hashes(self, group: GroupInfo, request: "Request") -> list[bytes]:
         """Hash a request at one group's block boundaries and chain seed."""
@@ -1079,7 +1112,11 @@ class HybridLinearAttentionLayout(KVCacheLayout):
     ) -> None:
         """One store segment per layer, addressed by that group's block id."""
         layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
-        names = _ordered_role_layers(self.kv_cache_config, role)
+        names = (
+            _compressed_layer_names(self.kv_cache_config)
+            if role == "compressed"
+            else _ordered_role_layers(self.kv_cache_config, role)
+        )
         found = 0
         for name in names:
             tensor = _unwrap_kv_tensor(kvcaches.get(name))
@@ -1208,20 +1245,19 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         block id on that sink.
         """
         infos = _layout_group_infos(self.kv_cache_config)
-        compressed_groups = [group for group in infos if group.kind == "compressed"]
         ple_groups = [group for group in infos if group.kind == "ple"]
         state_groups = [group for group in infos if group.kind == "mamba"]
-        if not compressed_groups and not ple_groups:
+        compressed_names = _compressed_layer_names(self.kv_cache_config)
+        if not compressed_names and not ple_groups:
             return
         if not tensor_size_lists:
             return
 
         compressed_by_index: dict[int, str] = {}
-        for group in compressed_groups:
-            for name in group.layer_names:
-                layer_index = _layer_index(name)
-                if layer_index is not None:
-                    compressed_by_index[layer_index] = name
+        for name in compressed_names:
+            layer_index = _layer_index(name)
+            if layer_index is not None:
+                compressed_by_index[layer_index] = name
 
         carrier_layers: set[str] = set()
         carrier_id = select_ple_carrier_group_id(
@@ -1245,9 +1281,9 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     f"{name} page={page}, expected={compressed_page}"
                 )
             compressed_views[name] = (base, stride, region)
-        if compressed_groups and compressed_page <= 0:
+        if compressed_names and compressed_page <= 0:
             raise ValueError(
-                "CUDA layerwise layout found compressed_key_cache groups "
+                "CUDA layerwise layout found compressed_key_cache layers "
                 "but no device page."
             )
 
@@ -1949,7 +1985,12 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 if not collect_side:
                     continue
                 comp_id = 0
-                if (
+                owns_compressed = any(
+                    _layer_role(name) == "compressed" for name in group.layer_names
+                )
+                if owns_compressed:
+                    comp_id = int(vllm_id)
+                elif (
                     manager.compressed_index_aligned
                     and compressed is not None
                     and group.group_id == primary_gid
