@@ -132,6 +132,43 @@ def _normalize_tensor_size_list(tensor_size_list: Any) -> list[int]:
     return [int(tensor_size_list)]
 
 
+def kv_cache_tensor_layer_names(raw_tensor) -> list[str]:
+    """Layer names placed in one vLLM KV cache tensor.
+
+    Current vLLM stores them on ``layers``. Older configs used ``shared_by``.
+    """
+    layers = getattr(raw_tensor, "layers", None)
+    if layers:
+        return list(layers)
+    shared_by = getattr(raw_tensor, "shared_by", None)
+    if shared_by:
+        return list(shared_by)
+    return []
+
+
+def iter_group_kv_cache_specs(spec: KVCacheSpec):
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.kv_cache_specs.values()
+    return (spec,)
+
+
+def has_cuda_hybrid_linear_attention_groups(kv_cache_config) -> bool:
+    """True when CUDA groups contain full attention and align-mode mamba.
+
+    Current vLLM gives each group its own tensor, so the two specs no longer
+    share one ``KVCacheTensor``. Group membership is the stable signal.
+    """
+    has_full_attention = False
+    has_mamba_align = False
+    for group in kv_cache_config.kv_cache_groups:
+        for spec in iter_group_kv_cache_specs(group.kv_cache_spec):
+            if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+                has_mamba_align = True
+            elif isinstance(spec, FullAttentionSpec):
+                has_full_attention = True
+    return has_full_attention and has_mamba_align
+
+
 @dataclass
 class GroupInfo:
     """Per-group metadata used by :class:`KVCacheGroupManager`."""
@@ -415,18 +452,21 @@ class KVCacheGroupManager:
 class HybridLinearAttentionLayout(KVCacheLayout):
     """Physical layout for hybrid full-attention + linear-attention pages.
 
-    vLLM may back full-attention and linear-attention layers with one shared
-    raw int8 tensor. The physical layout is backend dependent:
+    vLLM backs full-attention and linear-attention groups with raw tensors.
+    The physical layout is backend dependent:
 
-    - Ascend stores the shared page in component-major order:
+    - Ascend stores a shared page in component-major order:
         [conv_block_or_padding, k_or_ssm_block, v_block_or_padding]
       across all physical blocks.
-    - CUDA stores one contiguous page per physical block. The same bytes are
-      viewed as either attention [K, V] or mamba [conv, ssm, padding].
+    - CUDA LBNHC is layer-outermost, ``[L, B, N, H, C]``. Each layer is its
+      own contiguous region of blocks. One logical block is one page from
+      every layer, and those pages are not adjacent. Separate group tensors
+      alias this same allocation, because one block id belongs to one group
+      at a time.
 
-    The store receives one unified tensor_size_list, so we expose the three
-    physical slices for Ascend, while CUDA is exposed as one contiguous page
-    with a full-page stride.
+    The store receives one unified tensor_size_list. Ascend exposes three
+    physical slices. CUDA exposes one page segment per layer and drops
+    aliased group tensors.
     """
 
     def __init__(
@@ -546,7 +586,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         shared_specs: list[KVCacheSpec] = []
         shared_ptrs: list[int] = []
         layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
-        for layer_name in raw_tensor.shared_by:
+        for layer_name in kv_cache_tensor_layer_names(raw_tensor):
             kv_layer = kvcaches.get(layer_name)
             if kv_layer is None:
                 continue
@@ -581,6 +621,132 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         buffer_size_rows.append([raw_tensor.size])
         tensor_size_lists.append([page_size])
         block_stride_lists.append([page_size])
+
+    def _cuda_layer_bases(
+        self, raw_tensor, layer_names: list[str], layer_ptrs: list[tuple[int, int]]
+    ) -> tuple[list[int], int]:
+        """Return per-layer block-0 pointers and the page size for LBNHC.
+
+        Layer ``l`` occupies ``[base_l, base_l + layer_stride)``. Block ``b``
+        of that layer starts at ``base_l + b * block_stride``.
+        """
+        block_stride = int(getattr(raw_tensor, "block_stride", 0) or 0)
+        layer_stride = int(getattr(raw_tensor, "layer_stride", 0) or 0)
+        if block_stride <= 0 or layer_stride <= 0:
+            raise ValueError(
+                "CUDA LBNHC tensor is missing block_stride or layer_stride: "
+                f"block_stride={block_stride}, layer_stride={layer_stride}"
+            )
+        if layer_stride != block_stride * self.num_blocks:
+            raise ValueError(
+                "CUDA LBNHC layer region is not one contiguous run of blocks: "
+                f"layer_stride={layer_stride}, block_stride={block_stride}, "
+                f"num_blocks={self.num_blocks}"
+            )
+        span = len(layer_names) * layer_stride
+        if span > int(raw_tensor.size):
+            raise ValueError(
+                "CUDA LBNHC layers exceed the raw allocation: "
+                f"layers={len(layer_names)}, layer_stride={layer_stride}, "
+                f"raw_size={raw_tensor.size}"
+            )
+
+        index, ptr = layer_ptrs[0]
+        layer0_ptr = ptr - index * layer_stride
+        if layer0_ptr < 0:
+            raise ValueError(
+                "CUDA LBNHC layer pointer falls before layer 0: "
+                f"ptr={ptr}, layer_index={index}, layer_stride={layer_stride}"
+            )
+        for other_index, other_ptr in layer_ptrs[1:]:
+            expected = layer0_ptr + other_index * layer_stride
+            if other_ptr != expected:
+                raise ValueError(
+                    "CUDA LBNHC layers are not placed on layer_stride: "
+                    f"layer_index={other_index}, ptr={other_ptr}, "
+                    f"expected={expected}, layer_stride={layer_stride}"
+                )
+        bases = [
+            layer0_ptr + layer_index * layer_stride
+            for layer_index in range(len(layer_names))
+        ]
+        return bases, block_stride
+
+    def _build_cuda_lbnhc_layout(self, kvcaches) -> None:
+        """One page segment per layer for CUDA LBNHC whole-cache IO.
+
+        Group tensors overlay one backing allocation. Recording each of them
+        would copy the same layer pages once per group.
+        """
+        base_ptrs: list[list[int]] = []
+        buffer_size_rows: list[list[int]] = []
+        tensor_size_lists: list[list[int]] = []
+        block_stride_lists: list[list[int]] = []
+        self.layer_name_to_row = {}
+        seen_blocks: dict[tuple[int, int], int] = {}
+        tensor_count = 0
+
+        for raw_tensor in self.kv_cache_config.kv_cache_tensors:
+            layer_names = kv_cache_tensor_layer_names(raw_tensor)
+            if not layer_names:
+                continue
+            layer_ptrs: list[tuple[int, int]] = []
+            for index, layer_name in enumerate(layer_names):
+                kv_layer = kvcaches.get(layer_name)
+                if kv_layer is None:
+                    continue
+                ptr = self._layer_data_ptr(kv_layer)
+                if ptr is None:
+                    logger.warning(f"unsupported kv_layer type: {type(kv_layer)}")
+                    continue
+                layer_ptrs.append((index, ptr))
+            if not layer_ptrs:
+                logger.warning(f"no kv cache tensor found for layers {layer_names}")
+                continue
+
+            tensor_count += 1
+            bases, page_size = self._cuda_layer_bases(raw_tensor, layer_names, layer_ptrs)
+            block_key = (bases[0], int(raw_tensor.size))
+            row_id = seen_blocks.get(block_key)
+            if row_id is None:
+                row_id = len(base_ptrs)
+                seen_blocks[block_key] = row_id
+                layer_region = page_size * self.num_blocks
+                base_ptrs.append(bases)
+                buffer_size_rows.append([layer_region] * len(bases))
+                tensor_size_lists.append([page_size] * len(bases))
+                block_stride_lists.append([page_size] * len(bases))
+            for layer_name in layer_names:
+                self.layer_name_to_row[layer_name] = row_id
+
+        if tensor_count == 0:
+            raise ValueError("CUDA hybrid layout found no KV cache tensors")
+
+        logger.info(
+            "CUDA LBNHC hybrid layout: "
+            f"tensors={tensor_count}, packed_blocks={len(base_ptrs)}, "
+            f"layers_per_block={len(tensor_size_lists[0])}, "
+            f"page_size={int(tensor_size_lists[0][0])}"
+        )
+        self._finalize_layout_arrays(
+            base_ptrs,
+            buffer_size_rows,
+            tensor_size_lists,
+            block_stride_lists,
+        )
+
+    @staticmethod
+    def _layer_data_ptr(kv_layer) -> Optional[int]:
+        if isinstance(kv_layer, torch.Tensor):
+            return int(kv_layer.data_ptr())
+        if isinstance(kv_layer, (tuple, list)):
+            ptrs = [
+                int(tensor.data_ptr())
+                for tensor in kv_layer
+                if isinstance(tensor, torch.Tensor)
+            ]
+            return min(ptrs) if ptrs else None
+        return None
 
     def _append_ascend_component_major_layout(
         self,
@@ -678,6 +844,10 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         block_stride_lists.append(sizes)
 
     def _build_layout(self, kvcaches):
+        if current_platform.is_cuda_alike():
+            self._build_cuda_lbnhc_layout(kvcaches)
+            return
+
         base_ptrs = []
         buffer_size_rows = []
         tensor_size_lists = []
@@ -687,7 +857,8 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         is_npu = current_platform.device_type == "npu"
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
-            if not raw_tensor.shared_by:
+            layer_names = kv_cache_tensor_layer_names(raw_tensor)
+            if not layer_names:
                 continue
 
             shared_specs, shared_ptrs = self._collect_shared_tensor_info(
@@ -695,9 +866,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             )
 
             if not shared_ptrs:
-                logger.warning(
-                    f"no kv cache tensor found for shared layers {raw_tensor.shared_by}"
-                )
+                logger.warning(f"no kv cache tensor found for shared layers {layer_names}")
                 continue
 
             row_id = len(base_ptrs)
@@ -736,7 +905,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     block_stride_lists,
                 )
 
-            for layer_name in raw_tensor.shared_by:
+            for layer_name in layer_names:
                 self.layer_name_to_row[layer_name] = row_id
 
         self._finalize_layout_arrays(
@@ -760,17 +929,16 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         if kv_cache_config is None:
             return False
 
-        if (
-            current_platform.device_type != "npu"
-            and not current_platform.is_cuda_alike()
-        ):
+        if current_platform.is_cuda_alike():
+            return has_cuda_hybrid_linear_attention_groups(kv_cache_config)
+        if current_platform.device_type != "npu":
             return False
 
         layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
         for raw_tensor in kv_cache_config.kv_cache_tensors:
             shared_specs = [
                 spec
-                for layer_name in raw_tensor.shared_by
+                for layer_name in kv_cache_tensor_layer_names(raw_tensor)
                 for spec in layer_to_specs.get(layer_name, [])
             ]
             if any(
