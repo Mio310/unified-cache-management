@@ -124,6 +124,12 @@ def extend_non_null(
         dst_vllm_block_ids.append(vllm_block_id)
 
 
+def _preview_block_hash(block_id: bytes) -> str:
+    if not block_id:
+        return "empty"
+    return block_id[:8].hex()
+
+
 def _normalize_tensor_size_list(tensor_size_list: Any) -> list[int]:
     if isinstance(tensor_size_list, np.ndarray):
         return [int(v) for v in tensor_size_list.reshape(-1).tolist()]
@@ -347,12 +353,17 @@ class KVCacheGroupManager:
 
         # Stage 1: each full-attn group contributes a candidate hit count.
         candidates: list[int] = []
+        stage1_detail: list[str] = []
         for fa in self.full_attn_groups:
             fa_block_ids = group_block_ids[fa.group_id]
             fa_hbm_blocks = num_computed_tokens // fa.block_size
             fa_external = fa_block_ids[fa_hbm_blocks:]
             if not fa_external:
                 candidates.append(0)
+                stage1_detail.append(
+                    f"g{fa.group_id}:ext=0,hbm_blocks={fa_hbm_blocks},"
+                    f"total={len(fa_block_ids)}"
+                )
                 continue
             try:
                 fa_hit_blocks = lookup_on_prefix(fa_external) + 1
@@ -363,16 +374,29 @@ class KVCacheGroupManager:
                 )
                 _record_counter("connector_lookup_errors_total")
                 candidates.append(0)
+                stage1_detail.append(f"g{fa.group_id}:error")
                 continue
             candidates.append(max(fa_hit_blocks, 0) * fa.block_size)
+            stage1_detail.append(
+                f"g{fa.group_id}:ext={len(fa_external)},"
+                f"hit_blocks={max(fa_hit_blocks, 0)},"
+                f"block_size={fa.block_size},"
+                f"first={_preview_block_hash(fa_external[0])}"
+            )
 
         # Resume boundary must be a multiple of lcm_block_size so every
         # group's tail/dispatch slicing lands on a real block boundary.
-        min_external_hit_tokens = min(candidates)
+        min_external_hit_tokens = min(candidates) if candidates else 0
         external_hit_tokens = (
             min_external_hit_tokens // self.lcm_block_size
         ) * self.lcm_block_size
         if external_hit_tokens <= 0:
+            logger.info(
+                "HLA external miss at full-attention lookup: "
+                f"computed_tokens={num_computed_tokens}, "
+                f"lcm_block_size={self.lcm_block_size}, "
+                f"candidates={candidates}, detail=[{'; '.join(stage1_detail)}]"
+            )
             return 0, 0, []
 
         # Stage 2: reverse scan for mamba state at LCM boundaries.
@@ -419,13 +443,30 @@ class KVCacheGroupManager:
                 return 0, 0, []
             if idx < 0:
                 # This state group has no state at any candidate position.
+                empty_hashes = sum(1 for state_hash in sg_hashes if not state_hash)
+                logger.info(
+                    "HLA external miss at mamba-align lookup: "
+                    f"group={sg.group_id}, positions={sg_positions}, "
+                    f"hashes={len(sg_hashes)}, empty_hashes={empty_hashes}, "
+                    f"full_attn_hit_tokens={external_hit_tokens}, "
+                    f"first={_preview_block_hash(sg_hashes[0] if sg_hashes else b'')}"
+                )
                 return 0, 0, []
             sg_pos = sg_positions[idx]
             if sg_pos < best_pos:
+                logger.info(
+                    "HLA mamba-align lookup shortened the hit: "
+                    f"group={sg.group_id}, hit_pos={sg_pos}, "
+                    f"previous_best={best_pos}, positions={sg_positions}"
+                )
                 best_pos = sg_pos
 
         external_hit_tokens = best_pos - num_computed_tokens
         if external_hit_tokens <= 0:
+            logger.info(
+                "HLA external miss after mamba-align alignment: "
+                f"best_pos={best_pos}, computed_tokens={num_computed_tokens}"
+            )
             return 0, 0, []
 
         # Collect mamba state hashes for GC heat update.
@@ -1114,7 +1155,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         hbm_hit_block_num = num_computed_tokens // lcm_block_size
 
         if self.persist_token_threshold > request.num_tokens:
-            logger.info_once(
+            logger.info(
                 f"Skip persistence: req {request.request_id}, "
                 f"input tokens ({request.num_tokens}) < threshold "
                 f"({self.persist_token_threshold})."
@@ -1211,12 +1252,18 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         # total_hit_tokens is a position the store actually verified.
         num_total_hit_tokens = total_hit_block_num * lcm_block_size
 
-        logger.info_once(
-            f"request_id: {request.request_id}, "
-            f"total_lcm_blocks: {request.num_tokens // lcm_block_size}, "
-            f"hit hbm: {hbm_hit_block_num}, "
-            f"hit external: {total_hit_block_num - hbm_hit_block_num}, "
-            f"total_tokens: {len(request.all_token_ids)}"
+        logger.info(
+            "HLA lookup: "
+            f"request_id={request.request_id}, "
+            f"num_tokens={request.num_tokens}, "
+            f"computed_tokens={num_computed_tokens}, "
+            f"lcm_block_size={lcm_block_size}, "
+            f"recompute_tokens={recompute_tokens}, "
+            f"max_hit_lcm_blocks={max_hit_lcm_blocks}, "
+            f"primary_blocks={len(primary_block_ids)}, "
+            f"hit_hbm_lcm_blocks={hbm_hit_block_num}, "
+            f"hit_external_tokens={external_hit_tokens}, "
+            f"hit_external_lcm_blocks={external_hit_lcm_blocks}"
         )
 
         self.requests_meta[request.request_id] = HLARequestMeta(
@@ -1411,6 +1458,22 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
         req_meta.token_processed += new_tokens
 
+        if (
+            load_ucm_block_ids
+            or dump_ucm_block_ids
+            or new_tokens >= lcm_block_size
+        ):
+            logger.info(
+                "HLA dispatch: "
+                f"request_id={request_id}, new_tokens={new_tokens}, "
+                f"token_processed={req_meta.token_processed}, "
+                f"num_token_ids={req_meta.num_token_ids}, "
+                f"external_hit_lcm_blocks={external_hit_lcm_blocks}, "
+                f"load_blocks={len(load_ucm_block_ids)}, "
+                f"dump_blocks={len(dump_ucm_block_ids)}, "
+                f"dump_vllm_blocks={dump_vllm_block_ids[:4]}"
+            )
+
         return HLARequestDispatchMeta(
             load_block_ids=(load_ucm_block_ids, load_vllm_block_ids),
             dump_block_ids=(dump_ucm_block_ids, dump_vllm_block_ids),
@@ -1534,6 +1597,18 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         """Bulk load override: MLA blocks shared hash, KDA blocks per-rank hash."""
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
+        load_requests = sum(
+            1
+            for request in metadata.request_meta.values()
+            if len(request.load_block_ids[0]) > 0
+        )
+        if load_requests:
+            logger.info(
+                "HLA load begin: "
+                f"requests={len(metadata.request_meta)}, "
+                f"with_load_blocks={load_requests}, "
+                f"block_data_size={self.block_data_size}"
+            )
         request_to_task: dict[str, Task] = {}
         is_load = False
         num_loaded_block = 0
@@ -1629,14 +1704,24 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         total_vllm_block_ids: list[int] = []
         block_ids_by_request: dict[str, set[bytes]] = {}
         num_saved_block = 0
+        skipped_empty = 0
+        skipped_scope = 0
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
+                skipped_empty += 1
                 continue
             n = getattr(request, "dump_full_attn_count", 0)
             rank0_ucm, scoped_ucm, scoped_vllm = self._scope_blocks(
                 request.dump_block_ids[0], request.dump_block_ids[1], n, is_dump=True
             )
             if not scoped_ucm:
+                skipped_scope += 1
+                logger.info(
+                    "HLA dump scoped away: "
+                    f"request_id={request_id}, "
+                    f"dump_blocks={len(request.dump_block_ids[0])}, "
+                    f"dump_full_attn_count={n}"
+                )
                 continue
             block_ids_by_request[request_id] = set(rank0_ucm)
             num_saved_block += len(scoped_ucm)
@@ -1644,12 +1729,25 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             total_vllm_block_ids.extend(scoped_vllm)
 
         if not total_ucm_block_ids:
+            if skipped_scope:
+                logger.info(
+                    "HLA dump skipped: "
+                    f"requests={len(metadata.request_meta)}, "
+                    f"empty={skipped_empty}, scoped_away={skipped_scope}"
+                )
             return
 
         event_handle = 0
         try:
             total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
             total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+            logger.info(
+                "HLA dump submit: "
+                f"blocks={len(total_ucm_block_ids)}, "
+                f"ptr_cols={total_ptrs.shape[-1]}, "
+                f"block_data_size={self.block_data_size}, "
+                f"first_hash={_preview_block_hash(total_ucm_block_ids[0])}"
+            )
             shard_indexs = [0] * len(total_ucm_block_ids)
             event_handle = self._get_dump_event_handle()
             save_start_time = time.perf_counter() * 1000
