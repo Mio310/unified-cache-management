@@ -69,6 +69,9 @@ class HLARequestDispatchMeta(RequestDispatchMeta):
 
     load_full_attn_count: int = 0
     dump_full_attn_count: int = 0
+    # Parallel to load/dump vLLM block ids. Selects the BLNHC source block.
+    load_block_group_ids: list[int] = field(default_factory=list)
+    dump_block_group_ids: list[int] = field(default_factory=list)
 
 
 def layer_name_to_kv_cache_spec(
@@ -115,6 +118,8 @@ def extend_non_null(
     dst_vllm_block_ids: list[int],
     src_ucm_block_ids: list[bytes],
     src_vllm_block_ids: list[int],
+    dst_group_ids: Optional[list[int]] = None,
+    group_id: Optional[int] = None,
 ) -> None:
     # Skip vLLM null blocks (block_id=0) used as mamba-align placeholders.
     for ucm_block_id, vllm_block_id in zip(src_ucm_block_ids, src_vllm_block_ids):
@@ -122,6 +127,25 @@ def extend_non_null(
             continue
         dst_ucm_block_ids.append(ucm_block_id)
         dst_vllm_block_ids.append(vllm_block_id)
+        if dst_group_ids is not None:
+            dst_group_ids.append(int(group_id))
+
+
+def kv_cache_group_external_role(group) -> str:
+    """How one KV cache group participates in external cache IO.
+
+    ``raw_key`` stays in vLLM's block tables and is never hashed or copied.
+    ``ple`` and ``linear`` are mamba-align state groups. ``full_attn`` is the
+    token-hashed group. Compressed key shares that group's physical block.
+    """
+    names = [str(name).lower() for name in group.layer_names]
+    if names and all("raw_key_cache" in name for name in names):
+        return "raw_key"
+    if is_mamba_align_kv_cache_spec(group.kv_cache_spec):
+        if any(name.endswith(".ple") or ".ple." in name for name in names):
+            return "ple"
+        return "linear"
+    return "full_attn"
 
 
 def _preview_block_hash(block_id: bytes) -> str:
@@ -185,11 +209,16 @@ class GroupInfo:
     # Independent hash chain seed per group (see ``KVCacheGroupManager``).
     seed: bytes
     is_mamba_align: bool = False
+    external_role: str = "full_attn"
     block_hasher: Optional[Callable[["Request"], list[bytes]]] = None
 
     @property
     def is_full_attention(self) -> bool:
-        return not self.is_mamba_align
+        return self.external_role == "full_attn"
+
+    @property
+    def transfers_external_cache(self) -> bool:
+        return self.external_role != "raw_key"
 
 
 class KVCacheGroupManager:
@@ -210,6 +239,7 @@ class KVCacheGroupManager:
             spec = group.kv_cache_spec
             block_size = block_size_from_kv_cache_spec(spec)
             is_mamba_align = is_mamba_align_kv_cache_spec(spec)
+            external_role = kv_cache_group_external_role(group)
             seed = request_hasher((b"UCM_GROUP_SEED", base_seed, group_id))
             info = GroupInfo(
                 group_id=group_id,
@@ -217,15 +247,16 @@ class KVCacheGroupManager:
                 layer_names=tuple(group.layer_names),
                 seed=seed,
                 is_mamba_align=is_mamba_align,
+                external_role=external_role,
             )
-            if not is_mamba_align:
+            if external_role == "full_attn":
                 info.block_hasher = request_hasher.make_request_block_hasher(
                     block_size, seed
                 )
             self.groups_by_id.append(info)
             if info.is_full_attention:
                 self.full_attn_groups.append(info)
-            else:
+            elif external_role in ("linear", "ple"):
                 self.state_groups.append(info)
 
         assert len(self.full_attn_groups) >= 1, (
@@ -233,11 +264,23 @@ class KVCacheGroupManager:
             "kv_cache_config.kv_cache_groups."
         )
 
-        # Resume points must align to the LCM of all group block_sizes.
-        all_block_sizes = [g.block_size for g in self.groups_by_id]
+        # raw_key is not part of the external cache, so it does not define
+        # the resume alignment.
+        aligned_groups = [g for g in self.groups_by_id if g.transfers_external_cache]
+        all_block_sizes = [g.block_size for g in aligned_groups]
         self.lcm_block_size: int = math.lcm(*all_block_sizes)
+        self.primary_full_attn_group = self.full_attn_groups[0]
+        for group in self.full_attn_groups:
+            if any(
+                "compressed_key_cache" not in name.lower()
+                and "raw_key_cache" not in name.lower()
+                and "attn" in name.lower()
+                for name in group.layer_names
+            ):
+                self.primary_full_attn_group = group
+                break
 
-        for g in self.groups_by_id:
+        for g in aligned_groups:
             assert self.lcm_block_size % g.block_size == 0, (
                 f"group {g.group_id} block_size={g.block_size} does not "
                 f"divide LCM={self.lcm_block_size}"
@@ -255,7 +298,8 @@ class KVCacheGroupManager:
             f"full_attn_groups="
             f"{[(g.group_id, g.block_size) for g in self.full_attn_groups]}, "
             f"state_groups="
-            f"{[(g.group_id, g.block_size, g.is_mamba_align) for g in self.state_groups]}"
+            f"{[(g.group_id, g.block_size, g.external_role) for g in self.state_groups]}, "
+            f"primary_full_attn={self.primary_full_attn_group.group_id}"
         )
 
     @property
@@ -264,6 +308,8 @@ class KVCacheGroupManager:
 
     def compute_block_hashes(self, group: GroupInfo, request: "Request") -> list[bytes]:
         """Hash a request at one group's block boundaries and chain seed."""
+        if group.external_role == "raw_key":
+            return []
         if group.is_mamba_align:
             # mamba-align pads block table with null blocks; no per-block hash.
             return [b""] * (len(request.all_token_ids) // group.block_size)
@@ -284,7 +330,7 @@ class KVCacheGroupManager:
         """Derive the mamba-align state hash at ``seq_len`` from the prefix hash."""
         if seq_len <= 0 or seq_len % self.lcm_block_size != 0:
             return None
-        primary = self.full_attn_groups[0]
+        primary = self.primary_full_attn_group
         prefix_idx = seq_len // primary.block_size - 1
         if prefix_idx < 0:
             return None
@@ -884,9 +930,298 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         tensor_size_lists.append(sizes)
         block_stride_lists.append(sizes)
 
+    def _cuda_layout_name(self) -> str:
+        configured = getattr(self.kv_cache_config, "kv_cache_layout", None)
+        if configured:
+            return str(configured).split(".")[-1]
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        resolver = getattr(cache_config, "get_resolved_kv_cache_layout", None)
+        if resolver is None:
+            return "LBNHC"
+        layout = resolver()
+        return str(getattr(layout, "name", layout)).split(".")[-1]
+
+    @staticmethod
+    def _require_tensor_offset(raw_tensor) -> int:
+        if not hasattr(raw_tensor, "offset"):
+            raise ValueError(
+                "KVCacheTensor.offset is required for BLNHC; "
+                "refusing to assume offset 0"
+            )
+        return int(raw_tensor.offset)
+
+    def _blnhc_block0(
+        self, raw_tensor, layer_views: list[tuple[int, int, Optional[torch.Tensor]]]
+    ) -> tuple[int, int, int, int]:
+        """Return layer 0 of block 0. ``data_ptr`` already includes ``offset``."""
+        if not hasattr(raw_tensor, "block_stride") or not hasattr(
+            raw_tensor, "layer_stride"
+        ):
+            raise ValueError("BLNHC tensor is missing block_stride or layer_stride")
+        offset = self._require_tensor_offset(raw_tensor)
+        block_stride = int(raw_tensor.block_stride)
+        layer_stride = int(raw_tensor.layer_stride)
+        if block_stride <= 0 or layer_stride <= 0:
+            raise ValueError(
+                "BLNHC tensor has non-positive stride: "
+                f"block_stride={block_stride}, layer_stride={layer_stride}, "
+                f"offset={offset}"
+            )
+
+        def storage_base(tensor: Optional[torch.Tensor]) -> Optional[int]:
+            if tensor is None:
+                return None
+            try:
+                return int(tensor.untyped_storage().data_ptr())
+            except (AttributeError, RuntimeError):
+                return None
+
+        points_at_storage = all(
+            storage_base(tensor) == ptr for _, ptr, tensor in layer_views
+        )
+        if points_at_storage:
+            block0 = layer_views[0][1] + offset
+        else:
+            index, ptr, _ = layer_views[0]
+            block0 = ptr - index * layer_stride
+            for other_index, other_ptr, _ in layer_views[1:]:
+                if other_ptr - other_index * layer_stride != block0:
+                    raise ValueError(
+                        "BLNHC layers are not placed at layer_stride: "
+                        f"offset={offset}, layer_stride={layer_stride}, "
+                        f"layer_index={other_index}, ptr={other_ptr}, "
+                        f"block0={block0}"
+                    )
+        if block0 < 0:
+            raise ValueError(
+                f"BLNHC block base is negative: block0={block0}, offset={offset}"
+            )
+        return block0, block_stride, layer_stride, offset
+
+    @staticmethod
+    def _blnhc_tensor_kind(layer_names: list[str]) -> str:
+        names = [name.lower() for name in layer_names]
+        if any("raw_key_cache" in name for name in names):
+            return "raw_key"
+        if any("compressed_key_cache" in name for name in names):
+            return "compressed"
+        if any(name.endswith(".ple") or ".ple." in name for name in names):
+            return "ple"
+        return ""
+
+    def _build_cuda_blnhc_layout(self, kvcaches) -> None:
+        """BLNHC whole-cache layout for qwen3.8-flash-next.
+
+        Each stored object is one physical block of ``block_stride`` bytes.
+        Copy starts at ``block0``, which already includes the row-tensor
+        ``offset``. Compressed key and full attention share one block, so
+        that object starts at the earlier ``block0``. ``raw_key_cache`` is
+        omitted.
+        """
+        records = []
+        for raw_tensor in self.kv_cache_config.kv_cache_tensors:
+            layer_names = kv_cache_tensor_layer_names(raw_tensor)
+            if not layer_names:
+                continue
+            kind = self._blnhc_tensor_kind(layer_names)
+            layer_views: list[tuple[int, int, Optional[torch.Tensor]]] = []
+            for index, layer_name in enumerate(layer_names):
+                kv_layer = kvcaches.get(layer_name)
+                if kv_layer is None:
+                    continue
+                tensor = kv_layer if isinstance(kv_layer, torch.Tensor) else None
+                ptr = self._layer_data_ptr(kv_layer)
+                if ptr is None:
+                    logger.warning(f"unsupported kv_layer type: {type(kv_layer)}")
+                    continue
+                layer_views.append((index, ptr, tensor))
+            if not layer_views:
+                logger.warning(f"no kv cache tensor found for layers {layer_names}")
+                continue
+            block0, block_stride, layer_stride, offset = self._blnhc_block0(
+                raw_tensor, layer_views
+            )
+            if not kind:
+                specs = []
+                layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
+                for layer_name in layer_names:
+                    specs.extend(layer_to_specs.get(layer_name, []))
+                kind = (
+                    "linear"
+                    if any(isinstance(spec, MambaSpec) for spec in specs)
+                    else "full_attn"
+                )
+            records.append(
+                {
+                    "kind": kind,
+                    "layer_names": layer_names,
+                    "block0": block0,
+                    "block_stride": block_stride,
+                    "layer_stride": layer_stride,
+                    "offset": offset,
+                    "size": int(raw_tensor.size),
+                }
+            )
+
+        if not records:
+            raise ValueError("BLNHC hybrid layout found no KV cache tensors")
+
+        transferable = [rec for rec in records if rec["kind"] != "raw_key"]
+        main_records = [
+            rec for rec in transferable if rec["kind"] in ("linear", "full_attn", "ple")
+        ]
+        compressed_records = [
+            rec for rec in transferable if rec["kind"] == "compressed"
+        ]
+        full_records = [rec for rec in transferable if rec["kind"] == "full_attn"]
+        if not main_records or len(compressed_records) != 1 or len(full_records) != 1:
+            raise ValueError(
+                "BLNHC layout needs one full-attention tensor, one compressed "
+                f"tensor, and linear/PLE tensors; kinds="
+                f"{[rec['kind'] for rec in records]}"
+            )
+        main_stride = int(main_records[0]["layer_stride"])
+        if any(int(rec["layer_stride"]) != main_stride for rec in main_records):
+            raise ValueError(
+                "linear attention, full attention, and PLE must share layer_stride: "
+                + ", ".join(
+                    f"{rec['kind']}={rec['layer_stride']}" for rec in main_records
+                )
+            )
+        compressed = compressed_records[0]
+        full = full_records[0]
+        block_strides = {int(rec["block_stride"]) for rec in transferable}
+        if len(block_strides) != 1:
+            raise ValueError(
+                f"BLNHC tensors have different block_stride: {block_strides}"
+            )
+        block_stride = block_strides.pop()
+        layer_count = len(full["layer_names"])
+        if layer_count <= 0 or any(
+            len(rec["layer_names"]) != layer_count
+            for rec in transferable
+            if rec["kind"] in ("linear", "compressed")
+        ):
+            raise ValueError(
+                "BLNHC linear, compressed, and full-attention tensors must "
+                f"cover {layer_count} layers"
+            )
+        full_block0 = int(full["block0"])
+        compressed_block0 = int(compressed["block0"])
+        shared_base = min(full_block0, compressed_block0)
+        shared_gap = abs(full_block0 - compressed_block0)
+        if shared_gap >= block_stride:
+            raise ValueError(
+                "compressed key and full attention are not in one physical block: "
+                f"full_block0={full_block0}, compressed_block0={compressed_block0}, "
+                f"block_stride={block_stride}"
+            )
+        live_end = max(
+            full_block0 + layer_count * int(full["layer_stride"]),
+            compressed_block0 + layer_count * int(compressed["layer_stride"]),
+        )
+        if live_end - shared_base > block_stride:
+            raise ValueError(
+                "one block_stride cannot hold compressed key and full attention: "
+                f"shared_base={shared_base}, live_end={live_end}, "
+                f"block_stride={block_stride}"
+            )
+        for rec in transferable:
+            if rec["kind"] == "compressed":
+                continue
+            live_span = len(rec["layer_names"]) * int(rec["layer_stride"])
+            if live_span > block_stride:
+                raise ValueError(
+                    "BLNHC live data exceeds one physical block: "
+                    f"kind={rec['kind']}, live_span={live_span}, "
+                    f"block_stride={block_stride}"
+                )
+
+        group_block0: dict[int, int] = {}
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            role = kv_cache_group_external_role(group)
+            if role == "raw_key":
+                continue
+            if role == "full_attn":
+                group_block0[group_id] = shared_base
+                continue
+            matched = [
+                rec
+                for rec in transferable
+                if rec["kind"] == role
+                and set(rec["layer_names"]).intersection(group.layer_names)
+            ]
+            if len(matched) != 1:
+                raise ValueError(
+                    f"BLNHC group {group_id} role={role} matched "
+                    f"{len(matched)} tensors"
+                )
+            group_block0[group_id] = int(matched[0]["block0"])
+
+        self.blnhc_group_block0 = group_block0
+        self.blnhc_block_stride = block_stride
+        self.registration_buffers = []
+        seen_buffers = set()
+        for rec in transferable:
+            backing = int(rec["block0"]) - int(rec["offset"])
+            if backing < 0:
+                raise ValueError(
+                    "BLNHC backing base is negative: "
+                    f"kind={rec['kind']}, block0={rec['block0']}, "
+                    f"offset={rec['offset']}"
+                )
+            key = (backing, int(rec["size"]))
+            if key in seen_buffers:
+                continue
+            seen_buffers.add(key)
+            self.registration_buffers.append(key)
+
+        self.layer_name_to_row = {}
+        for rec in transferable:
+            for layer_name in rec["layer_names"]:
+                self.layer_name_to_row[layer_name] = 0
+        logger.info(
+            "CUDA BLNHC hybrid layout: "
+            f"block_stride={block_stride}, layer_stride={main_stride}, "
+            f"compressed_layer_stride={int(compressed['layer_stride'])}, "
+            f"shared_base={shared_base}, full_block0={full_block0}, "
+            f"compressed_block0={compressed_block0}, "
+            f"offsets={[(rec['kind'], rec['offset']) for rec in records]}, "
+            f"groups={sorted(group_block0)}"
+        )
+        self._finalize_layout_arrays(
+            [[shared_base]],
+            [[block_stride]],
+            [[block_stride]],
+            [[block_stride]],
+        )
+
+    def extract_blnhc_block_addrs(
+        self, vllm_block_ids: List[int], group_ids: List[int]
+    ) -> np.ndarray:
+        if len(vllm_block_ids) != len(group_ids):
+            raise ValueError(
+                "BLNHC block ids and group ids have different lengths: "
+                f"{len(vllm_block_ids)} vs {len(group_ids)}"
+            )
+        ptrs = np.empty((len(vllm_block_ids), 1), dtype=np.uint64)
+        stride = int(self.blnhc_block_stride)
+        for index, (block_id, group_id) in enumerate(zip(vllm_block_ids, group_ids)):
+            try:
+                block0 = self.blnhc_group_block0[int(group_id)]
+            except KeyError as exc:
+                raise ValueError(
+                    f"No BLNHC block base for group_id={group_id}"
+                ) from exc
+            ptrs[index, 0] = int(block0) + int(block_id) * stride
+        return ptrs
+
     def _build_layout(self, kvcaches):
         if current_platform.is_cuda_alike():
-            self._build_cuda_lbnhc_layout(kvcaches)
+            if self._cuda_layout_name() == "BLNHC":
+                self._build_cuda_blnhc_layout(kvcaches)
+            else:
+                self._build_cuda_lbnhc_layout(kvcaches)
             return
 
         base_ptrs = []
@@ -1080,8 +1415,13 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             config["block_size"] = block_size * self.blocks_per_chunk
             self._publish_block_size(config["block_size"])
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
-            buffer_addrs = kv_cache_layout.base_ptrs.reshape(-1).tolist()
-            buffer_sizes = kv_cache_layout.buffer_sizes.reshape(-1).tolist()
+            registration_buffers = getattr(kv_cache_layout, "registration_buffers", None)
+            if registration_buffers:
+                buffer_addrs = [int(addr) for addr, _ in registration_buffers]
+                buffer_sizes = [int(size) for _, size in registration_buffers]
+            else:
+                buffer_addrs = kv_cache_layout.base_ptrs.reshape(-1).tolist()
+                buffer_sizes = kv_cache_layout.buffer_sizes.reshape(-1).tolist()
             gpu_kv_buffer_set = set()
             gpu_kv_buffer_addrs = []
             gpu_kv_buffer_sizes = []
@@ -1171,7 +1511,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 f"request {request.request_id} hash error. " f"{type(e).__name__}: {e}"
             )
             return 0, False
-        primary_full_attn = self.group_manager.full_attn_groups[0]
+        primary_full_attn = self.group_manager.primary_full_attn_group
         primary_block_ids = group_ucm_block_ids[primary_full_attn.group_id]
 
         # Pre-lookup reduction: leave at least recompute_tokens for vLLM to
@@ -1302,6 +1642,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         gid: int,
         seq_len: int,
         reason: str,
+        dst_group_ids: Optional[list[int]] = None,
     ) -> None:
         group = self.group_manager.groups_by_id[gid]
         state_idx = max((seq_len - 1) // group.block_size, 0)
@@ -1337,6 +1678,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             return
         dst_ucm_block_ids.append(ucm_block_id)
         dst_vllm_block_ids.append(vllm_block_id)
+        if dst_group_ids is not None:
+            dst_group_ids.append(gid)
 
     def _generate_hla_dispatch_meta(
         self,
@@ -1372,8 +1715,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
         load_ucm_block_ids: list[bytes] = []
         load_vllm_block_ids: list[int] = []
+        load_block_group_ids: list[int] = []
         dump_ucm_block_ids: list[bytes] = []
         dump_vllm_block_ids: list[int] = []
+        dump_block_group_ids: list[int] = []
 
         external_hit_lcm_blocks = (
             req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
@@ -1384,7 +1729,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         if need_load and external_hit_lcm_blocks > 0:
             # Pass 1: full-attention blocks first (for MLA rank-0-only dump)
             for gid, group in enumerate(groups_by_id):
-                if group.is_mamba_align:
+                if not group.is_full_attention:
                     continue
                 load_tok_start = hbm_hit_tokens
                 load_tok_end = total_hit_tokens
@@ -1397,11 +1742,13 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     load_vllm_block_ids,
                     req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
                     req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                    load_block_group_ids,
+                    gid,
                 )
             load_full_attn_count = len(load_ucm_block_ids) if self.is_mla else 0
-            # Pass 2: mamba state blocks
+            # Pass 2: mamba state blocks, including the one-layer PLE group.
             for gid, group in enumerate(groups_by_id):
-                if not group.is_mamba_align:
+                if group.external_role not in ("linear", "ple"):
                     continue
                 self._append_mamba_align_state_block(
                     load_ucm_block_ids,
@@ -1411,6 +1758,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     gid,
                     total_hit_tokens,
                     "load",
+                    load_block_group_ids,
                 )
         else:
             load_full_attn_count = 0
@@ -1425,7 +1773,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
             # Pass 1: full-attention blocks first
             for gid, group in enumerate(groups_by_id):
-                if group.is_mamba_align:
+                if not group.is_full_attention:
                     continue
                 start_blk = dump_tok_start // group.block_size
                 end_blk = dump_tok_end // group.block_size
@@ -1436,11 +1784,13 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     dump_vllm_block_ids,
                     req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
                     req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                    dump_block_group_ids,
+                    gid,
                 )
             dump_full_attn_count = len(dump_ucm_block_ids) if self.is_mla else 0
-            # Pass 2: mamba state blocks
+            # Pass 2: mamba state blocks, including the one-layer PLE group.
             for gid, group in enumerate(groups_by_id):
-                if not group.is_mamba_align:
+                if group.external_role not in ("linear", "ple"):
                     continue
                 if dump_tok_end != last_lcm_b or last_lcm_b < first_lcm_b:
                     continue
@@ -1452,6 +1802,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     gid,
                     last_lcm_b,
                     "dump",
+                    dump_block_group_ids,
                 )
         else:
             dump_full_attn_count = 0
@@ -1479,6 +1830,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_block_ids=(dump_ucm_block_ids, dump_vllm_block_ids),
             load_full_attn_count=load_full_attn_count,
             dump_full_attn_count=dump_full_attn_count,
+            load_block_group_ids=load_block_group_ids,
+            dump_block_group_ids=dump_block_group_ids,
         )
 
     def build_connector_meta(
@@ -1593,6 +1946,22 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         scoped = [self.request_hasher(b) for b in ucm_ids]
         return ucm_ids, scoped, vllm_ids
 
+    def _aligned_group_ids(self, group_ids, scoped_vllm, original_vllm) -> list[int]:
+        if len(scoped_vllm) == len(original_vllm):
+            return list(group_ids)
+        if list(scoped_vllm) == list(original_vllm)[-len(scoped_vllm) :]:
+            return list(group_ids)[-len(scoped_vllm) :]
+        raise RuntimeError("BLNHC group ids do not line up with scoped blocks")
+
+    def _transfer_block_addrs(self, scoped_vllm, group_ids, original_vllm):
+        layout = self.kv_cache_layout
+        if not getattr(layout, "blnhc_group_block0", None):
+            return layout.extract_block_addrs(scoped_vllm)
+        if group_ids is None:
+            raise RuntimeError("BLNHC transfer is missing per-block group ids")
+        aligned = self._aligned_group_ids(group_ids, scoped_vllm, original_vllm)
+        return layout.extract_blnhc_block_addrs(scoped_vllm, aligned)
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Bulk load override: MLA blocks shared hash, KDA blocks per-rank hash."""
         metadata = self._get_connector_metadata()
@@ -1640,7 +2009,11 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 continue
             num_loaded_block -= len(request.load_block_ids[0]) - len(scoped_ucm)
             try:
-                ptrs = self.kv_cache_layout.extract_block_addrs(scoped_vllm)
+                ptrs = self._transfer_block_addrs(
+                    scoped_vllm,
+                    getattr(request, "load_block_group_ids", None),
+                    request.load_block_ids[1],
+                )
                 ptrs = ptrs.reshape(ptrs.shape[0], -1)
                 shard_indexs = [0] * len(scoped_ucm)
                 task = self._rank_consistency.submit_load(
@@ -1702,6 +2075,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
         total_ucm_block_ids: list[bytes] = []
         total_vllm_block_ids: list[int] = []
+        total_group_ids: list[int] = []
         block_ids_by_request: dict[str, set[bytes]] = {}
         num_saved_block = 0
         skipped_empty = 0
@@ -1727,6 +2101,14 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             num_saved_block += len(scoped_ucm)
             total_ucm_block_ids.extend(scoped_ucm)
             total_vllm_block_ids.extend(scoped_vllm)
+            if getattr(self.kv_cache_layout, "blnhc_group_block0", None):
+                total_group_ids.extend(
+                    self._aligned_group_ids(
+                        getattr(request, "dump_block_group_ids", []),
+                        scoped_vllm,
+                        request.dump_block_ids[1],
+                    )
+                )
 
         if not total_ucm_block_ids:
             if skipped_scope:
@@ -1739,7 +2121,11 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
         event_handle = 0
         try:
-            total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
+            total_ptrs = self._transfer_block_addrs(
+                total_vllm_block_ids,
+                total_group_ids,
+                total_vllm_block_ids,
+            )
             total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
             logger.info(
                 "HLA dump submit: "
