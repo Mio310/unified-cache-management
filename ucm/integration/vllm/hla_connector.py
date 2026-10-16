@@ -182,6 +182,37 @@ def iter_group_kv_cache_specs(spec: KVCacheSpec):
     return (spec,)
 
 
+def _layer_name_is_flash_next_only(name: str) -> bool:
+    lowered = str(name).lower()
+    return (
+        "raw_key_cache" in lowered
+        or "compressed_key_cache" in lowered
+        or lowered.endswith(".ple")
+        or ".ple." in lowered
+    )
+
+
+def has_npu_qwen3_next_groups(kv_cache_config) -> bool:
+    """Qwen3-Next on NPU: full attention plus align-mode linear groups.
+
+    Compressed key, raw key, and PLE belong to qwen3.8-flash-next and stay
+    out of this path.
+    """
+    has_full_attention = False
+    has_mamba_align = False
+    for group in kv_cache_config.kv_cache_groups:
+        if any(_layer_name_is_flash_next_only(name) for name in group.layer_names):
+            return False
+        role = kv_cache_group_external_role(group)
+        if role == "linear":
+            has_mamba_align = True
+        elif role == "full_attn":
+            has_full_attention = True
+        else:
+            return False
+    return has_full_attention and has_mamba_align
+
+
 def has_cuda_hybrid_linear_attention_groups(kv_cache_config) -> bool:
     """True when CUDA groups contain full attention and align-mode mamba.
 
@@ -542,7 +573,9 @@ class HybridLinearAttentionLayout(KVCacheLayout):
     vLLM backs full-attention and linear-attention groups with raw tensors.
     The physical layout is backend dependent:
 
-    - Ascend stores a shared page in component-major order:
+    - Ascend Qwen3-Next whole-cache stores one ``block_stride`` page per
+      layer. Conv/ssm and K/V already sit inside that page. Older Ascend
+      hybrid tensors stay component-major:
         [conv_block_or_padding, k_or_ssm_block, v_block_or_padding]
       across all physical blocks.
     - CUDA LBNHC is layer-outermost, ``[L, B, N, H, C]``. Each layer is its
@@ -563,6 +596,11 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         vllm_config: "VllmConfig",
         kv_cache_config: "KVCacheConfig",
     ):
+        # Whole-cache Qwen3-Next uses one object per block. The layerwise
+        # connector keeps its existing rows.
+        self._qwen3_next_npu_pages = not bool(
+            ucm_config.get("hybrid_linear_attention_layerwise", True)
+        )
         super().__init__(kvcaches, ucm_config, vllm_config, kv_cache_config)
 
     @staticmethod
@@ -1278,12 +1316,197 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             ptrs[index, 0] = int(block0) + int(block_id) * stride
         return ptrs
 
+    @staticmethod
+    def _component_tensors(kv_layer) -> list[torch.Tensor]:
+        if isinstance(kv_layer, torch.Tensor):
+            return [kv_layer]
+        if isinstance(kv_layer, (tuple, list)):
+            return [tensor for tensor in kv_layer if isinstance(tensor, torch.Tensor)]
+        return []
+
+    def _components_fit_one_page(self, tensors: list[torch.Tensor], block_stride: int) -> bool:
+        """True when every component of block 0 lives inside one physical page."""
+        if not tensors or self.num_blocks <= 0:
+            return False
+        pointers = [int(tensor.data_ptr()) for tensor in tensors]
+        if max(pointers) - min(pointers) >= block_stride:
+            return False
+        for tensor in tensors:
+            if tensor.dim() == 0 or int(tensor.shape[0]) <= 1:
+                return False
+            if int(tensor.shape[0]) % self.num_blocks != 0:
+                return False
+            slots_per_block = int(tensor.shape[0]) // self.num_blocks
+            step = int(tensor[1].data_ptr()) - int(tensor.data_ptr())
+            if step <= 0 or step * slots_per_block != block_stride:
+                return False
+        return True
+
+    def _npu_layer_block0(self, raw_tensor, index: int, tensors: list[torch.Tensor]) -> int:
+        """Layer 0, block 0. A view pointer already includes ``offset``."""
+        offset = self._require_tensor_offset(raw_tensor)
+        layer_stride = int(raw_tensor.layer_stride)
+        anchor = min(tensors, key=lambda tensor: int(tensor.data_ptr()))
+        ptr = int(anchor.data_ptr())
+        try:
+            storage = int(anchor.untyped_storage().data_ptr())
+        except (AttributeError, RuntimeError):
+            storage = None
+        origin = ptr + offset if storage is not None and storage == ptr else ptr
+        return origin - index * layer_stride
+
+    def _npu_qwen3_next_page_layout(self, kvcaches) -> bool:
+        """Qwen3-Next NPU pages are layer-major and packed inside ``block_stride``."""
+        if current_platform.device_type != "npu" or not self._qwen3_next_npu_pages:
+            return False
+        if not has_npu_qwen3_next_groups(self.kv_cache_config):
+            return False
+        saw_tensor = False
+        for raw_tensor in self.kv_cache_config.kv_cache_tensors:
+            layer_names = kv_cache_tensor_layer_names(raw_tensor)
+            if not layer_names:
+                continue
+            if any(_layer_name_is_flash_next_only(name) for name in layer_names):
+                return False
+            block_stride = int(getattr(raw_tensor, "block_stride", 0) or 0)
+            layer_stride = int(getattr(raw_tensor, "layer_stride", 0) or 0)
+            if block_stride <= 0 or layer_stride != block_stride * self.num_blocks:
+                logger.info(
+                    "NPU Qwen3-Next page layout skipped: "
+                    f"block_stride={block_stride}, layer_stride={layer_stride}, "
+                    f"num_blocks={self.num_blocks}"
+                )
+                return False
+            checked = False
+            for layer_name in layer_names:
+                tensors = self._component_tensors(kvcaches.get(layer_name))
+                if not tensors:
+                    continue
+                checked = True
+                if not self._components_fit_one_page(tensors, block_stride):
+                    logger.info(
+                        "NPU Qwen3-Next page layout skipped: components are not "
+                        f"packed in one block_stride, layer={layer_name}, "
+                        f"block_stride={block_stride}"
+                    )
+                    return False
+                break
+            if not checked:
+                logger.info(
+                    "NPU Qwen3-Next page layout skipped: "
+                    f"no kv cache tensor for layers {layer_names}"
+                )
+                return False
+            saw_tensor = True
+        return saw_tensor
+
+    def _build_npu_qwen3_next_layout(self, kvcaches) -> None:
+        """One full ``block_stride`` page from each layer.
+
+        Aliased group tensors share the allocation, so only the first copy is
+        recorded. ``block0`` comes from ``data_ptr`` and already includes
+        ``offset``.
+        """
+        base_ptrs: list[list[int]] = []
+        buffer_size_rows: list[list[int]] = []
+        tensor_size_lists: list[list[int]] = []
+        block_stride_lists: list[list[int]] = []
+        self.layer_name_to_row = {}
+        seen_blocks: dict[tuple[int, int], tuple[int, list[int]]] = {}
+        tensor_count = 0
+
+        for raw_tensor in self.kv_cache_config.kv_cache_tensors:
+            layer_names = kv_cache_tensor_layer_names(raw_tensor)
+            if not layer_names:
+                continue
+            block_stride = int(raw_tensor.block_stride)
+            layer_stride = int(raw_tensor.layer_stride)
+            offset = self._require_tensor_offset(raw_tensor)
+            present: list[tuple[int, list[torch.Tensor]]] = []
+            for index, layer_name in enumerate(layer_names):
+                tensors = self._component_tensors(kvcaches.get(layer_name))
+                if tensors:
+                    present.append((index, tensors))
+            if not present:
+                raise ValueError(
+                    f"Qwen3-Next NPU tensor has no layer pointers: {layer_names}"
+                )
+            block0 = self._npu_layer_block0(raw_tensor, present[0][0], present[0][1])
+            for index, tensors in present[1:]:
+                other = self._npu_layer_block0(raw_tensor, index, tensors)
+                if other != block0:
+                    raise ValueError(
+                        "Qwen3-Next NPU layers are not placed on layer_stride: "
+                        f"layer_index={index}, block0={other}, expected={block0}, "
+                        f"layer_stride={layer_stride}, offset={offset}"
+                    )
+            if block0 < 0:
+                raise ValueError(
+                    f"Qwen3-Next NPU block base is negative: block0={block0}, "
+                    f"offset={offset}"
+                )
+            span = len(layer_names) * layer_stride
+            if span > int(raw_tensor.size):
+                raise ValueError(
+                    "Qwen3-Next NPU layers exceed the raw allocation: "
+                    f"layers={len(layer_names)}, layer_stride={layer_stride}, "
+                    f"raw_size={raw_tensor.size}"
+                )
+            bases = [
+                block0 + layer_index * layer_stride
+                for layer_index in range(len(layer_names))
+            ]
+            tensor_count += 1
+            backing = block0 - offset
+            block_key = (backing, int(raw_tensor.size))
+            existing = seen_blocks.get(block_key)
+            if existing is None:
+                row_id = len(base_ptrs)
+                seen_blocks[block_key] = (row_id, bases)
+                layer_region = block_stride * self.num_blocks
+                base_ptrs.append(bases)
+                buffer_size_rows.append([layer_region] * len(bases))
+                tensor_size_lists.append([block_stride] * len(bases))
+                block_stride_lists.append([block_stride] * len(bases))
+            else:
+                row_id, existing_bases = existing
+                if existing_bases != bases:
+                    raise ValueError(
+                        "Aliased Qwen3-Next NPU tensors do not share layer bases: "
+                        f"offset={offset}, block0={block0}"
+                    )
+            for layer_name in layer_names:
+                self.layer_name_to_row[layer_name] = row_id
+
+        if tensor_count == 0 or len(base_ptrs) != 1:
+            raise ValueError(
+                "Qwen3-Next NPU layout must alias one allocation: "
+                f"tensors={tensor_count}, allocations={len(base_ptrs)}"
+            )
+        logger.info(
+            "NPU Qwen3-Next layout: "
+            f"tensors={tensor_count}, layers={len(tensor_size_lists[0])}, "
+            f"block_stride={int(tensor_size_lists[0][0])}, "
+            f"block0={base_ptrs[0][0]}, "
+            f"layer_stride={int(buffer_size_rows[0][0])}"
+        )
+        self._finalize_layout_arrays(
+            base_ptrs,
+            buffer_size_rows,
+            tensor_size_lists,
+            block_stride_lists,
+        )
+
     def _build_layout(self, kvcaches):
         if current_platform.is_cuda_alike():
             if self._cuda_layout_name() == "BLNHC":
                 self._build_cuda_blnhc_layout(kvcaches)
             else:
                 self._build_cuda_lbnhc_layout(kvcaches)
+            return
+
+        if self._npu_qwen3_next_page_layout(kvcaches):
+            self._build_npu_qwen3_next_layout(kvcaches)
             return
 
         base_ptrs = []
@@ -1372,6 +1595,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             return has_cuda_hybrid_linear_attention_groups(kv_cache_config)
         if current_platform.device_type != "npu":
             return False
+        if has_npu_qwen3_next_groups(kv_cache_config):
+            return True
 
         layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
         for raw_tensor in kv_cache_config.kv_cache_tensors:
