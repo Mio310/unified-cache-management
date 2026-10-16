@@ -688,6 +688,68 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 logger.warning(f"unsupported kv_layer type: {type(kv_layer)}")
         return shared_specs, shared_ptrs
 
+    def _log_component_adjacency(self, raw_tensor, kvcaches) -> None:
+        """Log whether conv and ssm/K of one block sit next to each other."""
+        layer_names = kv_cache_tensor_layer_names(raw_tensor)
+        if not layer_names:
+            return
+        layer_name = layer_names[0]
+        kv_layer = kvcaches.get(layer_name)
+        if isinstance(kv_layer, torch.Tensor):
+            components = [("tensor", kv_layer)]
+        elif isinstance(kv_layer, (tuple, list)):
+            components = [
+                (f"c{index}", tensor)
+                for index, tensor in enumerate(kv_layer)
+                if isinstance(tensor, torch.Tensor)
+            ]
+        else:
+            logger.info(
+                "HLA component adjacency: "
+                f"layer={layer_name}, unsupported_type={type(kv_layer)}"
+            )
+            return
+        described = []
+        for name, tensor in components:
+            one_block = (
+                int(tensor.nbytes) // self.num_blocks
+                if self.num_blocks and int(tensor.nbytes) % self.num_blocks == 0
+                else None
+            )
+            block1_ptr = None
+            if tensor.dim() > 0 and tensor.shape[0] > 1:
+                block1_ptr = int(tensor[1].data_ptr())
+            described.append(
+                {
+                    "name": name,
+                    "ptr": int(tensor.data_ptr()),
+                    "nbytes": int(tensor.nbytes),
+                    "shape": tuple(tensor.shape),
+                    "one_block": one_block,
+                    "block1_ptr": block1_ptr,
+                }
+            )
+        ordered = sorted(described, key=lambda item: item["ptr"])
+        gaps = []
+        for prev, curr in zip(ordered, ordered[1:]):
+            delta = curr["ptr"] - prev["ptr"]
+            gaps.append(
+                f"{prev['name']}->{curr['name']}: delta={delta}, "
+                f"prev_nbytes={prev['nbytes']}, "
+                f"prev_one_block={prev['one_block']}, "
+                f"same_block_adjacent={delta == prev['one_block']}, "
+                f"component_region_adjacent={delta == prev['nbytes']}"
+            )
+        logger.info(
+            "HLA component adjacency: "
+            f"layer={layer_name}, layer_count={len(layer_names)}, "
+            f"components={described}, gaps=[{'; '.join(gaps)}], "
+            f"block_stride={getattr(raw_tensor, 'block_stride', None)}, "
+            f"layer_stride={getattr(raw_tensor, 'layer_stride', None)}, "
+            f"offset={getattr(raw_tensor, 'offset', None)}, "
+            f"size={getattr(raw_tensor, 'size', None)}"
+        )
+
     def _append_contiguous_page_layout(
         self,
         raw_tensor,
@@ -1245,6 +1307,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 logger.warning(f"no kv cache tensor found for shared layers {layer_names}")
                 continue
 
+            self._log_component_adjacency(raw_tensor, kvcaches)
             row_id = len(base_ptrs)
             mamba_specs = [s for s in shared_specs if isinstance(s, MambaSpec)]
             attn_specs = [s for s in shared_specs if isinstance(s, FullAttentionSpec)]
