@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -573,9 +574,10 @@ class HybridLinearAttentionLayout(KVCacheLayout):
     vLLM backs full-attention and linear-attention groups with raw tensors.
     The physical layout is backend dependent:
 
-    - Ascend Qwen3-Next whole-cache stores one ``block_stride`` page per
-      layer. Conv/ssm and K/V already sit inside that page. Older Ascend
-      hybrid tensors stay component-major:
+    - Ascend Qwen3-Next stores one ``block_stride`` page per layer. Conv/ssm
+      and K/V already sit inside that page. Whole-cache copies every page in
+      one object. Layerwise gives each page its own shard, in forward order.
+      Older Ascend hybrid tensors stay component-major:
         [conv_block_or_padding, k_or_ssm_block, v_block_or_padding]
       across all physical blocks.
     - CUDA LBNHC is layer-outermost, ``[L, B, N, H, C]``. Each layer is its
@@ -596,11 +598,12 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         vllm_config: "VllmConfig",
         kv_cache_config: "KVCacheConfig",
     ):
-        # Whole-cache Qwen3-Next uses one object per block. The layerwise
-        # connector keeps its existing rows.
-        self._qwen3_next_npu_pages = not bool(
+        # Same gate as connector selection: both flags on means one shard per page.
+        use_layerwise = bool(ucm_config.get("use_layerwise", True))
+        hybrid_layerwise = bool(
             ucm_config.get("hybrid_linear_attention_layerwise", True)
         )
+        self._qwen3_next_npu_layerwise = use_layerwise and hybrid_layerwise
         super().__init__(kvcaches, ucm_config, vllm_config, kv_cache_config)
 
     @staticmethod
@@ -1357,7 +1360,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
 
     def _npu_qwen3_next_page_layout(self, kvcaches) -> bool:
         """Qwen3-Next NPU pages are layer-major and packed inside ``block_stride``."""
-        if current_platform.device_type != "npu" or not self._qwen3_next_npu_pages:
+        if current_platform.device_type != "npu":
             return False
         if not has_npu_qwen3_next_groups(self.kv_cache_config):
             return False
@@ -1400,27 +1403,27 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             saw_tensor = True
         return saw_tensor
 
-    def _build_npu_qwen3_next_layout(self, kvcaches) -> None:
-        """One full ``block_stride`` page from each layer.
+    def _prepare_npu_qwen3_next_pages(
+        self, kvcaches
+    ) -> tuple[int, int, int, dict[str, int], int]:
+        """Return ``block0``, page size, layer stride, layer index, tensor count.
 
-        Aliased group tensors share the allocation, so only the first copy is
-        recorded. ``block0`` comes from ``data_ptr`` and already includes
-        ``offset``.
+        Group tensors alias one allocation. ``block0`` already includes offset.
         """
-        base_ptrs: list[list[int]] = []
-        buffer_size_rows: list[list[int]] = []
-        tensor_size_lists: list[list[int]] = []
-        block_stride_lists: list[list[int]] = []
-        self.layer_name_to_row = {}
-        seen_blocks: dict[tuple[int, int], tuple[int, list[int]]] = {}
+        block0: Optional[int] = None
+        block_stride = 0
+        layer_stride = 0
+        layer_count = 0
+        backing_key: Optional[tuple[int, int]] = None
+        layer_to_index: dict[str, int] = {}
         tensor_count = 0
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             layer_names = kv_cache_tensor_layer_names(raw_tensor)
             if not layer_names:
                 continue
-            block_stride = int(raw_tensor.block_stride)
-            layer_stride = int(raw_tensor.layer_stride)
+            page = int(raw_tensor.block_stride)
+            stride = int(raw_tensor.layer_stride)
             offset = self._require_tensor_offset(raw_tensor)
             present: list[tuple[int, list[torch.Tensor]]] = []
             for index, layer_name in enumerate(layer_names):
@@ -1431,64 +1434,135 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 raise ValueError(
                     f"Qwen3-Next NPU tensor has no layer pointers: {layer_names}"
                 )
-            block0 = self._npu_layer_block0(raw_tensor, present[0][0], present[0][1])
+            this_block0 = self._npu_layer_block0(
+                raw_tensor, present[0][0], present[0][1]
+            )
             for index, tensors in present[1:]:
                 other = self._npu_layer_block0(raw_tensor, index, tensors)
-                if other != block0:
+                if other != this_block0:
                     raise ValueError(
                         "Qwen3-Next NPU layers are not placed on layer_stride: "
-                        f"layer_index={index}, block0={other}, expected={block0}, "
-                        f"layer_stride={layer_stride}, offset={offset}"
+                        f"layer_index={index}, block0={other}, expected={this_block0}, "
+                        f"layer_stride={stride}, offset={offset}"
                     )
-            if block0 < 0:
+            if this_block0 < 0:
                 raise ValueError(
-                    f"Qwen3-Next NPU block base is negative: block0={block0}, "
+                    f"Qwen3-Next NPU block base is negative: block0={this_block0}, "
                     f"offset={offset}"
                 )
-            span = len(layer_names) * layer_stride
-            if span > int(raw_tensor.size):
+            if len(layer_names) * stride > int(raw_tensor.size):
                 raise ValueError(
                     "Qwen3-Next NPU layers exceed the raw allocation: "
-                    f"layers={len(layer_names)}, layer_stride={layer_stride}, "
+                    f"layers={len(layer_names)}, layer_stride={stride}, "
                     f"raw_size={raw_tensor.size}"
                 )
-            bases = [
-                block0 + layer_index * layer_stride
-                for layer_index in range(len(layer_names))
-            ]
-            tensor_count += 1
-            backing = block0 - offset
-            block_key = (backing, int(raw_tensor.size))
-            existing = seen_blocks.get(block_key)
-            if existing is None:
-                row_id = len(base_ptrs)
-                seen_blocks[block_key] = (row_id, bases)
-                layer_region = block_stride * self.num_blocks
-                base_ptrs.append(bases)
-                buffer_size_rows.append([layer_region] * len(bases))
-                tensor_size_lists.append([block_stride] * len(bases))
-                block_stride_lists.append([block_stride] * len(bases))
-            else:
-                row_id, existing_bases = existing
-                if existing_bases != bases:
+            this_key = (this_block0 - offset, int(raw_tensor.size))
+            if block0 is None:
+                block0 = this_block0
+                block_stride = page
+                layer_stride = stride
+                layer_count = len(layer_names)
+                backing_key = this_key
+            elif (
+                this_block0 != block0
+                or page != block_stride
+                or stride != layer_stride
+                or len(layer_names) != layer_count
+                or this_key != backing_key
+            ):
+                raise ValueError(
+                    "Qwen3-Next NPU tensors do not alias one allocation: "
+                    f"block0={this_block0}, expected={block0}, "
+                    f"layers={len(layer_names)}, expected_layers={layer_count}"
+                )
+            for index, layer_name in enumerate(layer_names):
+                previous = layer_to_index.get(layer_name)
+                if previous is not None and previous != index:
                     raise ValueError(
-                        "Aliased Qwen3-Next NPU tensors do not share layer bases: "
-                        f"offset={offset}, block0={block0}"
+                        "Qwen3-Next NPU layer is listed at two page indexes: "
+                        f"layer={layer_name}, indexes={previous},{index}"
                     )
-            for layer_name in layer_names:
-                self.layer_name_to_row[layer_name] = row_id
+                layer_to_index[layer_name] = index
+            tensor_count += 1
 
-        if tensor_count == 0 or len(base_ptrs) != 1:
-            raise ValueError(
-                "Qwen3-Next NPU layout must alias one allocation: "
-                f"tensors={tensor_count}, allocations={len(base_ptrs)}"
-            )
+        if block0 is None or tensor_count == 0:
+            raise ValueError("Qwen3-Next NPU layout found no KV cache tensors")
+        return block0, block_stride, layer_stride, layer_to_index, tensor_count
+
+    def _npu_qwen3_next_forward_rows(
+        self, layer_to_index: dict[str, int], layer_count: int
+    ) -> list[int]:
+        """Physical page indexes sorted by the earliest model layer on that page."""
+
+        def page_position(index: int) -> tuple[int, int]:
+            positions = [
+                self.layer_name_to_id.get(name, extract_layer_index(name))
+                for name, page in layer_to_index.items()
+                if page == index
+            ]
+            if not positions:
+                return (index, index)
+            return (min(positions), index)
+
+        return sorted(range(layer_count), key=page_position)
+
+    def _build_npu_qwen3_next_layout(self, kvcaches) -> None:
+        """One object: every layer page of ``block_stride``."""
+        block0, block_stride, layer_stride, layer_to_index, tensor_count = (
+            self._prepare_npu_qwen3_next_pages(kvcaches)
+        )
+        layer_count = max(layer_to_index.values()) + 1
+        bases = [block0 + index * layer_stride for index in range(layer_count)]
+        layer_region = block_stride * self.num_blocks
+        self.layer_name_to_row = {name: 0 for name in layer_to_index}
         logger.info(
             "NPU Qwen3-Next layout: "
-            f"tensors={tensor_count}, layers={len(tensor_size_lists[0])}, "
-            f"block_stride={int(tensor_size_lists[0][0])}, "
-            f"block0={base_ptrs[0][0]}, "
-            f"layer_stride={int(buffer_size_rows[0][0])}"
+            f"tensors={tensor_count}, layers={layer_count}, "
+            f"block_stride={block_stride}, block0={block0}, "
+            f"layer_stride={layer_stride}"
+        )
+        self._finalize_layout_arrays(
+            [bases],
+            [[layer_region] * layer_count],
+            [[block_stride] * layer_count],
+            [[block_stride] * layer_count],
+        )
+        # One object holds every page, even if the generic flag defaults on.
+        self.use_layerwise = False
+
+    def _build_npu_qwen3_next_layerwise_layout(self, kvcaches) -> None:
+        """One shard per physical page, ordered by forward progress.
+
+        The i-th layer of every group shares that page. ``wait_for_layer_load``
+        runs on the full-attention layer and pulls in the next shard.
+        """
+        block0, block_stride, layer_stride, layer_to_index, tensor_count = (
+            self._prepare_npu_qwen3_next_pages(kvcaches)
+        )
+        layer_count = max(layer_to_index.values()) + 1
+        forward_pages = self._npu_qwen3_next_forward_rows(layer_to_index, layer_count)
+        row_of_page = {
+            physical: row for row, physical in enumerate(forward_pages)
+        }
+        layer_region = block_stride * self.num_blocks
+        base_ptrs = []
+        buffer_size_rows = []
+        tensor_size_lists = []
+        block_stride_lists = []
+        for physical in forward_pages:
+            base_ptrs.append([block0 + physical * layer_stride])
+            buffer_size_rows.append([layer_region])
+            tensor_size_lists.append([block_stride])
+            block_stride_lists.append([block_stride])
+        self.layer_name_to_row = {
+            name: row_of_page[index] for name, index in layer_to_index.items()
+        }
+        logger.info(
+            "NPU Qwen3-Next layerwise layout: "
+            f"tensors={tensor_count}, rows={layer_count}, "
+            f"block_stride={block_stride}, block0={block0}, "
+            f"layer_stride={layer_stride}, "
+            f"forward_pages={forward_pages}"
         )
         self._finalize_layout_arrays(
             base_ptrs,
@@ -1506,7 +1580,10 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             return
 
         if self._npu_qwen3_next_page_layout(kvcaches):
-            self._build_npu_qwen3_next_layout(kvcaches)
+            if self._qwen3_next_npu_layerwise:
+                self._build_npu_qwen3_next_layerwise_layout(kvcaches)
+            else:
+                self._build_npu_qwen3_next_layout(kvcaches)
             return
 
         base_ptrs = []
