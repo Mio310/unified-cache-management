@@ -193,11 +193,23 @@ def _layer_name_is_flash_next_only(name: str) -> bool:
     )
 
 
-def has_npu_qwen3_next_groups(kv_cache_config) -> bool:
-    """Qwen3-Next on NPU: full attention plus align-mode linear groups.
+def hybrid_kv_cache_layout_name(kv_cache_config, vllm_config=None) -> str:
+    """``LBNHC`` is layer-first. ``BLNHC`` is block-first."""
+    configured = getattr(kv_cache_config, "kv_cache_layout", None)
+    if configured:
+        return str(configured).split(".")[-1]
+    cache_config = getattr(vllm_config, "cache_config", None) if vllm_config else None
+    resolver = getattr(cache_config, "get_resolved_kv_cache_layout", None)
+    if resolver is None:
+        return "LBNHC"
+    layout = resolver()
+    return str(getattr(layout, "name", layout)).split(".")[-1]
 
-    Compressed key, raw key, and PLE belong to qwen3.8-flash-next and stay
-    out of this path.
+
+def has_npu_qwen3_next_groups(kv_cache_config) -> bool:
+    """Layer-first mamba models: full attention plus align-mode linear groups.
+
+    Compressed key, raw key, and PLE belong to block-first flash-next.
     """
     has_full_attention = False
     has_mamba_align = False
@@ -598,12 +610,13 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         vllm_config: "VllmConfig",
         kv_cache_config: "KVCacheConfig",
     ):
-        # Same gate as connector selection: both flags on means one shard per page.
+        # Layer-first models split one shard per page when layerwise is on.
+        # Block-first flash-next never takes that mode.
         use_layerwise = bool(ucm_config.get("use_layerwise", True))
         hybrid_layerwise = bool(
             ucm_config.get("hybrid_linear_attention_layerwise", True)
         )
-        self._qwen3_next_npu_layerwise = use_layerwise and hybrid_layerwise
+        self._layer_first_layerwise = use_layerwise and hybrid_layerwise
         super().__init__(kvcaches, ucm_config, vllm_config, kv_cache_config)
 
     @staticmethod
@@ -1033,16 +1046,8 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         tensor_size_lists.append(sizes)
         block_stride_lists.append(sizes)
 
-    def _cuda_layout_name(self) -> str:
-        configured = getattr(self.kv_cache_config, "kv_cache_layout", None)
-        if configured:
-            return str(configured).split(".")[-1]
-        cache_config = getattr(self.vllm_config, "cache_config", None)
-        resolver = getattr(cache_config, "get_resolved_kv_cache_layout", None)
-        if resolver is None:
-            return "LBNHC"
-        layout = resolver()
-        return str(getattr(layout, "name", layout)).split(".")[-1]
+    def _layout_name(self) -> str:
+        return hybrid_kv_cache_layout_name(self.kv_cache_config, self.vllm_config)
 
     @staticmethod
     def _require_tensor_offset(raw_tensor) -> int:
@@ -1284,7 +1289,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             for layer_name in rec["layer_names"]:
                 self.layer_name_to_row[layer_name] = 0
         logger.info(
-            "CUDA BLNHC hybrid layout: "
+            "BLNHC block-first layout: "
             f"block_stride={block_stride}, layer_stride={main_stride}, "
             f"compressed_layer_stride={int(compressed['layer_stride'])}, "
             f"shared_base={shared_base}, full_block0={full_block0}, "
@@ -1359,8 +1364,8 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         return origin - index * layer_stride
 
     def _npu_qwen3_next_page_layout(self, kvcaches) -> bool:
-        """Qwen3-Next NPU pages are layer-major and packed inside ``block_stride``."""
-        if current_platform.device_type != "npu":
+        """Layer-first pages: one ``block_stride`` page per layer, on CUDA and NPU."""
+        if self._layout_name() != "LBNHC":
             return False
         if not has_npu_qwen3_next_groups(self.kv_cache_config):
             return False
@@ -1375,7 +1380,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             layer_stride = int(getattr(raw_tensor, "layer_stride", 0) or 0)
             if block_stride <= 0 or layer_stride != block_stride * self.num_blocks:
                 logger.info(
-                    "NPU Qwen3-Next page layout skipped: "
+                    "LBNHC layer-first skipped: "
                     f"block_stride={block_stride}, layer_stride={layer_stride}, "
                     f"num_blocks={self.num_blocks}"
                 )
@@ -1386,17 +1391,17 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 if not tensors:
                     continue
                 checked = True
-                if not self._components_fit_one_page(tensors, block_stride):
+                pointers = [int(tensor.data_ptr()) for tensor in tensors]
+                if max(pointers) - min(pointers) >= block_stride:
                     logger.info(
-                        "NPU Qwen3-Next page layout skipped: components are not "
-                        f"packed in one block_stride, layer={layer_name}, "
-                        f"block_stride={block_stride}"
+                        "LBNHC layer-first skipped: components are not in one page, "
+                        f"layer={layer_name}, block_stride={block_stride}"
                     )
                     return False
                 break
             if not checked:
                 logger.info(
-                    "NPU Qwen3-Next page layout skipped: "
+                    "LBNHC layer-first skipped: "
                     f"no kv cache tensor for layers {layer_names}"
                 )
                 return False
@@ -1516,7 +1521,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         layer_region = block_stride * self.num_blocks
         self.layer_name_to_row = {name: 0 for name in layer_to_index}
         logger.info(
-            "NPU Qwen3-Next layout: "
+            "LBNHC layer-first layout: "
             f"tensors={tensor_count}, layers={layer_count}, "
             f"block_stride={block_stride}, block0={block0}, "
             f"layer_stride={layer_stride}"
@@ -1558,7 +1563,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             name: row_of_page[index] for name, index in layer_to_index.items()
         }
         logger.info(
-            "NPU Qwen3-Next layerwise layout: "
+            "LBNHC layer-first layerwise layout: "
             f"tensors={tensor_count}, rows={layer_count}, "
             f"block_stride={block_stride}, block0={block0}, "
             f"layer_stride={layer_stride}, "
@@ -1572,18 +1577,19 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         )
 
     def _build_layout(self, kvcaches):
-        if current_platform.is_cuda_alike():
-            if self._cuda_layout_name() == "BLNHC":
-                self._build_cuda_blnhc_layout(kvcaches)
-            else:
-                self._build_cuda_lbnhc_layout(kvcaches)
+        layout_name = self._layout_name()
+        if layout_name == "BLNHC":
+            # Block-first flash-next is whole-cache only.
+            self._build_cuda_blnhc_layout(kvcaches)
             return
-
-        if self._npu_qwen3_next_page_layout(kvcaches):
-            if self._qwen3_next_npu_layerwise:
+        if layout_name == "LBNHC" and self._npu_qwen3_next_page_layout(kvcaches):
+            if self._layer_first_layerwise:
                 self._build_npu_qwen3_next_layerwise_layout(kvcaches)
             else:
                 self._build_npu_qwen3_next_layout(kvcaches)
+            return
+        if current_platform.is_cuda_alike():
+            self._build_cuda_lbnhc_layout(kvcaches)
             return
 
         base_ptrs = []
@@ -1668,12 +1674,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         if kv_cache_config is None:
             return False
 
-        if current_platform.is_cuda_alike():
-            return has_cuda_hybrid_linear_attention_groups(kv_cache_config)
+        if has_cuda_hybrid_linear_attention_groups(kv_cache_config):
+            return True
         if current_platform.device_type != "npu":
             return False
-        if has_npu_qwen3_next_groups(kv_cache_config):
-            return True
 
         layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
         for raw_tensor in kv_cache_config.kv_cache_tensors:

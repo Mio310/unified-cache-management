@@ -3354,16 +3354,19 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         from ucm.integration.vllm.hla_connector import (
             UCMHybridLinearAttentionConnector,
             UCMHybridLinearAttentionLayerWiseConnector,
+            hybrid_kv_cache_layout_name,
         )
         from ucm.integration.vllm.hma_connector import UCMFAWAConnector
 
         use_hybrid_linear_attention = (
             UCMHybridLinearAttentionConnector.supports_kv_cache_layout(kv_cache_config)
         )
+        block_first = hybrid_kv_cache_layout_name(kv_cache_config, vllm_config) == "BLNHC"
         use_hybrid_linear_attention_layerwise = (
             use_hybrid_linear_attention
             and use_layerwise
             and self.launch_config.get("hybrid_linear_attention_layerwise", True)
+            and not block_first
         )
 
         if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
