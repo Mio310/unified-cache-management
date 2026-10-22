@@ -73,6 +73,10 @@ def hla():
         "is_mamba_align_kv_cache_spec",
         "participates_in_prefix_caching",
         "extend_non_null",
+        "_model_layer_index",
+        "_kv_layer_kind",
+        "flash_next_group_roles",
+        "build_flash_next_addresses",
     }
     methods = {
         "KVCacheGroupManager": {
@@ -91,6 +95,7 @@ def hla():
             "_finalize_glm53_ascend_columns",
             "_finalize_layout_arrays",
             "_extract_group_addrs",
+            "extract_block_addrs",
         },
         "UCMHybridLinearAttentionConnector": {
             "_scope_blocks",
@@ -108,9 +113,21 @@ def hla():
             "_record_layerwise_load_bytes",
         },
     }
+    flash_next_constants = {
+        "FLASH_NEXT_SEGMENT_SIZES",
+        "FLASH_NEXT_PAGE_BYTES",
+        "FLASH_NEXT_PLE_BYTES",
+        "FLASH_NEXT_ATTN_LAYERS",
+        "FLASH_NEXT_LINEAR_GROUPS",
+    }
     nodes = []
     for node in ast.parse(HLA_PATH.read_text(encoding="utf-8-sig")).body:
-        if getattr(node, "name", None) in functions | {
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in flash_next_constants
+            for target in node.targets
+        ):
+            nodes.append(node)
+        elif getattr(node, "name", None) in functions | {
             "GroupInfo",
             "HLARequestMeta",
             "HLARequestDispatchMeta",
@@ -871,3 +888,136 @@ def test_glm_preload_waits_all_state_rows_before_returning(
     # for every row, while the unused speculative tail remains untouched.
     for values in memory.values():
         assert values == {22: b"checkpoint", 23: b"checkpoint", 99: b"scratch"}
+
+
+def _flash_next_groups():
+    raw = [
+        f"language_model.model.layers.{i}.self_attn.indexer.raw_key_cache"
+        for i in range(12)
+    ]
+    attn = [f"language_model.model.layers.{i}.self_attn.attn" for i in range(12)]
+    compressed = [
+        f"language_model.model.layers.{i}.self_attn.indexer.compressed_key_cache"
+        for i in range(12)
+    ]
+    groups = [group(KVCacheSpec(block_size=4), *raw)]
+    groups.append(group(KVCacheSpec(block_size=4), *attn, *compressed))
+    groups.extend(
+        group(KVCacheSpec(block_size=4), f"language_model.model.layers.{i}.linear_attn")
+        for i in range(36)
+    )
+    groups.append(group(KVCacheSpec(block_size=4), "language_model.model.layers.1.ple"))
+    return groups
+
+
+def test_flash_next_roles_match_only_the_39_group_split(hla):
+    groups = _flash_next_groups()
+    roles = hla.flash_next_group_roles(groups)
+    assert roles[0] == "raw"
+    assert roles[1] == "attn"
+    assert [gid for gid, role in roles.items() if role == "linear"] == list(range(2, 38))
+    assert roles[38] == "ple"
+    assert hla.flash_next_group_roles(groups[:38]) is None
+    other = _flash_next_groups()
+    other[2] = group(KVCacheSpec(block_size=4), "language_model.model.layers.0.other")
+    assert hla.flash_next_group_roles(other) is None
+
+
+def test_flash_next_group_manager_keeps_attention_hash_and_excludes_raw_key(hla):
+    config = SimpleNamespace(kv_cache_groups=_flash_next_groups())
+    hasher = MagicMock(return_value=b"seed")
+    hash_request = MagicMock(return_value=[b"attn"])
+    hasher.make_request_block_hasher.return_value = hash_request
+    manager = hla.KVCacheGroupManager(config, hasher, b"base")
+    assert manager.lcm_block_size == 4
+    assert [g.group_id for g in manager.full_attn_groups] == [1]
+    assert [g.group_id for g in manager.non_prefix_groups] == [0]
+    assert [g.group_id for g in manager.state_groups] == list(range(2, 39))
+    assert all(g.is_mamba_align for g in manager.state_groups)
+    assert manager.groups_by_id[1].block_hasher is hash_request
+    assert manager.groups_by_id[2].block_hasher is None
+    hashes = manager.compute_all_group_block_ids(
+        SimpleNamespace(all_token_ids=list(range(4)))
+    )
+    assert hashes[0] == []
+    assert hashes[1] == [b"attn"]
+    assert hashes[2] == [b""]
+    assert hashes[38] == [b""]
+
+
+def test_flash_next_addresses_keep_one_object_width(hla):
+    page = hla.FLASH_NEXT_PAGE_BYTES
+    segments = hla.FLASH_NEXT_SEGMENT_SIZES
+    attn_layers = [
+        {
+            "k_ptr": 1000,
+            "k_stride": segments[1],
+            "v_ptr": 2000,
+            "v_stride": segments[2],
+            "ck_ptr": 3000,
+            "ck_stride": segments[3],
+        },
+        {
+            "k_ptr": 4000,
+            "k_stride": segments[1],
+            "v_ptr": 5000,
+            "v_stride": segments[2],
+            "ck_ptr": 6000,
+            "ck_stride": segments[3],
+        },
+    ]
+    linear = (
+        7,
+        {
+            "conv_ptr": 7000,
+            "conv_stride": segments[0],
+            "ssm_ptr": 8000,
+            "ssm_stride": segments[1],
+        },
+    )
+    tables = hla.build_flash_next_addresses(
+        1, attn_layers, [linear], 8, 0, zero_ptr=9, stage_ptr=10000
+    )
+    width = len(attn_layers) * len(segments)
+    assert all(len(bases) == width and len(strides) == width for bases, strides in tables.values())
+
+    raw_bases, raw_strides = tables[0]
+    assert raw_bases == [9] * width
+    assert raw_strides == [0] * width
+
+    attn_bases, attn_strides = tables[1]
+    assert attn_bases[0] == 9 and attn_strides[0] == 0
+    assert (attn_bases[1], attn_strides[1]) == (1000, segments[1])
+    assert (attn_bases[2], attn_strides[2]) == (2000, segments[2])
+    assert (attn_bases[3], attn_strides[3]) == (3000, segments[3])
+    assert (attn_bases[5], attn_strides[5]) == (4000, segments[1])
+
+    linear_bases, linear_strides = tables[7]
+    assert (linear_bases[0], linear_strides[0]) == (7000, segments[0])
+    assert (linear_bases[1], linear_strides[1]) == (8000, segments[1])
+    assert linear_bases[2:] == [9] * (width - 2)
+    assert linear_strides[2:] == [0] * (width - 2)
+
+    ple_bases, ple_strides = tables[8]
+    cursor = 0
+    for segment, size in enumerate(segments):
+        assert ple_bases[segment] == 10000 + cursor
+        assert ple_strides[segment] == page
+        cursor += size
+    assert cursor == page
+    assert ple_bases[len(segments) :] == [9] * (width - len(segments))
+    assert ple_strides[len(segments) :] == [0] * (width - len(segments))
+
+    layout = hla.HybridLinearAttentionLayout()
+    layout.base_ptrs = np.zeros(width, dtype=np.uint64)
+    layout.group_layouts = {
+        group_id: (
+            np.asarray(bases, dtype=np.uint64),
+            np.asarray(strides, dtype=np.uint64),
+        )
+        for group_id, (bases, strides) in tables.items()
+    }
+    addrs = layout.extract_block_addrs([3], group_ids=[8])
+    assert int(addrs[0, 0]) == 10000 + 3 * page
+    assert int(addrs[0, 1]) == 10000 + segments[0] + 3 * page
+    assert int(addrs[0, len(segments)]) == 9
