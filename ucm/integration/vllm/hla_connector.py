@@ -152,14 +152,6 @@ FLASH_NEXT_ATTN_LAYERS = 12
 FLASH_NEXT_LINEAR_GROUPS = 36
 
 
-def _flash_next_position_span(positions: list[int]) -> str:
-    if not positions:
-        return "none"
-    if len(positions) == 1:
-        return str(positions[0])
-    return f"{positions[0]}..{positions[-1]} ({len(positions)})"
-
-
 def _model_layer_index(name: str) -> int:
     parts = name.split(".")
     for index, part in enumerate(parts[:-1]):
@@ -371,7 +363,6 @@ class KVCacheGroupManager:
         flash_next_roles = flash_next_group_roles(
             kv_cache_config.kv_cache_groups, num_hidden_layers
         )
-        self.flash_next_roles = flash_next_roles
 
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
@@ -551,7 +542,6 @@ class KVCacheGroupManager:
 
         # Stage 1: each full-attn group contributes a candidate hit count.
         candidates: list[int] = []
-        flash_next_roles = getattr(self, "flash_next_roles", None)
         for fa in self.full_attn_groups:
             fa_block_ids = group_block_ids[fa.group_id]
             fa_hbm_blocks = num_computed_tokens // fa.block_size
@@ -577,14 +567,6 @@ class KVCacheGroupManager:
         external_hit_tokens = (
             min_external_hit_tokens // self.lcm_block_size
         ) * self.lcm_block_size
-        if flash_next_roles is not None:
-            logger.info(
-                "Flash-next lookup stage1: "
-                f"num_computed_tokens={num_computed_tokens}, "
-                f"attention_candidates={candidates}, "
-                f"attention_external_tokens={external_hit_tokens}, "
-                f"lcm_block_size={self.lcm_block_size}"
-            )
         if external_hit_tokens <= 0:
             return 0, 0, []
 
@@ -611,7 +593,6 @@ class KVCacheGroupManager:
         )
 
         best_pos = total_hit_tokens
-        limited_by = None
         for sg in self.state_groups:
             # Truncate to positions <= best_pos so earlier state groups
             # can shrink the search window for subsequent ones.
@@ -631,44 +612,14 @@ class KVCacheGroupManager:
                 )
                 _record_counter("connector_lookup_errors_total")
                 return 0, 0, []
-            role = None if flash_next_roles is None else flash_next_roles.get(sg.group_id)
             if idx < 0:
                 # This state group has no state at any candidate position.
-                if role in ("linear", "ple"):
-                    logger.info(
-                        "Flash-next lookup miss: "
-                        f"group={sg.group_id}, role={role}, "
-                        f"layer={sg.layer_names}, "
-                        f"positions={_flash_next_position_span(sg_positions)}, "
-                        f"external_hit_tokens=0"
-                    )
                 return 0, 0, []
             sg_pos = sg_positions[idx]
-            if role in ("linear", "ple"):
-                hit_hash = sg_hashes[idx]
-                logger.info(
-                    "Flash-next lookup hit: "
-                    f"group={sg.group_id}, role={role}, "
-                    f"layer={sg.layer_names}, "
-                    f"positions={_flash_next_position_span(sg_positions)}, "
-                    f"hit_index={idx}, hit_pos={sg_pos}, "
-                    f"state_hash={hit_hash.hex() if hit_hash else 'empty'}"
-                )
             if sg_pos < best_pos:
                 best_pos = sg_pos
-                limited_by = sg
 
         external_hit_tokens = best_pos - num_computed_tokens
-        if flash_next_roles is not None:
-            logger.info(
-                "Flash-next lookup result: "
-                f"external_hit_tokens={external_hit_tokens}, "
-                f"best_pos={best_pos}, "
-                f"limited_by_group="
-                f"{None if limited_by is None else limited_by.group_id}, "
-                f"limited_by_role="
-                f"{None if limited_by is None else flash_next_roles.get(limited_by.group_id)}"
-            )
         if external_hit_tokens <= 0:
             return 0, 0, []
 
@@ -1743,7 +1694,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             if role == "mtp":
                 tables[group_id] = ([zero_ptr] * mtp_width, [0] * mtp_width)
         self.flash_next = True
-        self.flash_next_roles = roles
         self.use_layerwise = False
         self.ple_group_id = ple_group_id
         self._ple_tensor = ple_tensor
@@ -1903,74 +1853,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             buffers.append(key)
         return buffers
 
-    def log_flash_next_io(
-        self, action: str, vllm_block_ids: list[int], group_ids: list[int]
-    ) -> None:
-        """Log linear and PLE pages selected for one dump or load."""
-        if not getattr(self, "flash_next", False):
-            return
-        roles = getattr(self, "flash_next_roles", {}) or {}
-        linear_pages = 0
-        ple_pages = 0
-        for block_id, group_id in zip(vllm_block_ids, group_ids):
-            role = roles.get(int(group_id))
-            if role not in ("linear", "ple"):
-                continue
-            bases, strides = self.group_layouts[int(group_id)]
-            block = int(block_id)
-            segment_sizes = self.flash_next_segment_sizes
-            if role == "linear":
-                linear_pages += 1
-                logger.info(
-                    "Flash-next %s linear page: "
-                    "group=%s, vllm_block=%s, "
-                    "conv_addr=%s, conv_stride=%s, conv_bytes=%s, "
-                    "ssm_addr=%s, ssm_stride=%s, ssm_bytes=%s, "
-                    "pad_v_addr=%s, pad_ck_addr=%s, "
-                    "live_page=0, object_pages=%s",
-                    action,
-                    group_id,
-                    block,
-                    int(bases[0]) + block * int(strides[0]),
-                    int(strides[0]),
-                    segment_sizes[0],
-                    int(bases[1]) + block * int(strides[1]),
-                    int(strides[1]),
-                    segment_sizes[1],
-                    int(bases[2]) + block * int(strides[2]),
-                    int(bases[3]) + block * int(strides[3]),
-                    FLASH_NEXT_ATTN_LAYERS,
-                )
-                continue
-            ple_pages += 1
-            segments = []
-            for segment, size in enumerate(segment_sizes):
-                segments.append(
-                    (
-                        int(bases[segment]) + block * int(strides[segment]),
-                        int(strides[segment]),
-                        size,
-                    )
-                )
-            logger.info(
-                "Flash-next %s ple page: "
-                "group=%s, vllm_block=%s, live_bytes=%s, "
-                "segments=%s, later_pages=zero, object_pages=%s",
-                action,
-                group_id,
-                block,
-                self.flash_next_ple_bytes,
-                segments,
-                FLASH_NEXT_ATTN_LAYERS,
-            )
-        logger.info(
-            "Flash-next %s summary: blocks=%s, linear_pages=%s, ple_pages=%s",
-            action,
-            len(vllm_block_ids),
-            linear_pages,
-            ple_pages,
-        )
-
     def prepare_flash_next_dump(
         self, vllm_block_ids: list[int], group_ids: list[int]
     ) -> None:
@@ -1987,13 +1869,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             page.zero_()
             ple_block = self._ple_tensor[block_id].contiguous()
             page[: ple_block.nbytes].copy_(ple_block.view(torch.uint8).reshape(-1))
-            logger.info(
-                "Flash-next pack ple before dump: "
-                f"vllm_block={block_id}, live_bytes={ple_block.nbytes}, "
-                f"ple_ptr={int(ple_block.data_ptr())}, "
-                f"stage_ptr={int(page.data_ptr())}, "
-                f"page_bytes={self.flash_next_page_bytes}"
-            )
 
     def finish_flash_next_load(
         self, vllm_block_ids: list[int], group_ids: list[int]
@@ -2009,13 +1884,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             ple_block = self._ple_tensor[block_id]
             src = self._ple_stage[block_id, : ple_block.nbytes]
             ple_block.copy_(src.view(ple_block.dtype).view(ple_block.shape))
-            logger.info(
-                "Flash-next scatter ple after load: "
-                f"vllm_block={block_id}, live_bytes={ple_block.nbytes}, "
-                f"stage_ptr={int(src.data_ptr())}, "
-                f"ple_ptr={int(ple_block.data_ptr())}, "
-                f"ple_shape={tuple(ple_block.shape)}"
-            )
 
     def _build_layout(self, kvcaches):
         # GLM-5.3-Flash is currently supported only on Ascend. Do not let
@@ -2546,17 +2414,6 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dst_ucm_block_ids.append(ucm_block_id)
             dst_vllm_block_ids.append(vllm_block_id)
             dst_group_ids.append(gid)
-        roles = getattr(self.group_manager, "flash_next_roles", None) or {}
-        role = roles.get(gid)
-        if role in ("linear", "ple"):
-            logger.info(
-                "Flash-next state %s: "
-                f"request={request_id}, group={gid}, role={role}, "
-                f"layer={group.layer_names}, seq_len={seq_len}, "
-                f"state_indices={state_indices}, "
-                f"vllm_blocks={vllm_block_ids}, "
-                f"state_hash={ucm_block_id.hex()}"
-            )
 
     def _generate_hla_dispatch_meta(
         self,
@@ -2839,9 +2696,6 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 continue
             num_loaded_block -= len(request.load_block_ids[0]) - len(scoped_ucm)
             try:
-                log_io = getattr(self.kv_cache_layout, "log_flash_next_io", None)
-                if log_io is not None:
-                    log_io("load", scoped_vllm, scoped_groups)
                 ptrs = self.kv_cache_layout.extract_block_addrs(
                     scoped_vllm, group_ids=scoped_groups
                 )
@@ -2965,9 +2819,6 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             )
             if prepare_dump is not None:
                 prepare_dump(total_vllm_block_ids, total_group_ids)
-            log_io = getattr(self.kv_cache_layout, "log_flash_next_io", None)
-            if log_io is not None:
-                log_io("dump", total_vllm_block_ids, total_group_ids)
             total_ptrs = self.kv_cache_layout.extract_block_addrs(
                 total_vllm_block_ids, group_ids=total_group_ids
             )
