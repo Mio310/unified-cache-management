@@ -1053,166 +1053,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 logger.warning(f"unsupported kv_layer type: {type(kv_layer)}")
         return shared_specs, shared_ptrs
 
-    @staticmethod
-    def _ascend_component_slot(
-        name: str,
-        slot_bytes: int,
-        base: int,
-        *,
-        payloads: dict[str, int] | None = None,
-        padding_kind: str,
-    ) -> dict:
-        """One component-major slot. Padding stays inside the slot."""
-        payloads = payloads or {}
-        padding = (
-            {"padding": int(slot_bytes)}
-            if padding_kind == "whole_slot"
-            else {
-                payload: int(slot_bytes) - int(size)
-                for payload, size in payloads.items()
-            }
-        )
-        return {
-            "name": name,
-            "slot_bytes": int(slot_bytes),
-            "block_stride": int(slot_bytes),
-            "base": int(base),
-            "payloads": payloads,
-            "padding_bytes": padding,
-            "padding_kind": padding_kind,
-        }
-
-    def _describe_ascend_kv_views(
-        self,
-        layer_names: list[str],
-        kvcaches,
-        raw_base: int,
-        components: list[dict],
-    ) -> list[str]:
-        """Map each live tensor onto a component slot.
-
-        A tensor's ``data_ptr`` says which slot it starts in. Its shape says
-        whether an axis is the component axis or the block axis, and that
-        axis's stride is the byte pitch between those elements.
-        """
-        views: list[str] = []
-        if not kvcaches:
-            return views
-        for layer_name in layer_names:
-            kv_layer = kvcaches.get(layer_name)
-            if isinstance(kv_layer, torch.Tensor):
-                tensors = (kv_layer,)
-            elif isinstance(kv_layer, (tuple, list)):
-                tensors = tuple(
-                    tensor for tensor in kv_layer if isinstance(tensor, torch.Tensor)
-                )
-            else:
-                continue
-            for index, tensor in enumerate(tensors):
-                shape = tuple(int(dim) for dim in tensor.shape)
-                strides = tuple(int(tensor.stride(dim)) for dim in range(tensor.dim()))
-                itemsize = int(tensor.element_size())
-                ptr = int(tensor.data_ptr())
-                slot_name = "unmatched"
-                offset_in_slot = ptr - raw_base
-                for component in components:
-                    span = component["slot_bytes"] * self.num_blocks
-                    if component["base"] <= ptr < component["base"] + span:
-                        slot_name = component["name"]
-                        offset_in_slot = ptr - component["base"]
-                        break
-                axis_notes = []
-                for dim, size in enumerate(shape):
-                    pitch = strides[dim] * itemsize
-                    if size == len(components) and len(components) > 1:
-                        axis_notes.append(
-                            f"dim{dim} matches component count, "
-                            f"component_stride_bytes={pitch}"
-                        )
-                    if size == self.num_blocks:
-                        axis_notes.append(
-                            f"dim{dim} matches num_blocks, block_stride_bytes={pitch}"
-                        )
-                axis = f" axes=[{'; '.join(axis_notes)}]" if axis_notes else ""
-                views.append(
-                    f"{layer_name}[{index}] shape={shape} stride={strides} "
-                    f"dtype={tensor.dtype} itemsize={itemsize} "
-                    f"nbytes={math.prod(shape) * itemsize} ptr={ptr} "
-                    f"slot={slot_name} offset_in_slot={offset_in_slot}{axis}"
-                )
-        return views
-
-    def _log_ascend_full_page_components(
-        self,
-        kind: str,
-        layer_names: list[str],
-        raw_tensor,
-        kvcaches,
-        raw_base: int,
-        components: list[dict],
-        note: str = "",
-    ) -> None:
-        """Log the NPU full-page component order, padding, and strides.
-
-        Component-major storage keeps every block of one component together.
-        ``block_stride`` is the pitch from block ``b`` to block ``b + 1`` inside
-        that component. ``inter_component_stride`` is the pitch from the first
-        byte of one component to the first byte of the next, equal to
-        ``slot_bytes * num_blocks``.
-        """
-        page_bytes = raw_tensor.size // self.num_blocks if self.num_blocks else 0
-        inter_component_stride = [
-            (
-                f"{left['name']}->{right['name']}="
-                f"{right['base'] - left['base']}"
-                f" ({left['slot_bytes']}*{self.num_blocks})"
-            )
-            for left, right in zip(components, components[1:])
-        ]
-        covered = set()
-        for layer_name in layer_names:
-            kv_layer = kvcaches.get(layer_name) if kvcaches else None
-            tensors = (
-                (kv_layer,)
-                if isinstance(kv_layer, torch.Tensor)
-                else kv_layer
-                if isinstance(kv_layer, (tuple, list))
-                else ()
-            )
-            for tensor in tensors:
-                if not isinstance(tensor, torch.Tensor):
-                    continue
-                ptr = int(tensor.data_ptr())
-                for component in components:
-                    span = component["slot_bytes"] * self.num_blocks
-                    if component["base"] <= ptr < component["base"] + span:
-                        covered.add(component["name"])
-        uncovered = [
-            component["name"]
-            for component in components
-            if component["name"] not in covered
-        ]
-        logger.info(
-            "Ascend full-page component-major layout kind=%s layers=%s "
-            "num_blocks=%s page_bytes=%s raw_base=%s order=%s "
-            "block_stride=%s inter_component_stride=%s "
-            "slots_without_live_view=%s components=%s views=%s%s",
-            kind,
-            list(layer_names),
-            self.num_blocks,
-            page_bytes,
-            raw_base,
-            [component["name"] for component in components],
-            [component["block_stride"] for component in components],
-            inter_component_stride or ["single-component"],
-            uncovered,
-            components,
-            self._describe_ascend_kv_views(
-                layer_names, kvcaches, raw_base, components
-            ),
-            f" {note}" if note else "",
-        )
-
     def _append_contiguous_page_layout(
         self,
         raw_tensor,
@@ -1244,25 +1084,8 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         buffer_size_rows: list[list[int]],
         tensor_size_lists: list[list[int]],
         block_stride_lists: list[list[int]],
-        layer_names: list[str],
-        kvcaches,
     ) -> None:
-        mamba_spec = mamba_specs[0]
-        mamba_sizes = self._mamba_component_sizes(mamba_spec)
-        mamba_components = [
-            {
-                "index": index,
-                "shape": tuple(shape),
-                "dtype": str(dtype),
-                "bytes": size,
-                "layout_slot": (
-                    "conv" if index == 0 else "k_or_ssm" if index == 1 else "not_placed"
-                ),
-            }
-            for index, (shape, dtype, size) in enumerate(
-                zip(mamba_spec.shapes, mamba_spec.dtypes, mamba_sizes)
-            )
-        ]
+        mamba_sizes = self._mamba_component_sizes(mamba_specs[0])
         if len(mamba_sizes) < 2:
             logger.warning(
                 f"unexpected mamba component sizes {mamba_sizes}; "
@@ -1275,25 +1098,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 buffer_size_rows,
                 tensor_size_lists,
                 block_stride_lists,
-            )
-            page_size = raw_tensor.size // self.num_blocks
-            base = min(shared_ptrs)
-            self._log_ascend_full_page_components(
-                "contiguous_fallback",
-                layer_names,
-                raw_tensor,
-                kvcaches,
-                base,
-                [
-                    self._ascend_component_slot(
-                        "page",
-                        page_size,
-                        base,
-                        payloads={"page": page_size},
-                        padding_kind="none",
-                    )
-                ],
-                note=f"mamba_components={mamba_components}",
             )
             return
 
@@ -1326,42 +1130,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         buffer_size_rows.append([size * self.num_blocks for size in sizes])
         tensor_size_lists.append(sizes)
         block_stride_lists.append(sizes)
-        self._log_ascend_full_page_components(
-            "hybrid",
-            layer_names,
-            raw_tensor,
-            kvcaches,
-            base,
-            [
-                self._ascend_component_slot(
-                    "conv",
-                    conv_size,
-                    base + offsets[0],
-                    payloads={"mamba.shapes[0]": conv_size},
-                    padding_kind="none",
-                ),
-                self._ascend_component_slot(
-                    "k_or_ssm",
-                    middle_size,
-                    base + offsets[1],
-                    payloads={"attn.k": k_size, "mamba.shapes[1]": ssm_size},
-                    padding_kind="inside_slot",
-                ),
-                self._ascend_component_slot(
-                    "v_or_padding",
-                    tail_size,
-                    base + offsets[2],
-                    payloads={"attn.v": v_size},
-                    padding_kind="inside_slot",
-                ),
-            ],
-            note=(
-                "order=[conv, k_or_ssm, v_or_padding]; "
-                "the smaller of attn.k and mamba.shapes[1] is padded to "
-                f"middle={middle_size}; tail padding={tail_size - v_size}; "
-                f"mamba_components={mamba_components}"
-            ),
-        )
 
     def _append_ascend_attn_only_layout(
         self,
@@ -1372,8 +1140,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         buffer_size_rows: list[list[int]],
         tensor_size_lists: list[list[int]],
         block_stride_lists: list[list[int]],
-        layer_names: list[str],
-        kvcaches,
     ) -> None:
         """Component-major [conv_padding, K, V] layout for Ascend attn-only tensors."""
         k_size, v_size = self._attention_component_sizes(attn_specs[0])
@@ -1387,27 +1153,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 buffer_size_rows,
                 tensor_size_lists,
                 block_stride_lists,
-            )
-            base = min(shared_ptrs)
-            self._log_ascend_full_page_components(
-                "contiguous_fallback",
-                layer_names,
-                raw_tensor,
-                kvcaches,
-                base,
-                [
-                    self._ascend_component_slot(
-                        "page",
-                        page_size,
-                        base,
-                        payloads={"page": page_size},
-                        padding_kind="none",
-                    )
-                ],
-                note=(
-                    "page has no leading conv padding to split; "
-                    f"attn.k={k_size} attn.v={v_size}"
-                ),
             )
             return
 
@@ -1423,36 +1168,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         buffer_size_rows.append([size * self.num_blocks for size in sizes])
         tensor_size_lists.append(sizes)
         block_stride_lists.append(sizes)
-        self._log_ascend_full_page_components(
-            "attn_only",
-            layer_names,
-            raw_tensor,
-            kvcaches,
-            base,
-            [
-                self._ascend_component_slot(
-                    "conv_padding",
-                    conv_padding_size,
-                    base + offsets[0],
-                    padding_kind="whole_slot",
-                ),
-                self._ascend_component_slot(
-                    "k",
-                    k_size,
-                    base + offsets[1],
-                    payloads={"attn.k": k_size},
-                    padding_kind="none",
-                ),
-                self._ascend_component_slot(
-                    "v",
-                    v_size,
-                    base + offsets[2],
-                    payloads={"attn.v": v_size},
-                    padding_kind="none",
-                ),
-            ],
-            note="order=[conv_padding, k, v]; the leading slot is entirely padding",
-        )
 
     def _block_shape_fits(self, block_shape, spec_shape) -> bool:
         """True when the allocated block is the spec shape, or that shape with a longer leading axis.
@@ -1943,8 +1658,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     buffer_size_rows,
                     tensor_size_lists,
                     block_stride_lists,
-                    layer_names,
-                    kvcaches,
                 )
             elif is_npu and attn_specs:
                 self._append_ascend_attn_only_layout(
@@ -1955,8 +1668,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     buffer_size_rows,
                     tensor_size_lists,
                     block_stride_lists,
-                    layer_names,
-                    kvcaches,
                 )
             else:
                 self._append_contiguous_page_layout(
@@ -1967,30 +1678,6 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     tensor_size_lists,
                     block_stride_lists,
                 )
-                if is_npu:
-                    page_size = raw_tensor.size // self.num_blocks
-                    base = min(shared_ptrs)
-                    self._log_ascend_full_page_components(
-                        "contiguous_page",
-                        layer_names,
-                        raw_tensor,
-                        kvcaches,
-                        base,
-                        [
-                            self._ascend_component_slot(
-                                "page",
-                                page_size,
-                                base,
-                                payloads={"page": page_size},
-                                padding_kind="none",
-                            )
-                        ],
-                        note=(
-                            "NPU tensor was not split into components; "
-                            f"mamba_specs={len(mamba_specs)} "
-                            f"attn_specs={len(attn_specs)}"
-                        ),
-                    )
 
             for layer_name in layer_names:
                 self.layer_name_to_row[layer_name] = row_id
