@@ -74,9 +74,11 @@ def hla():
         "participates_in_prefix_caching",
         "extend_non_null",
         "_model_layer_index",
+        "_model_num_hidden_layers",
         "_kv_layer_kind",
         "_is_mtp_kv_layer",
         "flash_next_group_roles",
+        "reject_flash_next_layerwise",
         "build_flash_next_addresses",
     }
     methods = {
@@ -919,6 +921,22 @@ def test_flash_next_roles_match_only_the_39_group_split(hla):
     other = _flash_next_groups()
     other[2] = group(KVCacheSpec(block_size=4), "language_model.model.layers.0.other")
     assert hla.flash_next_group_roles(other) is None
+
+
+def test_flash_next_layerwise_is_rejected(hla):
+    kv_cache_config = SimpleNamespace(kv_cache_groups=_flash_next_groups())
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_hidden_layers=48)
+        )
+    )
+    with pytest.raises(RuntimeError, match="use_layerwise: false"):
+        hla.reject_flash_next_layerwise(vllm_config, kv_cache_config)
+    other = _flash_next_groups()
+    other[2] = group(KVCacheSpec(block_size=4), "language_model.model.layers.0.other")
+    hla.reject_flash_next_layerwise(
+        vllm_config, SimpleNamespace(kv_cache_groups=other)
+    )
 
 
 def test_flash_next_roles_exclude_one_qwen35_mtp_layer(hla):

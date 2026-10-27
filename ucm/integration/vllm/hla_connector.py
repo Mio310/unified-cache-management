@@ -261,6 +261,24 @@ def flash_next_group_roles(
     return roles
 
 
+def reject_flash_next_layerwise(vllm_config, kv_cache_config) -> None:
+    """qwen3.8-flash-next KV transfer is full-page only."""
+    if kv_cache_config is None:
+        return
+    groups = getattr(kv_cache_config, "kv_cache_groups", None)
+    if not groups:
+        return
+    if (
+        flash_next_group_roles(groups, _model_num_hidden_layers(vllm_config))
+        is None
+    ):
+        return
+    raise RuntimeError(
+        "qwen3.8-flash-next does not support layerwise KV transfer. "
+        "Set use_layerwise: false so the full-page layout is used."
+    )
+
+
 def build_flash_next_addresses(
     attn_group_id: int,
     attn_layers: list[dict[str, int]],
@@ -2567,6 +2585,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig",
     ):
+        reject_flash_next_layerwise(vllm_config, kv_cache_config)
         super().__init__(vllm_config, role, kv_cache_config)
         self.launch_config = copy.deepcopy(self.launch_config)
         self.launch_config["use_layerwise"] = True
