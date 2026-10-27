@@ -75,6 +75,7 @@ def hla():
         "extend_non_null",
         "_model_layer_index",
         "_kv_layer_kind",
+        "_is_mtp_kv_layer",
         "flash_next_group_roles",
         "build_flash_next_addresses",
     }
@@ -114,9 +115,6 @@ def hla():
         },
     }
     flash_next_constants = {
-        "FLASH_NEXT_SEGMENT_SIZES",
-        "FLASH_NEXT_PAGE_BYTES",
-        "FLASH_NEXT_PLE_BYTES",
         "FLASH_NEXT_ATTN_LAYERS",
         "FLASH_NEXT_LINEAR_GROUPS",
     }
@@ -923,6 +921,48 @@ def test_flash_next_roles_match_only_the_39_group_split(hla):
     assert hla.flash_next_group_roles(other) is None
 
 
+def test_flash_next_roles_exclude_one_qwen35_mtp_layer(hla):
+    groups = _flash_next_groups()
+    groups[0].layer_names = (
+        *groups[0].layer_names,
+        "language_model.model.layers.48.self_attn.indexer.raw_key_cache",
+    )
+    groups[1].layer_names = (
+        *groups[1].layer_names,
+        "language_model.model.layers.48.self_attn.attn",
+        "language_model.model.layers.48.self_attn.indexer.compressed_key_cache",
+        "mtp.layers.0.self_attn.attn",
+    )
+    groups.append(group(KVCacheSpec(block_size=4), "mtp.layers.0.self_attn.attn"))
+
+    assert hla.flash_next_group_roles(groups) is None
+    roles = hla.flash_next_group_roles(groups, num_hidden_layers=48)
+    assert roles[0] == "raw"
+    assert roles[1] == "attn"
+    assert roles[39] == "mtp"
+    assert list(roles.values()).count("linear") == 36
+    assert list(roles.values()).count("attn") == 1
+    body_attn = [
+        name
+        for name in groups[1].layer_names
+        if hla._kv_layer_kind(name) == "attn"
+        and not hla._is_mtp_kv_layer(name, 48)
+    ]
+    assert len(body_attn) == 12
+
+    hasher = MagicMock(return_value=b"seed")
+    hasher.make_request_block_hasher.return_value = MagicMock(return_value=[b"attn"])
+    manager = hla.KVCacheGroupManager(
+        SimpleNamespace(kv_cache_groups=groups),
+        hasher,
+        b"base",
+        num_hidden_layers=48,
+    )
+    assert [group.group_id for group in manager.full_attn_groups] == [1]
+    assert [group.group_id for group in manager.non_prefix_groups] == [0, 39]
+    assert manager.lcm_block_size == 4
+
+
 def test_flash_next_group_manager_keeps_attention_hash_and_excludes_raw_key(hla):
     config = SimpleNamespace(kv_cache_groups=_flash_next_groups())
     hasher = MagicMock(return_value=b"seed")
@@ -946,8 +986,8 @@ def test_flash_next_group_manager_keeps_attention_hash_and_excludes_raw_key(hla)
 
 
 def test_flash_next_addresses_keep_one_object_width(hla):
-    page = hla.FLASH_NEXT_PAGE_BYTES
-    segments = hla.FLASH_NEXT_SEGMENT_SIZES
+    segments = (7680, 393216, 393216, 49152)
+    page = sum(segments)
     attn_layers = [
         {
             "k_ptr": 1000,
@@ -976,7 +1016,14 @@ def test_flash_next_addresses_keep_one_object_width(hla):
         },
     )
     tables = hla.build_flash_next_addresses(
-        1, attn_layers, [linear], 8, 0, zero_ptr=9, stage_ptr=10000
+        1,
+        attn_layers,
+        [linear],
+        8,
+        0,
+        zero_ptr=9,
+        stage_ptr=10000,
+        segment_sizes=segments,
     )
     width = len(attn_layers) * len(segments)
     assert all(len(bases) == width and len(strides) == width for bases, strides in tables.values())

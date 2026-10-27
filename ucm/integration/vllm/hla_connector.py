@@ -148,9 +148,6 @@ def extend_non_null(
         dst_group_ids.append(group_id)
 
 
-FLASH_NEXT_SEGMENT_SIZES = (7680, 393216, 393216, 49152)
-FLASH_NEXT_PAGE_BYTES = sum(FLASH_NEXT_SEGMENT_SIZES)
-FLASH_NEXT_PLE_BYTES = 184320
 FLASH_NEXT_ATTN_LAYERS = 12
 FLASH_NEXT_LINEAR_GROUPS = 36
 
@@ -185,32 +182,76 @@ def _kv_layer_kind(name: str) -> str:
     return "other"
 
 
-def flash_next_group_roles(groups) -> Optional[dict[int, str]]:
+def _model_num_hidden_layers(vllm_config) -> Optional[int]:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_text_config", None)
+    value = getattr(hf_config, "num_hidden_layers", None)
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+def _is_mtp_kv_layer(name: str, num_hidden_layers: Optional[int] = None) -> bool:
+    """A qwen3_5_mtp head is one extra attention layer, not three.
+
+    ``num_speculative_tokens`` is the draft length. The KV layer is either
+    named under ``mtp`` or registered at ``num_hidden_layers``.
+    """
+    if "mtp" in name.split("."):
+        return True
+    if num_hidden_layers is None:
+        return False
+    try:
+        return _model_layer_index(name) >= num_hidden_layers
+    except ValueError:
+        return False
+
+
+def flash_next_group_roles(
+    groups, num_hidden_layers: Optional[int] = None
+) -> Optional[dict[int, str]]:
     """Return flash-next roles when the NPU group split matches, else None.
 
     The expected split is one 12-layer raw-key group, one group holding 12
     full-attention layers and 12 compressed-key layers, 36 single-layer linear
-    groups, and one single-layer PLE group.
+    groups, and one single-layer PLE group. A qwen3_5_mtp attention layer may
+    sit in those groups or in its own group; it is reported as ``mtp`` and is
+    not part of the 12-layer body.
     """
     roles: dict[int, str] = {}
     raw_layers = attn_layers = compressed_layers = 0
     linear_groups = ple_groups = 0
     for group_id, group in enumerate(groups):
         names = list(getattr(group, "layer_names", ()) or ())
-        kinds = [_kv_layer_kind(name) for name in names]
-        if not kinds or any(kind == "other" for kind in kinds):
+        if not names or any(_kv_layer_kind(name) == "other" for name in names):
             return None
-        if set(kinds) == {"raw"}:
+        body = [
+            name for name in names if not _is_mtp_kv_layer(name, num_hidden_layers)
+        ]
+        mtp_names = [
+            name for name in names if _is_mtp_kv_layer(name, num_hidden_layers)
+        ]
+        mtp_kinds = {_kv_layer_kind(name) for name in mtp_names}
+        if mtp_names and not mtp_kinds <= {"raw", "attn", "compressed"}:
+            return None
+        if not body:
+            roles[group_id] = "mtp"
+            continue
+        kinds = [_kv_layer_kind(name) for name in body]
+        if set(kinds) == {"raw"} and mtp_kinds <= {"raw"}:
             roles[group_id] = "raw"
-            raw_layers += len(names)
-        elif set(kinds) == {"attn", "compressed"}:
+            raw_layers += len(body)
+        elif set(kinds) == {"attn", "compressed"} and mtp_kinds <= {
+            "attn",
+            "compressed",
+        }:
             roles[group_id] = "attn"
             attn_layers += kinds.count("attn")
             compressed_layers += kinds.count("compressed")
-        elif kinds == ["linear"]:
+        elif kinds == ["linear"] and not mtp_names:
             roles[group_id] = "linear"
             linear_groups += 1
-        elif kinds == ["ple"]:
+        elif kinds == ["ple"] and not mtp_names:
             roles[group_id] = "ple"
             ple_groups += 1
         else:
@@ -236,17 +277,18 @@ def build_flash_next_addresses(
     raw_group_id: Optional[int],
     zero_ptr: int,
     stage_ptr: int,
+    segment_sizes: tuple[int, ...],
 ) -> dict[int, tuple[list[int], list[int]]]:
     """Build per-group segment bases and strides for one fixed 12-page object.
 
-    Every group addresses ``len(attn_layers)`` pages of
-    ``[7680, 393216, 393216, 49152]``. Attention fills every page with K, V,
-    and compressed key. Each linear group fills only page 0 with conv and SSM.
-    PLE fills page 0 from its staging page. Padding addresses share ``zero_ptr``
-    and a zero stride.
+    Every group addresses ``len(attn_layers)`` pages of ``segment_sizes``.
+    Attention fills every page with K, V, and compressed key. Each linear group
+    fills only page 0 with conv and SSM. PLE fills page 0 from its staging page.
+    Padding addresses share ``zero_ptr`` and a zero stride.
     """
     page_count = len(attn_layers)
-    segment_count = len(FLASH_NEXT_SEGMENT_SIZES)
+    segment_count = len(segment_sizes)
+    page_bytes = sum(segment_sizes)
     width = page_count * segment_count
 
     def blank() -> tuple[list[int], list[int]]:
@@ -277,9 +319,9 @@ def build_flash_next_addresses(
 
     ple_bases, ple_strides = blank()
     cursor = 0
-    for segment, size in enumerate(FLASH_NEXT_SEGMENT_SIZES):
+    for segment, size in enumerate(segment_sizes):
         ple_bases[segment] = stage_ptr + cursor
-        ple_strides[segment] = FLASH_NEXT_PAGE_BYTES
+        ple_strides[segment] = page_bytes
         cursor += size
     tables[ple_group_id] = (ple_bases, ple_strides)
     return tables
@@ -319,13 +361,16 @@ class KVCacheGroupManager:
         kv_cache_config: "KVCacheConfig",
         request_hasher: "RequestHasher",
         base_seed: bytes,
+        num_hidden_layers: Optional[int] = None,
     ) -> None:
         self.request_hasher = request_hasher
         self.groups_by_id: list[GroupInfo] = []
         self.full_attn_groups: list[GroupInfo] = []
         self.state_groups: list[GroupInfo] = []
         self.non_prefix_groups: list[GroupInfo] = []
-        flash_next_roles = flash_next_group_roles(kv_cache_config.kv_cache_groups)
+        flash_next_roles = flash_next_group_roles(
+            kv_cache_config.kv_cache_groups, num_hidden_layers
+        )
         self.flash_next_roles = flash_next_roles
 
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -343,6 +388,9 @@ class KVCacheGroupManager:
             elif role in ("linear", "ple"):
                 is_mamba_align = True
                 participates = True
+            elif role == "mtp":
+                is_mamba_align = False
+                participates = False
             seed = request_hasher((b"UCM_GROUP_SEED", base_seed, group_id))
             info = GroupInfo(
                 group_id=group_id,
@@ -402,7 +450,8 @@ class KVCacheGroupManager:
                 "Flash-next group roles: "
                 f"raw={ [gid for gid, role in flash_next_roles.items() if role == 'raw'] }, "
                 f"attn={ [gid for gid, role in flash_next_roles.items() if role == 'attn'] }, "
-                f"linear={len(self.state_groups) - 1}, ple included in state groups"
+                f"linear={len(self.state_groups) - 1}, ple included in state groups, "
+                f"mtp={ [gid for gid, role in flash_next_roles.items() if role == 'mtp'] }"
             )
 
     @property
@@ -1454,28 +1503,112 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             note="order=[conv_padding, k, v]; the leading slot is entirely padding",
         )
 
+    def _block_shape_fits(self, block_shape, spec_shape) -> bool:
+        """True when the allocated block is the spec shape, or that shape with a longer leading axis.
+
+        Speculative tokens extend conv and PLE on the first state axis. The
+        remaining axes stay the same, so the two can still be paired.
+        """
+        block_shape = tuple(int(dim) for dim in block_shape)
+        spec_shape = tuple(int(dim) for dim in spec_shape)
+        if block_shape == spec_shape:
+            return True
+        if not spec_shape or len(block_shape) != len(spec_shape):
+            return False
+        return block_shape[1:] == spec_shape[1:] and block_shape[0] >= spec_shape[0]
+
+    def _flash_next_uniform_live_sizes(
+        self, kvcaches, names: list[str], count: int, label: str
+    ) -> tuple[int, ...]:
+        found = None
+        for name in names:
+            tensors = self._flash_next_entry_tensors(kvcaches[name], name)
+            if len(tensors) != count:
+                raise ValueError(
+                    f"Flash-next {label} {name} has {len(tensors)} blocks, "
+                    f"expected {count}. "
+                    f"found {self._describe_flash_next_tensors(tensors, name)}"
+                )
+            sizes = tuple(self._tensor_logical_block_bytes(tensor) for tensor in tensors)
+            if found is None:
+                found = sizes
+            elif sizes != found:
+                raise ValueError(
+                    f"Flash-next {label} {name} block sizes {sizes} differ from {found}."
+                )
+        if found is None:
+            raise ValueError(f"Flash-next {label} has no layers.")
+        return found
+
+    def _flash_next_conv_ssm_sizes(self, kvcaches, names: list[str], specs) -> tuple[int, int]:
+        found = None
+        for name in names:
+            tensors = self._flash_next_entry_tensors(kvcaches[name], name)
+            if len(tensors) != 2:
+                raise ValueError(
+                    f"Flash-next linear {name} has {len(tensors)} blocks, expected 2. "
+                    f"found {self._describe_flash_next_tensors(tensors, name)}"
+                )
+            layer_specs = specs.get(name, [])
+            spec = layer_specs[0] if len(layer_specs) == 1 else None
+            sizes = self._label_conv_ssm(tensors, spec, name)
+            if found is None:
+                found = sizes
+            elif sizes != found:
+                raise ValueError(
+                    f"Flash-next linear {name} block sizes {sizes} differ from {found}."
+                )
+        if found is None:
+            raise ValueError("Flash-next linear has no layers.")
+        return found
+
+    def _label_conv_ssm(self, tensors, spec, name: str) -> tuple[int, int]:
+        shapes = getattr(spec, "shapes", None) if isinstance(spec, MambaSpec) else None
+        if shapes is not None and len(shapes) == 2:
+            assigned: dict[int, int] = {}
+            for tensor in tensors:
+                block_shape = tuple(int(dim) for dim in tensor.shape[1:])
+                for index, spec_shape in enumerate(shapes):
+                    if index in assigned:
+                        continue
+                    if self._block_shape_fits(block_shape, spec_shape):
+                        assigned[index] = self._tensor_logical_block_bytes(tensor)
+                        break
+            if set(assigned) == {0, 1}:
+                return assigned[0], assigned[1]
+        sizes = tuple(sorted(self._tensor_logical_block_bytes(tensor) for tensor in tensors))
+        if sizes[0] == sizes[1]:
+            raise ValueError(
+                f"Flash-next linear {name} conv and SSM blocks have the same size. "
+                f"found {self._describe_flash_next_tensors(tensors, name)}"
+            )
+        return sizes
+
     def _try_build_flash_next_layout(self, kvcaches) -> bool:
         """Install the qwen3.8-flash-next full-page layout, or leave it unchanged."""
         if current_platform.device_type != "npu":
             return False
-        roles = flash_next_group_roles(self.kv_cache_config.kv_cache_groups)
+        num_hidden_layers = _model_num_hidden_layers(self.vllm_config)
+        roles = flash_next_group_roles(
+            self.kv_cache_config.kv_cache_groups, num_hidden_layers
+        )
         if roles is None:
             return False
+
+        def body_names(group_id: int, kind: str) -> list[str]:
+            return [
+                name
+                for name in groups[group_id].layer_names
+                if _kv_layer_kind(name) == kind
+                and not _is_mtp_kv_layer(name, num_hidden_layers)
+            ]
 
         groups = list(self.kv_cache_config.kv_cache_groups)
         attn_group_id = next(gid for gid, role in roles.items() if role == "attn")
         ple_group_id = next(gid for gid, role in roles.items() if role == "ple")
         raw_group_id = next(gid for gid, role in roles.items() if role == "raw")
-        attn_names = [
-            name
-            for name in groups[attn_group_id].layer_names
-            if _kv_layer_kind(name) == "attn"
-        ]
-        compressed_names = [
-            name
-            for name in groups[attn_group_id].layer_names
-            if _kv_layer_kind(name) == "compressed"
-        ]
+        attn_names = body_names(attn_group_id, "attn")
+        compressed_names = body_names(attn_group_id, "compressed")
         attn_by_layer = {_model_layer_index(name): name for name in attn_names}
         compressed_by_layer = {
             _model_layer_index(name): name for name in compressed_names
@@ -1485,17 +1618,43 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 "Flash-next full attention and compressed-key layers do not pair."
             )
 
+        specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
+        linear_names = [
+            groups[group_id].layer_names[0]
+            for group_id, role in roles.items()
+            if role == "linear"
+        ]
+        # Copy lengths follow the allocated tensors. MTP lengthens conv and PLE
+        # without updating every spec, and the compressed-key spec is not one block.
+        conv_size, ssm_size = self._flash_next_conv_ssm_sizes(
+            kvcaches, linear_names, specs
+        )
+        k_size, v_size = self._flash_next_uniform_live_sizes(
+            kvcaches, list(attn_by_layer.values()), 2, "attention"
+        )
+        (ck_size,) = self._flash_next_uniform_live_sizes(
+            kvcaches, list(compressed_by_layer.values()), 1, "compressed key"
+        )
+        if k_size != ssm_size:
+            raise ValueError(
+                "Flash-next K and SSM share one page slot: "
+                f"k={k_size}, ssm={ssm_size}."
+            )
+        segment_sizes = (conv_size, ssm_size, v_size, ck_size)
+        page_bytes = sum(segment_sizes)
+
         attn_layers = []
         live_tensors: list[torch.Tensor] = []
         for layer_index in sorted(attn_by_layer):
             k_tensor, v_tensor = self._flash_next_kv_pair(
                 kvcaches[attn_by_layer[layer_index]],
-                FLASH_NEXT_SEGMENT_SIZES[1],
+                k_size,
+                v_size,
                 attn_by_layer[layer_index],
             )
             ck_tensor = self._flash_next_single(
                 kvcaches[compressed_by_layer[layer_index]],
-                FLASH_NEXT_SEGMENT_SIZES[3],
+                ck_size,
                 compressed_by_layer[layer_index],
             )
             live_tensors.extend((k_tensor, v_tensor, ck_tensor))
@@ -1516,8 +1675,19 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 continue
             layer_name = groups[group_id].layer_names[0]
             conv_tensor, ssm_tensor = self._flash_next_conv_ssm(
-                kvcaches[layer_name], layer_name
+                kvcaches[layer_name], layer_name, conv_size, ssm_size
             )
+            if not linear_groups:
+                logger.info(
+                    "Flash-next allocated block sizes: layer=%s "
+                    "conv=%s ssm=%s k=%s v=%s compressed=%s",
+                    layer_name,
+                    conv_size,
+                    ssm_size,
+                    k_size,
+                    v_size,
+                    ck_size,
+                )
             live_tensors.extend((conv_tensor, ssm_tensor))
             linear_groups.append(
                 (
@@ -1532,26 +1702,46 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             )
 
         ple_name = groups[ple_group_id].layer_names[0]
-        ple_tensor = self._flash_next_single(
-            kvcaches[ple_name], FLASH_NEXT_PLE_BYTES, ple_name
+        ple_entries = self._flash_next_entry_tensors(kvcaches[ple_name], ple_name)
+        if len(ple_entries) != 1:
+            raise ValueError(
+                f"Flash-next entry {ple_name} does not have one PLE block. "
+                f"found {self._describe_flash_next_tensors(ple_entries, ple_name)}"
+            )
+        ple_tensor = ple_entries[0]
+        ple_size = self._tensor_logical_block_bytes(ple_tensor)
+        if ple_size > page_bytes:
+            raise ValueError(
+                "Flash-next PLE block does not fit in one page: "
+                f"ple={ple_size}, page={page_bytes}."
+            )
+        logger.info(
+            "Flash-next PLE allocated block: layer=%s bytes=%s",
+            ple_name,
+            ple_size,
         )
         live_tensors.append(ple_tensor)
         device = ple_tensor.device
-        zero = torch.zeros(
-            max(FLASH_NEXT_SEGMENT_SIZES), dtype=torch.uint8, device=device
-        )
+        zero = torch.zeros(max(segment_sizes), dtype=torch.uint8, device=device)
         stage = torch.zeros(
-            (self.num_blocks, FLASH_NEXT_PAGE_BYTES), dtype=torch.uint8, device=device
+            (self.num_blocks, page_bytes), dtype=torch.uint8, device=device
         )
+        zero_ptr = int(zero.data_ptr())
         tables = build_flash_next_addresses(
             attn_group_id,
             attn_layers,
             linear_groups,
             ple_group_id,
             raw_group_id,
-            int(zero.data_ptr()),
+            zero_ptr,
             int(stage.data_ptr()),
+            segment_sizes,
         )
+        # MTP stays in HBM. A dump of its group copies the zero page, not its KV.
+        mtp_width = len(attn_layers) * len(segment_sizes)
+        for group_id, role in roles.items():
+            if role == "mtp":
+                tables[group_id] = ([zero_ptr] * mtp_width, [0] * mtp_width)
         self.flash_next = True
         self.flash_next_roles = roles
         self.use_layerwise = False
@@ -1559,7 +1749,10 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         self._ple_tensor = ple_tensor
         self._ple_stage = stage
         self._zero_page = zero
-        sizes = list(FLASH_NEXT_SEGMENT_SIZES) * len(attn_layers)
+        self.flash_next_segment_sizes = segment_sizes
+        self.flash_next_page_bytes = page_bytes
+        self.flash_next_ple_bytes = ple_size
+        sizes = list(segment_sizes) * len(attn_layers)
         self.tensor_size_lists = np.asarray(sizes, dtype=np.uint64)
         self.block_stride_lists = np.asarray(sizes, dtype=np.uint64)
         self.base_ptrs = np.zeros(len(sizes), dtype=np.uint64)
@@ -1581,21 +1774,45 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         }
         logger.info(
             "Flash-next full-page layout: "
-            f"pages={len(attn_layers)} page_bytes={FLASH_NEXT_PAGE_BYTES} "
-            f"block_bytes={FLASH_NEXT_PAGE_BYTES * len(attn_layers)} "
-            f"segments={list(FLASH_NEXT_SEGMENT_SIZES)} "
+            f"pages={len(attn_layers)} page_bytes={page_bytes} "
+            f"block_bytes={page_bytes * len(attn_layers)} "
+            f"segments={list(segment_sizes)} "
             f"attn_group={attn_group_id} linear_groups={len(linear_groups)} "
-            f"ple_group={ple_group_id} raw_group={raw_group_id}"
+            f"ple_group={ple_group_id} raw_group={raw_group_id} "
+            f"mtp_groups={[gid for gid, role in roles.items() if role == 'mtp']}"
         )
         return True
 
-    def _tensor_block_bytes(self, tensor: torch.Tensor) -> int:
+    def _check_flash_next_block_axis(self, tensor: torch.Tensor, name: str = "") -> None:
         if tensor.dim() < 1 or int(tensor.shape[0]) != self.num_blocks:
             raise ValueError(
                 "Flash-next KV tensor block axis does not match num_blocks: "
-                f"shape={tuple(tensor.shape)} num_blocks={self.num_blocks}"
+                f"name={name} shape={tuple(tensor.shape)} num_blocks={self.num_blocks}"
             )
+
+    def _tensor_block_bytes(self, tensor: torch.Tensor) -> int:
+        """Bytes between block 0 and block 1. Mamba views stride a whole page."""
+        self._check_flash_next_block_axis(tensor)
         return int(tensor.stride(0)) * int(tensor.element_size())
+
+    def _tensor_logical_block_bytes(self, tensor: torch.Tensor) -> int:
+        """Live bytes of one block, from ``shape[1:]``, ignoring page padding."""
+        self._check_flash_next_block_axis(tensor)
+        payload = 1
+        for dim in tensor.shape[1:]:
+            payload *= int(dim)
+        return payload * int(tensor.element_size())
+
+    def _describe_flash_next_tensors(self, tensors: list[torch.Tensor], name: str) -> str:
+        parts = []
+        for tensor in tensors:
+            self._check_flash_next_block_axis(tensor, name)
+            parts.append(
+                f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"logical={self._tensor_logical_block_bytes(tensor)} "
+                f"stride_bytes={self._tensor_block_bytes(tensor)}"
+            )
+        return "; ".join(parts)
 
     def _flash_next_entry_tensors(self, value, name: str) -> list[torch.Tensor]:
         if isinstance(value, torch.Tensor):
@@ -1614,39 +1831,61 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         matched = [
             tensor
             for tensor in tensors
-            if self._tensor_block_bytes(tensor) == expected_bytes
+            if self._tensor_logical_block_bytes(tensor) == expected_bytes
+            or self._tensor_block_bytes(tensor) == expected_bytes
         ]
         if len(matched) != 1:
             raise ValueError(
-                f"Flash-next entry {name} does not have one {expected_bytes}-byte block."
+                f"Flash-next entry {name} does not have one {expected_bytes}-byte block. "
+                f"found {self._describe_flash_next_tensors(tensors, name)}"
             )
         return matched[0]
 
     def _flash_next_kv_pair(
-        self, value, expected_bytes: int, name: str
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        tensors = [
-            tensor
-            for tensor in self._flash_next_entry_tensors(value, name)
-            if self._tensor_block_bytes(tensor) == expected_bytes
-        ]
-        if len(tensors) != 2:
-            raise ValueError(
-                f"Flash-next attention entry {name} does not have K and V "
-                f"blocks of {expected_bytes} bytes."
-            )
-        return tensors[0], tensors[1]
-
-    def _flash_next_conv_ssm(
-        self, value, name: str
+        self, value, k_size: int, v_size: int, name: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tensors = self._flash_next_entry_tensors(value, name)
-        by_size = {self._tensor_block_bytes(tensor): tensor for tensor in tensors}
-        conv = by_size.get(FLASH_NEXT_SEGMENT_SIZES[0])
-        ssm = by_size.get(FLASH_NEXT_SEGMENT_SIZES[1])
-        if conv is None or ssm is None:
+        if k_size == v_size:
+            matched = [
+                tensor
+                for tensor in tensors
+                if self._tensor_logical_block_bytes(tensor) == k_size
+                or self._tensor_block_bytes(tensor) == k_size
+            ]
+            if len(matched) != 2:
+                raise ValueError(
+                    f"Flash-next attention entry {name} does not have K and V "
+                    f"blocks of {k_size} bytes. "
+                    f"found {self._describe_flash_next_tensors(tensors, name)}"
+                )
+            return matched[0], matched[1]
+        by_size = {
+            self._tensor_logical_block_bytes(tensor): tensor for tensor in tensors
+        }
+        k_tensor = by_size.get(k_size)
+        v_tensor = by_size.get(v_size)
+        if k_tensor is None or v_tensor is None:
             raise ValueError(
-                f"Flash-next linear entry {name} does not have conv and SSM blocks."
+                f"Flash-next attention entry {name} does not have K and V "
+                f"blocks of {k_size} and {v_size} bytes. "
+                f"found {self._describe_flash_next_tensors(tensors, name)}"
+            )
+        return k_tensor, v_tensor
+
+    def _flash_next_conv_ssm(
+        self, value, name: str, conv_size: int, ssm_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = self._flash_next_entry_tensors(value, name)
+        by_size = {
+            self._tensor_logical_block_bytes(tensor): tensor for tensor in tensors
+        }
+        conv = by_size.get(conv_size)
+        ssm = by_size.get(ssm_size)
+        if conv is None or ssm is None or conv_size == ssm_size:
+            raise ValueError(
+                f"Flash-next linear entry {name} does not have conv and SSM blocks. "
+                f"expected conv={conv_size} ssm={ssm_size}. "
+                f"found {self._describe_flash_next_tensors(tensors, name)}"
             )
         return conv, ssm
 
@@ -1679,6 +1918,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 continue
             bases, strides = self.group_layouts[int(group_id)]
             block = int(block_id)
+            segment_sizes = self.flash_next_segment_sizes
             if role == "linear":
                 linear_pages += 1
                 logger.info(
@@ -1693,10 +1933,10 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     block,
                     int(bases[0]) + block * int(strides[0]),
                     int(strides[0]),
-                    FLASH_NEXT_SEGMENT_SIZES[0],
+                    segment_sizes[0],
                     int(bases[1]) + block * int(strides[1]),
                     int(strides[1]),
-                    FLASH_NEXT_SEGMENT_SIZES[1],
+                    segment_sizes[1],
                     int(bases[2]) + block * int(strides[2]),
                     int(bases[3]) + block * int(strides[3]),
                     FLASH_NEXT_ATTN_LAYERS,
@@ -1704,7 +1944,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 continue
             ple_pages += 1
             segments = []
-            for segment, size in enumerate(FLASH_NEXT_SEGMENT_SIZES):
+            for segment, size in enumerate(segment_sizes):
                 segments.append(
                     (
                         int(bases[segment]) + block * int(strides[segment]),
@@ -1719,7 +1959,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 action,
                 group_id,
                 block,
-                FLASH_NEXT_PLE_BYTES,
+                self.flash_next_ple_bytes,
                 segments,
                 FLASH_NEXT_ATTN_LAYERS,
             )
@@ -1752,7 +1992,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 f"vllm_block={block_id}, live_bytes={ple_block.nbytes}, "
                 f"ple_ptr={int(ple_block.data_ptr())}, "
                 f"stage_ptr={int(page.data_ptr())}, "
-                f"page_bytes={FLASH_NEXT_PAGE_BYTES}"
+                f"page_bytes={self.flash_next_page_bytes}"
             )
 
     def finish_flash_next_load(
@@ -1955,6 +2195,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 kv_cache_config=kv_cache_config,
                 request_hasher=self.request_hasher,
                 base_seed=self._seed,
+                num_hidden_layers=_model_num_hidden_layers(vllm_config),
             )
             lcm_block_size = self.group_manager.lcm_block_size
             self.block_size = lcm_block_size
@@ -3269,6 +3510,7 @@ class UCMHLALiteConnector(UCMLiteConnector, SupportsHMA):
             kv_cache_config=kv_cache_config,
             request_hasher=self.request_hasher,
             base_seed=self._seed,
+            num_hidden_layers=_model_num_hidden_layers(vllm_config),
         )
         self.block_size = self.group_manager.lcm_block_size
         self.hash_block_size = self.group_manager.lcm_block_size
