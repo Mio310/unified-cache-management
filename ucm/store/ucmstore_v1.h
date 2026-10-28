@@ -130,6 +130,24 @@ public:
     virtual void Prefetch(const Detail::BlockId* blocks, size_t num) = 0;
 
     /**
+     * @brief Load blocks from storage into the host cache without copying to the device.
+     *
+     * Cache fills its DRAM slots through the normal backend load path and marks them ready.
+     * A later Load of the same blocks copies those slots to the device. The returned task
+     * completes when the cache fill finishes. Slots are not pinned after completion.
+     *
+     * @param blocks Array of block identifiers to cache.
+     * @param num Number of block identifiers.
+     * @return Task handle for Wait() or Check(), or an error when this store has no host cache.
+     */
+    virtual Expected<Detail::TaskHandle> PrefetchToCache(const Detail::BlockId* blocks, size_t num)
+    {
+        (void)blocks;
+        (void)num;
+        return Status::Unsupported();
+    }
+
+    /**
      * @brief Check whether this store's own read/write path is healthy.
      *
      * Overrides must use bounded I/O and clean up any temporary data they create.

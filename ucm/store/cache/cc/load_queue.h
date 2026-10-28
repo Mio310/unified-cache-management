@@ -50,6 +50,7 @@ class LoadQueue {
         WaiterPtr waiter;
         bool fromPosix{false};
         bool hostDirect{false};
+        bool cacheFill{false};
     };
 
 private:
@@ -81,10 +82,12 @@ private:
     void DispatchStage();
     void DispatchOneTask(TaskPair&& pair);
     void DispatchHostTask(const TaskPtr& task, const WaiterPtr& waiter);
+    void DispatchCacheFill(const TaskPtr& task, const WaiterPtr& waiter);
     Status BuildHostBackend(const Detail::TaskDesc& desc, Detail::TaskDesc& backend) const;
     void TransferStage(std::promise<Status>& started);
     void TransferOneTask(CopyStream& stream, ShardTask&& task);
     void TransferHostTask(ShardTask&& task);
+    void TransferCacheFill(ShardTask&& task);
     Status WaitBackendTaskReady(ShardTask& task);
     Status HostToDeviceAsync(CopyStream& stream, void* host, void** device);
     void RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,

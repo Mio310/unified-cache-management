@@ -42,6 +42,7 @@ namespace UC::CacheStore {
 class CacheStore : public StoreV1 {
     BufferManager bufferMgr_;
     bool transEnable_{false};
+    size_t nShardPerBlock_{1};
     TransManager transMgr_;
     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
 
@@ -69,6 +70,7 @@ public:
             return s;
         }
         transEnable_ = config.deviceId >= 0;
+        nShardPerBlock_ = config.blockSize / config.shardSize;
         if (transEnable_) {
             s = transMgr_.Setup(config, bufferMgr_.GetTransBuffer());
             if (s.Failure()) [[unlikely]] { return s; }
@@ -98,6 +100,27 @@ public:
     void Prefetch(const Detail::BlockId* blocks, size_t num) override
     {
         bufferMgr_.Prefetch(blocks, num);
+    }
+    Expected<Detail::TaskHandle> PrefetchToCache(const Detail::BlockId* blocks, size_t num) override
+    {
+        if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        if (num > 0 && blocks == nullptr) { return Status::InvalidParam("invalid blocks"); }
+        Detail::TaskDesc desc;
+        desc.brief = "PrefetchToCache";
+        desc.reserve(num * nShardPerBlock_);
+        for (size_t i = 0; i < num; ++i) {
+            for (size_t shardIdx = 0; shardIdx < nShardPerBlock_; ++shardIdx) {
+                Detail::Shard shard;
+                shard.owner = blocks[i];
+                shard.index = shardIdx;
+                desc.push_back(std::move(shard));
+            }
+        }
+        auto res = transMgr_.Submit({TransTask::Type::PREFETCH, std::move(desc)});
+        if (!res) [[unlikely]] {
+            UC_ERROR("Failed({}) to submit prefetch task.", res.Error());
+        }
+        return res;
     }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {

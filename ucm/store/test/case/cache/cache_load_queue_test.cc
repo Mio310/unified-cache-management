@@ -285,3 +285,62 @@ TEST_F(UCCacheLoadQueueTest, LoadHostBufferBypassesCache)
     ASSERT_FALSE(failureSet.Contains(task->id));
     ASSERT_FALSE(buffer.Exist(blockId, 0));
 }
+
+TEST_F(UCCacheLoadQueueTest, PrefetchFillsCacheFromBackend)
+{
+    using namespace UC::CacheStore;
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Load)
+        .WillOnce(testing::Invoke([](UC::Detail::TaskDesc desc) -> UC::Expected<UC::Detail::TaskHandle> {
+            EXPECT_EQ(desc.brief, "Backend2Cache");
+            EXPECT_EQ(desc.size(), 1u);
+            if (desc.size() == 1) {
+                EXPECT_EQ(desc[0].addrs.size(), 1u);
+                if (!desc[0].addrs.empty()) { EXPECT_NE(desc[0].addrs[0], nullptr); }
+            }
+            return NextId();
+        }));
+    EXPECT_CALL(backend, Wait).WillOnce(testing::Return(UC::Status::OK()));
+    UC::HashSet<UC::Detail::TaskHandle> failureSet;
+    Config config;
+    config.storeBackend = &backend;
+    size_t tensorSize = 32768;
+    config.tensorSizes = {tensorSize};
+    config.shardSize = tensorSize;
+    config.blockSize = config.shardSize;
+    config.deviceId = 0;
+    config.bufferCapacity = config.shardSize * 1024;
+    config.uniqueId = rd.RandomString(10);
+    config.shareBufferEnable = true;
+    TransBuffer buffer;
+    LoadQueue loadQ;
+    auto s = buffer.Setup(config);
+    ASSERT_EQ(s, UC::Status::OK());
+    s = loadQ.Setup(config, &failureSet, &buffer);
+    ASSERT_EQ(s, UC::Status::OK());
+    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    UC::Detail::TaskDesc desc;
+    UC::Detail::Shard shard;
+    shard.owner = blockId;
+    shard.index = 0;
+    desc.push_back(std::move(shard));
+    auto task = std::make_shared<TransTask>(TransTask::Type::PREFETCH, std::move(desc));
+    auto waiter = std::make_shared<UC::Latch>();
+    loadQ.Submit(task, waiter);
+    ASSERT_TRUE(waiter->WaitForDuration(1000));
+    ASSERT_FALSE(failureSet.Contains(task->id));
+    ASSERT_TRUE(buffer.Exist(blockId, 0));
+    auto cached = buffer.Get(blockId, 0, true, true);
+    ASSERT_TRUE(cached.Ready());
+
+    UC::Detail::TaskDesc againDesc;
+    UC::Detail::Shard again;
+    again.owner = blockId;
+    again.index = 0;
+    againDesc.push_back(std::move(again));
+    auto second = std::make_shared<TransTask>(TransTask::Type::PREFETCH, std::move(againDesc));
+    auto waiter2 = std::make_shared<UC::Latch>();
+    loadQ.Submit(second, waiter2);
+    ASSERT_TRUE(waiter2->WaitForDuration(1000));
+    ASSERT_FALSE(failureSet.Contains(second->id));
+}

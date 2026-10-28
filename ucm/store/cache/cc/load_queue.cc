@@ -107,6 +107,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         waiter->Done();
         return;
     }
+    if (task->type == TransTask::Type::PREFETCH) {
+        DispatchCacheFill(task, waiter);
+        return;
+    }
     if (task->desc.bufferSpace == Detail::BufferSpace::HOST) {
         DispatchHostTask(task, waiter);
         return;
@@ -197,6 +201,62 @@ Status LoadQueue::BuildHostBackend(const Detail::TaskDesc& desc, Detail::TaskDes
         backend.push_back(std::move(out));
     }
     return Status::OK();
+}
+
+void LoadQueue::DispatchCacheFill(const TaskPtr& task, const WaiterPtr& waiter)
+{
+    auto tp = waiter->startTp;
+    auto tpWait = NowTime::Now();
+    const auto nShard = task->desc.size();
+    if (nShard == 0) {
+        waiter->Done();
+        return;
+    }
+    size_t backendSubmitCount = 0;
+    size_t waitShardCount = 0;
+    for (size_t i = 0; i < nShard; ++i) {
+        auto& shard = task->desc[i];
+        ShardTask shardTask;
+        shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
+        shardTask.cacheFill = true;
+        shardTask.fromPosix = !shardTask.bufferHandle.Ready();
+        if (shardTask.fromPosix) { ++waitShardCount; }
+        if (shardTask.bufferHandle.Owner() && !shardTask.bufferHandle.Ready()) {
+            Detail::TaskDesc backendTask{
+                Detail::Shard{shard.owner, shard.index, {shardTask.bufferHandle.Data()}}
+            };
+            backendTask.brief = "Backend2Cache";
+            auto res = backend_->Load(std::move(backendTask));
+            if (!res) [[unlikely]] {
+                UC_ERROR("Failed({}) to submit prefetch task({}) to backend.", res.Error(),
+                         task->id);
+                UC::Metrics::UpdateStats(
+                    NAME_TO_METRIC_ID("cache_backend_load_submit_errors_total"), 1.0);
+                RecordLoadSourceShards(i + 1, waitShardCount);
+                RecordFailedShards(nShard - i);
+                shardTask.bufferHandle.MarkFailed(res.Error());
+                task->Fail(res.Error());
+                failureSet_->Insert(task->id);
+                waiter->Done();
+                return;
+            }
+            shardTask.backendTaskHandle = res.Value();
+            ++backendSubmitCount;
+        }
+        shardTask.task = task;
+        shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+        running_.Push(std::move(shardTask));
+    }
+    auto tpDispatch = NowTime::Now();
+    UC_DEBUG("Cache prefetch task({}) dispatch shards({}), wait={:.3f}ms, cost={:.3f}ms.",
+             task->id, nShard, (tpWait - tp) * 1e3, (tpDispatch - tpWait) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_queue_wait_duration_ms"),
+                             (tpWait - tp) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_submit_duration_ms"),
+                             (tpDispatch - tpWait) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_shards_total"),
+                             static_cast<double>(backendSubmitCount));
+    RecordLoadSourceShards(nShard, waitShardCount);
 }
 
 void LoadQueue::DispatchHostTask(const TaskPtr& task, const WaiterPtr& waiter)
@@ -301,8 +361,30 @@ void LoadQueue::TransferHostTask(ShardTask&& task)
     if (task.waiter) { task.waiter->Done(); }
 }
 
+void LoadQueue::TransferCacheFill(ShardTask&& task)
+{
+    auto parentTask = task.task;
+    const auto taskHandle = parentTask->id;
+    if (failureSet_->Contains(taskHandle)) {
+        RecordFailedShards(1);
+        if (task.waiter) { task.waiter->Done(); }
+        return;
+    }
+    auto s = WaitBackendTaskReady(task);
+    if (s.Failure()) [[unlikely]] {
+        parentTask->Fail(s);
+        failureSet_->Insert(taskHandle);
+        RecordFailedShards(1);
+    }
+    if (task.waiter) { task.waiter->Done(); }
+}
+
 void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 {
+    if (task.cacheFill) {
+        TransferCacheFill(std::move(task));
+        return;
+    }
     if (task.hostDirect) {
         TransferHostTask(std::move(task));
         return;

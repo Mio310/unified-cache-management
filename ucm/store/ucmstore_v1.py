@@ -127,6 +127,21 @@ class UcmKVStoreBaseV1(ABC):
         """
         pass
 
+    def prefetch_to_cache(self, block_ids: List[bytes]) -> Task:
+        """Load blocks from storage into the host cache.
+
+        The returned task completes when the data is in the host cache. A later
+        load of the same blocks copies that cache to the device.
+
+        Args:
+            block_ids: List of block hashes to cache.
+
+        Returns:
+            A ``Task`` handle that can be used to check or wait for completion.
+        """
+        del block_ids
+        raise NotImplementedError
+
     @abstractmethod
     def load(
         self,
