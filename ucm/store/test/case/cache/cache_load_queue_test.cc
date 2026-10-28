@@ -226,3 +226,62 @@ TEST_F(UCCacheLoadQueueTest, LoadWhileBackendWaitFailed)
     ASSERT_EQ(observer.FailureStatus(), UC::Status::NotFound());
     ASSERT_EQ(task->FailureStatus(), UC::Status::NotFound());
 }
+
+TEST_F(UCCacheLoadQueueTest, LoadHostBufferBypassesCache)
+{
+    using namespace UC::CacheStore;
+    UC::Test::Detail::MockStore backend;
+    UC::Test::Detail::DataGenerator first{1, 4096};
+    UC::Test::Detail::DataGenerator second{1, 4096};
+    first.Generate();
+    second.Generate();
+    void* addr0 = first.Buffer();
+    void* addr1 = second.Buffer();
+    EXPECT_CALL(backend, Load)
+        .WillOnce(testing::Invoke([&](UC::Detail::TaskDesc desc) -> UC::Expected<UC::Detail::TaskHandle> {
+            EXPECT_EQ(desc.bufferSpace, UC::Detail::BufferSpace::HOST);
+            EXPECT_EQ(desc.brief, "HostDirect");
+            EXPECT_EQ(desc.size(), 1u);
+            if (desc.size() == 1) {
+                EXPECT_EQ(desc[0].addrs.size(), 2u);
+                if (desc[0].addrs.size() == 2) {
+                    EXPECT_EQ(desc[0].addrs[0], addr0);
+                    EXPECT_EQ(desc[0].addrs[1], addr1);
+                }
+                EXPECT_EQ(desc[0].lengths.size(), 2u);
+                if (desc[0].lengths.size() == 2) {
+                    EXPECT_EQ(desc[0].lengths[0], 4096u);
+                    EXPECT_EQ(desc[0].lengths[1], 4096u);
+                }
+            }
+            return NextId();
+        }));
+    EXPECT_CALL(backend, Wait).WillOnce(testing::Return(UC::Status::OK()));
+    UC::HashSet<UC::Detail::TaskHandle> failureSet;
+    Config config;
+    config.storeBackend = &backend;
+    config.tensorSizes = {4096, 4096};
+    config.shardSize = 8192;
+    config.blockSize = config.shardSize;
+    config.deviceId = 0;
+    config.bufferCapacity = config.shardSize * 1024;
+    config.uniqueId = rd.RandomString(10);
+    config.shareBufferEnable = true;
+    TransBuffer buffer;
+    LoadQueue loadQ;
+    auto s = buffer.Setup(config);
+    ASSERT_EQ(s, UC::Status::OK());
+    s = loadQ.Setup(config, &failureSet, &buffer);
+    ASSERT_EQ(s, UC::Status::OK());
+    auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    UC::Detail::TaskDesc desc{
+        {blockId, 0, {addr0, addr1}}
+    };
+    desc.bufferSpace = UC::Detail::BufferSpace::HOST;
+    auto task = std::make_shared<TransTask>(TransTask::Type::LOAD, std::move(desc));
+    auto waiter = std::make_shared<UC::Latch>();
+    loadQ.Submit(task, waiter);
+    ASSERT_TRUE(waiter->WaitForDuration(1000));
+    ASSERT_FALSE(failureSet.Contains(task->id));
+    ASSERT_FALSE(buffer.Exist(blockId, 0));
+}

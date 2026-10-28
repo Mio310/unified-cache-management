@@ -107,6 +107,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         waiter->Done();
         return;
     }
+    if (task->desc.bufferSpace == Detail::BufferSpace::HOST) {
+        DispatchHostTask(task, waiter);
+        return;
+    }
     auto tp = waiter->startTp;
     auto tpWait = NowTime::Now();
     const auto nShard = task->desc.size();
@@ -164,6 +168,87 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     RecordLoadSourceShards(nShard, waitShardCount);
 }
 
+Status LoadQueue::BuildHostBackend(const Detail::TaskDesc& desc, Detail::TaskDesc& backend) const
+{
+    backend.brief = "HostDirect";
+    backend.bufferSpace = Detail::BufferSpace::HOST;
+    backend.reserve(desc.size());
+    for (const auto& shard : desc) {
+        if (shard.addrs.empty() || shard.addrs.front() == nullptr) {
+            return Status::InvalidParam("host load shard({}) has no address", shard.index);
+        }
+        Detail::Shard out;
+        out.owner = shard.owner;
+        out.index = shard.index;
+        out.addrs = shard.addrs;
+        if (!shard.lengths.empty()) {
+            if (shard.lengths.size() != shard.addrs.size()) {
+                return Status::InvalidParam("host load length count({}) != address count({})",
+                                            shard.lengths.size(), shard.addrs.size());
+            }
+            out.lengths = shard.lengths;
+        } else if (shard.addrs.size() > 1) {
+            if (shard.addrs.size() != tensorSizes_.size()) {
+                return Status::InvalidParam("host load address count({}) != tensor count({})",
+                                            shard.addrs.size(), tensorSizes_.size());
+            }
+            out.lengths = tensorSizes_;
+        }
+        backend.push_back(std::move(out));
+    }
+    return Status::OK();
+}
+
+void LoadQueue::DispatchHostTask(const TaskPtr& task, const WaiterPtr& waiter)
+{
+    auto tp = waiter->startTp;
+    auto tpWait = NowTime::Now();
+    const auto nShard = task->desc.size();
+    Detail::TaskDesc backendTask;
+    auto built = BuildHostBackend(task->desc, backendTask);
+    if (built.Failure()) [[unlikely]] {
+        UC_ERROR("Failed({}) to build host load task({}).", built, task->id);
+        RecordFailedShards(nShard);
+        task->Fail(built);
+        failureSet_->Insert(task->id);
+        waiter->Done();
+        return;
+    }
+    Detail::TaskHandle backendHandle = 0;
+    if (!backendTask.empty()) {
+        auto res = backend_->Load(std::move(backendTask));
+        if (!res) [[unlikely]] {
+            UC_ERROR("Failed({}) to submit host load task({}) to backend.", res.Error(), task->id);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_backend_load_submit_errors_total"),
+                                     1.0);
+            RecordLoadSourceShards(nShard, nShard);
+            RecordFailedShards(nShard);
+            task->Fail(res.Error());
+            failureSet_->Insert(task->id);
+            waiter->Done();
+            return;
+        }
+        backendHandle = res.Value();
+    }
+    ShardTask shardTask;
+    shardTask.task = task;
+    shardTask.backendTaskHandle = backendHandle;
+    shardTask.waiter = waiter;
+    shardTask.fromPosix = true;
+    shardTask.hostDirect = true;
+    running_.Push(std::move(shardTask));
+    auto tpDispatch = NowTime::Now();
+    UC_DEBUG("Cache host task({}) dispatch shards({}), wait={:.3f}ms, cost={:.3f}ms.", task->id,
+             nShard, (tpWait - tp) * 1e3, (tpDispatch - tpWait) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_queue_wait_duration_ms"),
+                             (tpWait - tp) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_submit_duration_ms"),
+                             (tpDispatch - tpWait) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_shards_total"),
+                             static_cast<double>(nShard));
+    RecordLoadSourceShards(nShard, nShard);
+}
+
 void LoadQueue::TransferStage(std::promise<Status>& started)
 {
     auto nameStatus = CpuAffinity::SetCurrentThreadName("ucm_load_xfer");
@@ -186,8 +271,42 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
     running_.ConsumerLoop(stop_, &LoadQueue::TransferOneTask, this, stream);
 }
 
+void LoadQueue::TransferHostTask(ShardTask&& task)
+{
+    auto parentTask = task.task;
+    const auto taskHandle = parentTask->id;
+    const auto nShard = parentTask->desc.size();
+    auto s = Status::OK();
+    if (failureSet_->Contains(taskHandle)) {
+        s = parentTask->FailureStatus();
+    } else if (task.backendTaskHandle != 0) {
+        auto tpBackendWait = NowTime::Now();
+        s = backend_->Wait(task.backendTaskHandle);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_wait_ms"),
+                                 (NowTime::Now() - tpBackendWait) * 1e3);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to wait backend({}) for host task({}).", s, task.backendTaskHandle,
+                     taskHandle);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_backend_load_wait_errors_total"), 1.0);
+        }
+    }
+    if (s.Failure()) [[unlikely]] {
+        parentTask->Fail(s);
+        failureSet_->Insert(taskHandle);
+        RecordFailedShards(nShard);
+    } else {
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_posix_load_success_shards_total"),
+                                 static_cast<double>(nShard));
+    }
+    if (task.waiter) { task.waiter->Done(); }
+}
+
 void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 {
+    if (task.hostDirect) {
+        TransferHostTask(std::move(task));
+        return;
+    }
     auto parentTask = task.task;
     const auto taskHandle = parentTask->id;
     if (failureSet_->Contains(taskHandle)) {

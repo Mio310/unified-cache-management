@@ -24,8 +24,10 @@
 #ifndef UNIFIEDCACHE_POSIX_STORE_CC_IO_ENGINE_AIO_H
 #define UNIFIEDCACHE_POSIX_STORE_CC_IO_ENGINE_AIO_H
 
+#include <atomic>
 #include <cerrno>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <tuple>
 #include <unordered_map>
@@ -49,7 +51,20 @@ class IoEngineAio : public Detail::TaskWrapper<TransTask, Detail::TaskHandle> {
         size_t shardCount{0};
         bool aborted{false};
     };
+    struct HostReadGroup {
+        TaskPtr task;
+        WaiterPtr waiter;
+        Detail::BlockId block{};
+        int32_t fd{-1};
+        std::atomic<size_t> remaining{0};
+    };
+    struct IoSeg {
+        void* buffer{nullptr};
+        size_t length{0};
+        uint64_t offset{0};
+    };
     size_t shardSize_;
+    size_t ioSize_{0};
     size_t nShardPerBlock_;
     const SpaceLayout* layout_;
     BlockCommitTracker tracker_;
@@ -66,6 +81,7 @@ public:
     {
         timeoutMs_ = config.timeoutMs;
         shardSize_ = config.shardSize;
+        ioSize_ = config.tensorSize;
         nShardPerBlock_ = config.blockSize / config.shardSize;
         layout_ = layout;
         tracker_.Setup(nShardPerBlock_);
@@ -132,6 +148,117 @@ private:
         }
         w->Done();
     }
+    Status BuildHostLoadSegs(const Detail::Shard& shard, std::vector<IoSeg>& segs) const
+    {
+        if (shard.addrs.empty()) { return Status::InvalidParam("host load shard has no address"); }
+        const auto base = static_cast<uint64_t>(shard.index) * shardSize_;
+        if (!shard.lengths.empty()) {
+            if (shard.lengths.size() != shard.addrs.size()) {
+                return Status::InvalidParam("host load length count({}) != address count({})",
+                                            shard.lengths.size(), shard.addrs.size());
+            }
+            uint64_t off = base;
+            size_t total = 0;
+            segs.reserve(shard.addrs.size());
+            for (size_t i = 0; i < shard.addrs.size(); ++i) {
+                const auto len = shard.lengths[i];
+                if (len == 0 || shard.addrs[i] == nullptr) {
+                    return Status::InvalidParam("host load segment is empty");
+                }
+                if (len > std::numeric_limits<uint32_t>::max()) {
+                    return Status::InvalidParam("host load segment is too large");
+                }
+                total += len;
+                if (total > shardSize_) {
+                    return Status::InvalidParam("host load segments exceed shard size({})",
+                                                shardSize_);
+                }
+                segs.push_back(IoSeg{shard.addrs[i], len, off});
+                off += len;
+            }
+            return Status::OK();
+        }
+        if (ioSize_ == 0 || ioSize_ > std::numeric_limits<uint32_t>::max() ||
+            ioSize_ > shardSize_) {
+            return Status::InvalidParam("invalid host load io size({})", ioSize_);
+        }
+        if (shard.addrs.size() > shardSize_ / ioSize_) {
+            return Status::InvalidParam("host load address count({}) exceeds shard",
+                                        shard.addrs.size());
+        }
+        uint64_t off = base;
+        segs.reserve(shard.addrs.size());
+        for (auto* addr : shard.addrs) {
+            if (addr == nullptr) { return Status::InvalidParam("host load segment is empty"); }
+            segs.push_back(IoSeg{addr, ioSize_, off});
+            off += ioSize_;
+        }
+        return Status::OK();
+    }
+    void FinishHostSeg(const std::shared_ptr<HostReadGroup>& group, size_t expect,
+                       const AioImpl::Result& result)
+    {
+        const auto shortIo = result.error == 0 && result.nBytes != static_cast<ssize_t>(expect);
+        if (result.error != 0 || shortIo) {
+            UC_ERROR("Failed(error={}, bytes={}/{}) to do host load on block({}).", result.error,
+                     result.nBytes, expect, group->block);
+            if (result.error != ECANCELED) { IncrementIoErrorMetric(); }
+            group->task->Fail(shortIo ? Status::NotFound() : Status::Error());
+            failureSet_.Insert(group->task->id);
+        }
+        if (group->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            if (group->fd >= 0) { ::close(group->fd); }
+            group->waiter->Done();
+        }
+    }
+    Status SubmitHostLoad(const TaskPtr& task, const WaiterPtr& w, int32_t fd,
+                          const Detail::Shard& shard)
+    {
+        std::vector<IoSeg> segs;
+        auto status = BuildHostLoadSegs(shard, segs);
+        if (status.Failure() || segs.empty()) {
+            if (status.Success()) {
+                status = Status::InvalidParam("host load shard has no address");
+            }
+            return status;
+        }
+        auto group = std::make_shared<HostReadGroup>();
+        group->task = task;
+        group->waiter = w;
+        group->block = shard.owner;
+        group->fd = fd;
+        group->remaining.store(segs.size(), std::memory_order_relaxed);
+        size_t submitted = 0;
+        for (const auto& seg : segs) {
+            AioImpl::Io io;
+            io.fd = fd;
+            io.offset = seg.offset;
+            io.length = static_cast<uint32_t>(seg.length);
+            io.buffer = seg.buffer;
+            io.tag = task->id;
+            const auto expect = seg.length;
+            io.callback = [this, group, expect](AioImpl::Result ioResult) {
+                FinishHostSeg(group, expect, ioResult);
+            };
+            status = aio_.ReadAsync(std::move(io));
+            if (status.Failure()) { break; }
+            ++submitted;
+        }
+        if (submitted == segs.size()) { return Status::OK(); }
+        task->Fail(status);
+        failureSet_.Insert(task->id);
+        if (status == Status::Timeout()) {
+            IncrementAioTimeoutMetric();
+        } else {
+            IncrementIoErrorMetric();
+        }
+        const auto left = segs.size() - submitted;
+        if (group->remaining.fetch_sub(left, std::memory_order_acq_rel) == left) {
+            if (fd >= 0) { ::close(fd); }
+            w->Done();
+        }
+        return Status::OK();
+    }
     template <bool dump>
     void OnOpenCallback(const TaskPtr& task, WaiterPtr w, const Detail::Shard& shard,
                         const BlockOperator::OpenResult& result)
@@ -164,6 +291,13 @@ private:
             }
             w->Done();
             return;
+        }
+        if constexpr (!dump) {
+            if (task->desc.bufferSpace == Detail::BufferSpace::HOST) {
+                auto status = SubmitHostLoad(task, w, result.fd, shard);
+                if (status.Failure()) { handleFailure(result.fd, status); }
+                return;
+            }
         }
         AioImpl::Io io;
         io.fd = result.fd;

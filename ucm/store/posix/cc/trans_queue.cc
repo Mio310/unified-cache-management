@@ -183,15 +183,42 @@ Status TransQueue::S2H(IoUnit& ios)
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_open_errors_total"), 1.0);
         return s;
     }
-    auto offset = shardSize_ * ios.shard.index;
-    for (const auto& addr : ios.shard.addrs) {
+    auto offset = static_cast<off64_t>(shardSize_ * ios.shard.index);
+    const auto& shard = ios.shard;
+    const auto host = ios.task->desc.bufferSpace == Detail::BufferSpace::HOST;
+    if (host && !shard.lengths.empty()) {
+        if (shard.lengths.size() != shard.addrs.size()) {
+            return Status::InvalidParam("host load length count({}) != address count({})",
+                                        shard.lengths.size(), shard.addrs.size());
+        }
+        size_t total = 0;
+        for (size_t i = 0; i < shard.addrs.size(); ++i) {
+            const auto len = shard.lengths[i];
+            if (len == 0 || shard.addrs[i] == nullptr) {
+                return Status::InvalidParam("host load segment is empty");
+            }
+            total += len;
+            if (total > shardSize_) {
+                return Status::InvalidParam("host load segments exceed shard size({})", shardSize_);
+            }
+            s = file.Read(shard.addrs[i], len, offset);
+            if (s.Failure()) [[unlikely]] {
+                UC_ERROR("Failed({}) to read file({}:{}).", s, path, offset);
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_io_errors_total"), 1.0);
+                return s;
+            }
+            offset += static_cast<off64_t>(len);
+        }
+        return Status::OK();
+    }
+    for (const auto& addr : shard.addrs) {
         s = file.Read(addr, ioSize_, offset);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to read file({}:{}).", s, path, offset);
             UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_io_errors_total"), 1.0);
             return s;
         }
-        offset += ioSize_;
+        offset += static_cast<off64_t>(ioSize_);
     }
     return Status::OK();
 }

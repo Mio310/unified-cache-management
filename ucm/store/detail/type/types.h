@@ -25,6 +25,7 @@
 #define UNIFIEDCACHE_STORE_DETAIL_TYPE_TYPES_H
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -45,12 +46,21 @@ struct BlockIdHasher {
 };
 
 /**
+ * @brief Address space of the buffers carried by a task.
+ *
+ * DEVICE is the existing path: Cache treats addresses as HBM and stages through its DRAM pool.
+ * HOST means the addresses are already DRAM. Posix reads SSD directly into them.
+ */
+enum class BufferSpace : uint8_t { DEVICE, HOST };
+
+/**
  * @brief Describes one shard (slice) of a block.
  */
 struct Shard {
-    BlockId owner;            /* Parent block identifier */
-    std::size_t index;        /* Shard index inside the block */
-    std::vector<void*> addrs; /* Device-side buffer addresses */
+    BlockId owner;                 /* Parent block identifier */
+    std::size_t index;             /* Shard index inside the block */
+    std::vector<void*> addrs;      /* Buffer addresses, HBM unless TaskDesc::bufferSpace is HOST */
+    std::vector<std::size_t> lengths; /* HOST load only: bytes per address. Empty uses the store io size. */
 };
 
 /**
@@ -64,6 +74,8 @@ struct TaskDesc : std::vector<Shard> {
     std::string brief;    /* Description of Task */
     /** Optional: prerequisite handle for dump. Cache stream waits before D2H. */
     uintptr_t prerequisiteHandle{0};
+    /** DEVICE keeps the HBM load path. HOST reads SSD straight into shard.addrs. */
+    BufferSpace bufferSpace{BufferSpace::DEVICE};
 };
 
 }  // namespace UC::Detail
