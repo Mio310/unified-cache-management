@@ -204,11 +204,14 @@ void LoadQueue::TransferDdrLoad(ShardTask&& task)
     if (s.Success()) {
         auto* src = task.bufferHandle.Data();
         auto* dst = task.shard.addrs.empty() ? nullptr : task.shard.addrs.front();
-        if (src == nullptr || dst == nullptr || task.shard.addrs.size() != 1) [[unlikely]] {
-            s = Status::InvalidParam();
-            UC_ERROR("DDR load shard({}) requires one host address.", task.shard.index);
-        } else {
-            std::memcpy(dst, src, shardSize_);
+        // A null DDR address means prefetch: fill the cache slot and skip the host copy.
+        if (dst != nullptr) {
+            if (src == nullptr || task.shard.addrs.size() != 1) [[unlikely]] {
+                s = Status::InvalidParam();
+                UC_ERROR("DDR load shard({}) requires one host address.", task.shard.index);
+            } else {
+                std::memcpy(dst, src, shardSize_);
+            }
         }
     }
     if (s.Failure()) [[unlikely]] {

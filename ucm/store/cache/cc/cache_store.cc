@@ -104,7 +104,7 @@ public:
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
         if (task.memoryType == Detail::TaskDesc::MemoryType::DDR) {
             for (const auto& shard : task) {
-                if (shard.addrs.size() != 1 || shard.addrs.front() == nullptr) {
+                if (shard.addrs.size() != 1) {
                     return Status::InvalidParam("ddr load shard({}) requires one host address",
                                                 shard.index);
                 }
