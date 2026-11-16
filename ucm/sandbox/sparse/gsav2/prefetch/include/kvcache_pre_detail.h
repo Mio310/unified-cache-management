@@ -195,7 +195,7 @@ struct PrefetchTopkView {
     int64_t numel = 0;
 };
 
-inline int64_t PrefetchTopkReadableNumel(contest torch::Tensor& t)
+inline int64_t PrefetchTopkReadableNumel(const torch::Tensor& t)
 {
     if (!t.defined()) { return 0; }
     const int64_t elemBytes = static_cast<int64_t>(t.element_size());
