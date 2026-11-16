@@ -92,6 +92,7 @@ public:
     /* UCM store for Host-only KV load */
     UC::StoreV1* mStoreV1_{nullptr};
     bool mISSPAC8{false};
+    size_t mStoreTensorCount{kStoreTensorCount};
     Logger mLogger;
 
 public:
@@ -138,6 +139,13 @@ public:
     void SetStoreV1Raw(uintptr_t storePtr) { mStoreV1_ = reinterpret_cast<UC::StoreV1*>(storePtr); }
 
     uintptr_t GetStoreV1Raw() const { return reinterpret_cast<uintptr_t>(mStoreV1_); }
+
+    void SetStoreTensorCount(size_t count)
+    {
+        if (count > 0) { mStoreTensorCount = count; }
+    }
+
+    size_t GetStoreTensorCount() { return mStoreTensorCount; }
 
     uintptr_t GetSelfRaw() const { return reinterpret_cast<uintptr_t>(this); }
 

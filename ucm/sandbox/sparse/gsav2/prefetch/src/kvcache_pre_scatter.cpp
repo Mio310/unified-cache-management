@@ -330,7 +330,7 @@ int GSAPrefetchEngineC::AcquirePrefetchTopkBase(const TaskInfo& taskInfo, uint32
     topkView.base = topkList.data_ptr<int>();
     topkView.stride0 = topkList.stride(0);
     topkView.stride1 = topkList.stride(1);
-    topkView.numel = topkList.numel();
+    topkView.numel = PrefetchTopkReadableNumel(topkList);
     return 0;
 }
 
@@ -916,7 +916,7 @@ int GSAPrefetchEngineC::AcquireIndexerTopkBase(const torch::Tensor& topkList,
         topkOk = topkLen >= 0 && static_cast<int64_t>(mLayerNum) - 1 >= 0 &&
                  (static_cast<int64_t>(mLayerNum) - 1) * stride0 +
                          static_cast<int64_t>(topkLen) <=
-                     topkList.numel();
+                     PrefetchTopkReadableNumel(topkList);
     }
     if (!topkOk) {
         mLogger.log(LogLevel::ERROR,
@@ -1186,7 +1186,7 @@ bool GSAPrefetchEngineC::TryAppendInitShard(int i, std::vector<std::vector<int>>
                     reqID.c_str(), layerID, blockIdx, hashVec.size());
         return true;
     }
-    std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
+    std::vector<void*> tensorAddrs(mStoreTensorCount, nullptr);
     tensorAddrs[kIndexerTensorIndex] = indexerAddr;
     task.emplace_back(UC::Detail::Shard{hashVec[static_cast<size_t>(blockIdx)], shardIndex,
                                         std::move(tensorAddrs)});
@@ -1402,7 +1402,7 @@ bool GSAPrefetchEngineC::BuildIndexerLoadTask(const std::string& reqID, int laye
         }
         /* Same slot-padded addrs contract as the init load: the store's H2D
          * path indexes addrs[i] for every tensorSizes_ slot. */
-        std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
+        std::vector<void*> tensorAddrs(mStoreTensorCount, nullptr);
         tensorAddrs[kIndexerTensorIndex] = indexerAddr;
         task.emplace_back(UC::Detail::Shard{hashVec[missBlockIdx], shardIndex,
                                             std::move(tensorAddrs)});

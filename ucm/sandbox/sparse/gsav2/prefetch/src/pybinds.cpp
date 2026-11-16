@@ -140,6 +140,8 @@ void registerPrefetchEngine(pybind11::module_& m)
         .def("indexer_init_load", &ucmprefetch::GSAPrefetchEngineC::IndexerInitLoad)
         .def("set_store_v1", &ucmprefetch::GSAPrefetchEngineC::SetStoreV1Raw)
         .def("get_store_v1_ptr", &ucmprefetch::GSAPrefetchEngineC::GetStoreV1Raw)
+        .def("set_store_tensor_count", &ucmprefetch::GSAPrefetchEngineC::SetStoreTensorCount)
+        .def("get_store_tensor_count", &ucmprefetch::GSAPrefetchEngineC::GetStoreTensorCount)
         .def("get_self_ptr", &ucmprefetch::GSAPrefetchEngineC::GetSelfRaw);
 }
 

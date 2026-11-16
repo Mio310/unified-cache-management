@@ -751,7 +751,8 @@ class GSA(UcmSparseBase):
         self.cudagraph_capture_sizes = (
             vllm_config.compilation_config.cudagraph_capture_sizes
         )
-        max_graph_bs = max(max(self.cudagraph_capture_sizes), self.max_bs)
+        max_graph_bs = max(max(self.cudagraph_capture_sizes),
+            self.max_bs * self.num_spec_tokens)
         self._init_gsa_dsa_buffers(vllm_config, max_graph_bs)
         self._init_gsa_swap_buffers(max_graph_bs)
         if IS_INDEXER_OFFLOAD:
@@ -899,6 +900,16 @@ class GSA(UcmSparseBase):
             )
             return False
         self.prefetch_engine.prefetch_engine_c.set_store_v1(store_ptr)
+        layout = getattr(connector, "kv_cache_layout", None)
+        if layout is not None:
+            tensor_count = len(layout.tensor_size_list)
+            if tensor_count > 0:
+                self.prefetch_engine.prefetch_engine_c.set_store_tensor_count(
+                    tensor_count
+                )
+                logger.info(
+                    "[GSA Store Inject] store tensor count=%d", tensor_count
+                )
         actual_store_ptr = self.prefetch_engine.prefetch_engine_c.get_store_v1_ptr()
         cpp_self_ptr = self.prefetch_engine.prefetch_engine_c.get_self_ptr()
         self.ucm_prefetch_engine.store_init(store_ptr, self.layer_num)
@@ -2908,6 +2919,7 @@ class GSA(UcmSparseBase):
             )
             if IS_INDEXER_OFFLOAD:
                 self.prefetch_engine.prefetch_engine_c.set_kvTensor_Index(
+                    layer_id,
                     indexer_cache,
                 )
 

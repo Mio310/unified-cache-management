@@ -764,7 +764,7 @@ void GSAPrefetchEngineC::SetTokensMap(int layerID, const std::string& reqID,
     const auto totalEnd = std::chrono::high_resolution_clock::now();
     const auto totalDuration =
         std::chrono::duration_cast<std::chrono::microseconds>(totalEnd - start);
-    mLogger.log(LogLevel::INFO,
+    mLogger.log(LogLevel::DEBUG,
                 "Decode step: %u, |KVCache Prefetch| End SetTokensMap "
                 "layerID=%d reqID=%s managerCost=%lld us totalCost=%lld us\n",
                 mDecodeStep, layerID, reqID.c_str(),
@@ -903,7 +903,7 @@ int GSAPrefetchEngineC::AcquireQTopkView(torch::Tensor& qTopkTensor, const std::
     topkSize = static_cast<int>(qTopkTensor.sizes()[2]);
     topkView.base = qTopkTensor.data_ptr<int>();
     topkView.stride0 = qTopkTensor.stride(0);
-    topkView.numel = qTopkTensor.numel();
+    topkView.numel = PrefetchTopkReadableNumel(qTopkTensor);
     /* 平坦读边界：末行读取范围不得超过张量元素数（防 OOB 读）。 */
     const int64_t lastOffset = static_cast<int64_t>(qTopkNum > 0 ? qTopkNum - 1 : 0) *
                                    topkView.stride0 +
@@ -1345,14 +1345,14 @@ void GSAPrefetchEngineC::OpenUcmShard(size_t i, size_t blockIdxSz, int layerID,
         hashVec[blockIdxSz], static_cast<size_t>(layerID),
         std::vector<void*>{kDstBase + i * kTokenBytes}});
     UC::Detail::TokenFilter kFilter;
-    kFilter.ranges.resize(kStoreTensorCount);
+    kFilter.ranges.resize(mStoreTensorCount);
     plan.kFilters.push_back(std::move(kFilter));
     if (!mISSPAC8) {
         plan.vTask.emplace_back(UC::Detail::Shard{
             hashVec[blockIdxSz], static_cast<size_t>(layerID),
             std::vector<void*>{vDstBase + i * vTokenBytes}});
         UC::Detail::TokenFilter vFilter;
-        vFilter.ranges.resize(kStoreTensorCount);
+        vFilter.ranges.resize(mStoreTensorCount);
         plan.vFilters.push_back(std::move(vFilter));
     }
 }
@@ -1546,7 +1546,7 @@ void GSAPrefetchEngineC::AppendMergeBlockShard(const UCMMergeBlockContext& conte
         hashVec[static_cast<size_t>(context.blockIdx)], static_cast<size_t>(layerID),
         std::vector<void*>{kDstBase + firstDst * kTokenBytes}});
     UC::Detail::TokenFilter kFilter;
-    kFilter.ranges.resize(kStoreTensorCount);
+    kFilter.ranges.resize(mStoreTensorCount);
     for (size_t localTokenIdx = 0; localTokenIdx < tokenIndices.size(); ++localTokenIdx) {
         const int globalToken = missGlobalIds[tokenIndices[localTokenIdx]];
         const size_t tokenIdxInBlock = static_cast<size_t>(globalToken % mBlockSize);
@@ -1559,7 +1559,7 @@ void GSAPrefetchEngineC::AppendMergeBlockShard(const UCMMergeBlockContext& conte
         hashVec[static_cast<size_t>(context.blockIdx)], static_cast<size_t>(layerID),
         std::vector<void*>{vDstBase + firstDst * vTokenBytes}});
     UC::Detail::TokenFilter vFilter;
-    vFilter.ranges.resize(kStoreTensorCount);
+    vFilter.ranges.resize(mStoreTensorCount);
     for (size_t localTokenIdx = 0; localTokenIdx < tokenIndices.size(); ++localTokenIdx) {
         const int globalToken = missGlobalIds[tokenIndices[localTokenIdx]];
         const size_t tokenIdxInBlock = static_cast<size_t>(globalToken % mBlockSize);

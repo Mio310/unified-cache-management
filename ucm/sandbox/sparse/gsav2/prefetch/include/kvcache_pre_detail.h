@@ -14,6 +14,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <torch/torch.h>
 #include "ucmstore_v1.h"
 
 namespace ucmprefetch {
@@ -193,6 +194,16 @@ struct PrefetchTopkView {
     int64_t stride1 = 0;
     int64_t numel = 0;
 };
+
+inline int64_t PrefetchTopkReadableNumel(contest torch::Tensor& t)
+{
+    if (!t.defined()) { return 0; }
+    const int64_t elemBytes = static_cast<int64_t>(t.element_size());
+    if (elemBytes <= 0) { return 0; }
+    const int64_t storageElems = 
+        static_cast<int64_t>(t.storage().nbytes()) / elemBytes;
+    return storageElems - static_cast<int64_t>(t.storage_offset());
+}
 
 /* UCMTensorMergeBatch 的整批请求态：contexts 持有指向 tokenMap 节点的
  * 指针，须与 tokenMap 同生命周期（std::map 节点地址稳定，move 安全）。 */
