@@ -125,7 +125,8 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             waiter->Done();
         };
         if (task->filter.size() != nShard) {
-            fail(Status::InvalidParam("filter size({}) != shards({})", task->filter.size(), nShard));
+            fail(
+                Status::InvalidParam("filter size({}) != shards({})", task->filter.size(), nShard));
             return;
         }
         for (size_t i = 0; i < nShard; ++i) {
@@ -188,9 +189,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         }
         shardTask.task = task;
         shardTask.shard = std::move(shard);
-        if (task->type == TransTask::Type::LOAD_ON_TOKEN) {
-            shardTask.tokenFilter = task->filter[indexes[i]];
-        }
+        if (task->type == TransTask::Type::LOAD_ON_TOKEN) { shardTask.filterIndex = indexes[i]; }
         shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
         shardTask.firstShard = i == 0;
         running_.Push(std::move(shardTask));
@@ -287,9 +286,8 @@ void LoadQueue::TransferDdrLoadOnToken(ShardTask&& task)
             s = Status::InvalidParam();
             UC_ERROR("DDR load-on-token shard({}) requires one host address.", task.shard.index);
         } else {
-            /* Cache-slot layout is [full K][full V][indexer][scale]: a range's
-             * offset is relative to its tensor, so add the tensor's base. */
-            size_t tokenNum = task.tokenFilter.ranges.size();
+            const auto& tokenFilter = parentTask->filter[task.filterIndex];
+            size_t tokenNum = tokenFilter.ranges.size();
             for (size_t t = 0; t < tokenNum; ++t) {
                 const auto* tensorSrc = static_cast<const std::byte*>(src) + TensorBaseOffset(t);
                 const auto& ranges = task.tokenFilter.ranges[t];

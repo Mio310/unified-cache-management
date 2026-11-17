@@ -40,11 +40,9 @@ NUM_GSA_BLOCKS = 1
 # affected. Other sparse methods (ESA / KVStar / GSAOnDevice / Blend) are driven
 # by their own kv_transfer_config and do not consume this switch.
 IS_OPEN_GSA = _env_bool("UCM_SPARSE_GSA_ENABLE", False)
-# Topk-prefetch switch consumed by the legacy ucm.sparse.gsa chain only.
-# NOTE: gsav2 and its vLLM integration patches
-# (ucm.sandbox.sparse.gsav2.patch) no longer read this switch -- it was
-# merged into IS_OPEN_GSA (env UCM_SPARSE_GSA_ENABLE) so GSA init and
-# runtime gating share a single variable.
+IS_INDEXER_OFFLOAD = _env_bool("IS_INDEXER_OFFLOAD_ENABLE", False)
+# Topk-prefetch switch consumed by GSA v2 and the vLLM integration patches.
+# Configurable via env var, defaulting to True for GSA v2.
 PTOPK_PREFETCH_ENABLE = _env_bool("UCM_GSA_PTOPK_PREFETCH_ENABLE", True)
 
 ######  GSA v2 threshold for offload
@@ -68,7 +66,6 @@ MAX_INDEXER_BLOCK_NUM = 17000
 MAX_SLOTS_BLOCK_NUM = 12000
 INIT_LOCAL_WINDOWS = 5
 LOCAL_WINDOWS_LEN = 1
-IS_INDEXER_OFFLOAD = False
 INDEXER_SPARSE_RATE = 0.2
 INDEXER_PREFETCH_RATIO = 1.5
 
