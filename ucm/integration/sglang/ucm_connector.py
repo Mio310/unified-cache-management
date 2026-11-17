@@ -1,9 +1,9 @@
 import hashlib
 import logging
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 import torch
@@ -23,21 +23,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _load_extra_config_from_yaml_env() -> Optional[Dict[str, Any]]:
-    cfg_path = os.environ.get("UNIFIEDCACHE_CONFIG_FILE")
-    if not cfg_path:
-        return None
-
-    p = Path(cfg_path)
-    if not p.is_file():
-        return None
-
-    with p.open("r", encoding="utf-8") as f:
+def _load_extra_config_from_yaml(config_file: str) -> Dict[str, Any]:
+    with Path(config_file).open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
     if not isinstance(data, dict):
         raise ValueError(
-            f"UNIFIEDCACHE_CONFIG_FILE YAML root must be a dict, got {type(data)}"
+            f"UCM configuration YAML root must be a dict, got {type(data)}"
         )
     return data
 
@@ -73,21 +65,28 @@ class UnifiedCacheStoreConfig:
         storage_config: "HiCacheStorageConfig", mem_pool_host: "HostKVCache"
     ) -> "UnifiedCacheStoreConfig":
         extra = dict(getattr(storage_config, "extra_config", None) or {})
-        if "kv_connector_extra_config" not in extra:
-            yaml_extra = _load_extra_config_from_yaml_env()
-            if yaml_extra is not None:
-                extra.update(yaml_extra)
-        if not extra:
-            raise ValueError(
-                "Missing extra_config: storage_config.extra_config is None and "
-                "UNIFIEDCACHE_CONFIG_FILE is not set or cannot be loaded"
-            )
-
         kvc = extra.get("kv_connector_extra_config")
         if kvc is None:
             raise ValueError(
                 "Missing config: extra_config['kv_connector_extra_config']"
             )
+        if "UCM_CONFIG_FILE" in kvc:
+            kvc = _load_extra_config_from_yaml(kvc["UCM_CONFIG_FILE"])
+            # Keep existing YAML files wrapping the legacy single-store config.
+            kvc = kvc.get("kv_connector_extra_config", kvc)
+            if not isinstance(kvc, dict):
+                raise ValueError(
+                    "kv_connector_extra_config in UCM YAML must be a mapping."
+                )
+        if "ucm_connectors" in kvc:
+            connectors = kvc["ucm_connectors"]
+            if not isinstance(connectors, list) or len(connectors) != 1:
+                raise ValueError(
+                    "SGLang UCM HiCache requires exactly one ucm_connectors entry."
+                )
+            if not isinstance(connectors[0], dict):
+                raise ValueError("UCM connector entry must be a mapping.")
+            kvc = connectors[0]
 
         is_logical_pool = getattr(mem_pool_host, "kv_buffer", None) is None
         if is_logical_pool:
@@ -116,7 +115,14 @@ class UnifiedCacheStoreConfig:
             )
 
         cfg = dict(ucm_cfg)
-        cfg["store_pipeline"] = "Posix"
+        store_pipeline = cfg.setdefault("store_pipeline", "Posix")
+        if store_pipeline != "Posix":
+            logger.warning(
+                "SGLang UCM HiCache is configured with store_pipeline=%r; "
+                "pipelines other than 'Posix' may be incompatible and cause "
+                "startup to fail.",
+                store_pipeline,
+            )
         storage_backends = [path for path in cfg["storage_backends"].split(":") if path]
         pp_rank = int(getattr(storage_config, "pp_rank", 0))
         pp_size = int(getattr(storage_config, "pp_size", 1))
@@ -290,15 +296,27 @@ class SglangUcmConnector:
         self.pool_components[pool_name] = [(store, component_size)]
         self.pool_component_sizes[pool_name] = component_sizes
 
+    def _pool_is_replicated(self, pool_name: Any) -> bool:
+        if not self.is_mla:
+            return False
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        should_backup = getattr(HybridCacheController, "should_backup", None)
+        if not callable(should_backup):
+            raise ValueError(
+                "SGLang does not expose the hybrid side-pool writer policy"
+            )
+        # Ask which sidecars still need a per-rank write when MLA backup is
+        # skipped. This preserves sharded state without model-name rules.
+        policy = SimpleNamespace(backup_skip=True, storage_backend_type="unifiedcache")
+        return not should_backup(policy, SimpleNamespace(name=pool_name))
+
     def _component_key(self, logical_key: str, pool_name: Any, index: int) -> bytes:
-        # A logical primary anchor means the physical payload is wholly owned
-        # by the v2 pools.  Such layouts follow SGLang's replicated-MLA owner
-        # semantics: TP0 persists one copy and every rank queries/loads that
-        # same object.  A physical primary anchor can have rank-sharded hybrid
-        # sidecars, so keep the TP rank in that case.
         tp_suffix = (
             ""
-            if self._is_logical_anchor()
+            if self._pool_is_replicated(pool_name)
             else f"__v2_tp_{self.tp_rank}_{self.tp_size}"
         )
         physical = (
@@ -344,6 +362,11 @@ class SglangUcmConnector:
     ) -> Dict[str, List[bool]]:
         results: Dict[str, List[bool]] = {}
         for transfer in transfers:
+            if transfer.name not in self.pool_components:
+                raise ValueError(f"Unregistered UCM hybrid pool: {transfer.name}")
+            if is_set and self.tp_rank != 0 and self._pool_is_replicated(transfer.name):
+                results[transfer.name] = [True] * len(transfer.keys or [])
+                continue
             if transfer.name in self.flattened_pools:
                 page_results = self._batch_io_flattened_pool(transfer, is_set)
                 results[transfer.name] = page_results

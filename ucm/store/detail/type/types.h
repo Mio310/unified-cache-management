@@ -58,8 +58,8 @@ struct Shard {
  * @brief Byte range inside one tensor buffer for LoadOnToken.
  */
 struct TokenRange {
-    std::size_t offset; /* Range start inside the tensor's buffer */
-    std::size_t length; /* Range length in bytes */
+    std::size_t offset;    /* Range start inside the tensor's buffer */
+    std::size_t length;    /* Range length in bytes */
     std::size_t dstOffset; /* Offset inside the source buffer (for concatenation) */
 };
 
@@ -85,6 +85,8 @@ struct TaskDesc : std::vector<Shard> {
     uintptr_t prerequisiteHandle{0};
     /** Optional: memory type of the shard addresses, defaults to HBM. */
     MemoryType memoryType{MemoryType::HBM};
+    /** Shared keys requested by every rank may distribute backend fills. */
+    bool distributeBackendLoad{false};
 };
 
 }  // namespace UC::Detail

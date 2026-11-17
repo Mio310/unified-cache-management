@@ -1,3 +1,4 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #pragma once
 
 #include <cstddef>
@@ -11,8 +12,9 @@
 namespace UC::AsuStore {
 
 struct Config {
-    // Configuration key: enable_metrics. Controls installation only;
-    // does not filter this store's samples or disable a process-wide backend.
+    // Configuration key: enable_metrics.
+    // Controls this store's native ASU metrics and KV backend installation.
+    // Does not filter KV samples or disable a process-wide KV backend.
     bool enableMetrics{true};
     std::string mode{"client"};
     std::string configPath;
@@ -29,6 +31,7 @@ struct Config {
     std::uint64_t queryTimeoutMs{500};
     std::uint64_t maxErrorCount{2};
     std::uint64_t clientMaxInflightTasks{1024};
+    bool useBatchIoForSingleKey{true};
     std::uint64_t transportMaxInflightTasks{1024};
     std::uint64_t completionPollSpinLimit{16};
     std::uint64_t maxInflightBytes{1ULL << 30};

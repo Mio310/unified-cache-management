@@ -89,6 +89,11 @@ class UcmPipelineStoreTransTask(Task):
 
 
 class UcmPipelineStore(UcmKVStoreBaseV1):
+    @property
+    def supports_distributed_backend_load(self) -> bool:
+        """Custom load overrides keep their original submission interface."""
+        return getattr(self.load_data, "__func__", None) is UcmPipelineStore.load_data
+
     def __init__(self, config: Dict[str, object]) -> None:
         super().__init__(config)
         self.store_ = ucmpipelinestore.PipelineStore()
@@ -131,11 +136,13 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         block_ids: List[bytes],
         shard_index: List[int],
         dst_tensor: List[List[torch.Tensor]],
+        *,
+        distribute_backend_load: bool = False,
     ) -> Task:
         ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         indexes = array.array("Q", shard_index)
         addrs = self._tensor_normalize(dst_tensor)
-        task_id = self.store_.Load(ids, indexes, addrs)
+        task_id = self.store_.Load(ids, indexes, addrs, 0, distribute_backend_load)
         return UcmPipelineStoreTransTask(task_id)
 
     def dump(
@@ -155,6 +162,9 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         block_ids: List[bytes],
         shard_index: List[int],
         dst_addr: List[List[int]] | np.ndarray,
+        prerequisite_handle: int = 0,
+        *,
+        distribute_backend_load: bool = False,
     ) -> Task:
         ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         indexes = array.array("Q", shard_index)
@@ -162,7 +172,9 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
             addrs = dst_addr
         else:
             addrs = np.array(dst_addr, dtype=np.uint64)
-        task_id = self.store_.Load(ids, indexes, addrs)
+        task_id = self.store_.Load(
+            ids, indexes, addrs, prerequisite_handle, distribute_backend_load
+        )
         return UcmPipelineStoreTransTask(task_id)
 
     def dump_data(
@@ -196,6 +208,14 @@ def _cache_ds3fs_pipeline_builder(
     if config.get("device_id", -1) >= 0:
         ds3fs_config |= {"tensor_size": config["shard_size"]}
     pipeline.Stack("Ds3fs", str(store_dir / "ds3fs/libds3fsstore.so"), ds3fs_config)
+    _preload_metrics(store_dir)
+    pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
+
+
+def _cache_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+):
+    store_dir = Path(__file__).resolve().parent.parent
     _preload_metrics(store_dir)
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
 
@@ -392,6 +412,7 @@ def _dram_pipeline_builder(
 
 UcmPipelineStoreBuilder.register("Cache|Ds3fs", _cache_ds3fs_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Empty", _cache_empty_pipeline_builder)
+UcmPipelineStoreBuilder.register("Cache", _cache_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Posix", _cache_posix_pipeline_builder)
 UcmPipelineStoreBuilder.register("Empty", _empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Fake", _fake_pipeline_builder)

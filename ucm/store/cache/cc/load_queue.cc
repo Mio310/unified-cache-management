@@ -192,6 +192,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             shardTask.tokenFilter = task->filter[indexes[i]];
         }
         shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+        shardTask.firstShard = i == 0;
         running_.Push(std::move(shardTask));
     }
     auto tpDispatch = NowTime::Now();
@@ -343,6 +344,15 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         auto tpBackendReady = NowTime::Now();
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_wait_ms"),
                                  (tpBackendReady - tpBackendWait) * 1e3);
+
+        if (task.firstShard && parentTask->desc.prerequisiteHandle != 0) {
+            s = stream.WaitEvent(Trans::Event{parentTask->desc.prerequisiteHandle});
+            if (s.Failure()) [[unlikely]] {
+                UC_ERROR("Failed({}) to wait prerequisite event for load task({}).", s, taskHandle);
+                RecordShardResults(holder_, &task, false);
+                break;
+            }
+        }
 
         auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
         s = HostToDeviceAsync(stream, host, task.shard.addrs.data());

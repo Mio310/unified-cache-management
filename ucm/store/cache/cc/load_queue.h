@@ -50,6 +50,7 @@ class LoadQueue {
         Detail::TaskHandle backendTaskHandle;
         WaiterPtr waiter;
         bool fromPosix{false};
+        bool firstShard{false};
     };
 
 private:
