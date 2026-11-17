@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import freeze_gc, get_device_module
 
+from ucm.integration.sglang import load_trace
 from ucm.integration.sglang.ucm_direct_store_adapter import (
     UcmDirectStoreAdapter,
     UcmLayerTransfer,
@@ -149,6 +150,8 @@ class UcmDirectLinker(UnifiedCacheLinker):
         self._tp_size = parallel.tp_size
         self._dp_rank = int(getattr(parallel, "dp_rank", None) or 0)
         self._attn_dp_rank = int(getattr(parallel, "attn_dp_rank", None) or 0)
+        self._pp_rank = params.pp_rank
+        self._attn_cp_rank = params.attn_cp_rank
         tp_group = params.attn_tp_cache_group or params.tp_cache_group
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             self._tp_rank = torch.distributed.get_rank(group=tp_group)
@@ -663,12 +666,21 @@ class UcmDirectLinker(UnifiedCacheLinker):
         return result
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        trace = load_trace.new_attempt(
+            rid,
+            dp_rank=self._dp_rank,
+            attn_dp_rank=self._attn_dp_rank,
+            tp_rank=self._tp_rank,
+            pp_rank=getattr(self, "_pp_rank", None),
+            attn_cp_rank=getattr(self, "_attn_cp_rank", None),
+        )
         self._lookup_progress.pop(rid, None)
         try:
             expanded = self._expand(
                 transfers, allow_partial=True, allow_missing_kv=True
             )
         except Exception:
+            load_trace.emit("load_failed", trace, stage="expand")
             logger.exception(
                 "[dp_rank=%d attn_dp_rank=%d tp_rank=%d] "
                 "[CacheLoad] load_failed request_id=%s",
@@ -679,8 +691,10 @@ class UcmDirectLinker(UnifiedCacheLinker):
             )
             raise
         if not expanded:
+            load_trace.emit("load_skipped", trace, reason="empty_transfers")
             return False
         if rid in self._pending_loads:
+            load_trace.emit("load_rejected", trace, reason="already_queued")
             logger.error(
                 "[dp_rank=%d attn_dp_rank=%d tp_rank=%d] "
                 "[CacheLoad] load_rejected request_id=%s reason=already_queued",
@@ -690,11 +704,16 @@ class UcmDirectLinker(UnifiedCacheLinker):
                 rid,
             )
             raise RuntimeError(f"UCM load for rid={rid} is already queued.")
-        self._pending_loads[rid] = expanded
+        self._pending_loads[rid] = (
+            load_trace.TracedLoad(expanded, trace) if trace is not None else expanded
+        )
+        load_trace.emit("load_queued", trace)
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        return self._pending_loads.pop(rid, None) is not None
+        pending = self._pending_loads.pop(rid, None)
+        load_trace.emit("load_cancelled", getattr(pending, "trace", None))
+        return pending is not None
 
     def num_completed_loads(self) -> int:
         return self._completed_loads.qsize()
@@ -771,7 +790,14 @@ class UcmDirectLinker(UnifiedCacheLinker):
                 try:
                     prerequisite_handle = self._wait_transfer_events(ready_events)
                     page_transfers = [
-                        transfer
+                        (
+                            replace(
+                                transfer,
+                                trace=dict(request.trace, load_batch_id=counter_index),
+                            )
+                            if getattr(request, "trace", None) is not None
+                            else transfer
+                        )
                         for request in pending.values()
                         for transfer in self._page_transfers(
                             request, for_io=True, lazy_addresses=True
@@ -843,6 +869,12 @@ class UcmDirectLinker(UnifiedCacheLinker):
                         list(pending),
                     )
                 finally:
+                    for request in pending.values():
+                        load_trace.emit(
+                            "load_completed" if landed else "load_failed",
+                            getattr(request, "trace", None),
+                            load_batch_id=counter_index,
+                        )
                     if self._requires_load_finish:
                         self._load_results[counter_index].set_result(landed)
                     else:
@@ -1059,7 +1091,8 @@ class UcmDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self._lookup_progress.clear()
-        self._pending_loads.clear()
+        for rid in list(self._pending_loads):
+            self.cancel_queued_load(rid)
         self._load_queue.join()
         self._load_results.clear()
         self._offload_queue.join()

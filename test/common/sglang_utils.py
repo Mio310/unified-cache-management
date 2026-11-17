@@ -7,14 +7,17 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import threading
 import time
 import types
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, List
+from uuid import uuid4
 
 import numpy as np
 from common.path_utils import get_test_root
@@ -62,14 +65,21 @@ def load_source(relative_path, definitions=None, **dependencies):
         Task=object,
         UcmKVStoreBaseV1=object,
         torch=types.SimpleNamespace(Tensor=object),
+        uuid4=uuid4,
     )
     defaults.update(dependencies)
     return _load_source(relative_path, definitions=definitions, **defaults)
 
 
-adapter_module = load_source("ucm/integration/sglang/ucm_direct_store_adapter.py")
+trace_module = load_source(
+    "ucm/integration/sglang/load_trace.py", os=os, ContextVar=ContextVar
+)
+adapter_module = load_source(
+    "ucm/integration/sglang/ucm_direct_store_adapter.py", load_trace=trace_module
+)
 linker_module = load_source(
     "ucm/integration/sglang/ucm_direct_linker.py",
+    load_trace=trace_module,
     **{
         name: getattr(adapter_module, name)
         for name in ("UcmDirectStoreAdapter", "UcmLayerTransfer", "UcmPoolMetadata")

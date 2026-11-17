@@ -11,10 +11,12 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 import numpy as np
 import yaml
 
+from ucm.integration.sglang import load_trace
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
@@ -48,6 +50,7 @@ class UcmLayerTransfer:
     fragments: tuple[tuple[int, int], ...]
     hit_policy: str = "all_pages"
     address_builder: Callable[[int], np.ndarray] | None = None
+    trace: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class _StoreTask:
     task: Task
     # Keep address arrays alive until the native task is reaped.
     addresses: np.ndarray
+    trace: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -843,8 +847,34 @@ class UcmDirectStoreAdapter:
                             addresses,
                         )
                     )
-                    task = operation(*args, **transfer_options)
-                    tasks.append(_StoreTask(item.store, task, addresses))
+                    trace = None
+                    if transfer.trace is not None:
+                        trace = dict(
+                            transfer.trace,
+                            task_trace_id=uuid4().hex,
+                            store_group=transfer.store_group,
+                            layer=logical_layer,
+                            shard=shard_index,
+                        )
+                    try:
+                        task = operation(*args, **transfer_options)
+                    except Exception as error:
+                        load_trace.emit(
+                            "task_submit_failed",
+                            trace,
+                            error_type=type(error).__name__,
+                            block_ids=[key.hex() for key in item.block_ids],
+                            page_keys=list(transfer.page_keys),
+                        )
+                        raise
+                    tasks.append(_StoreTask(item.store, task, addresses, trace))
+                    if trace is not None:
+                        load_trace.emit(
+                            "task_submitted",
+                            trace,
+                            block_ids=[key.hex() for key in item.block_ids],
+                            page_keys=list(transfer.page_keys),
+                        )
             except Exception:
                 # A later layer, batch or group can fail after earlier tasks
                 # started. Reap those handles before their device buffers can
@@ -896,7 +926,11 @@ class UcmDirectStoreAdapter:
         for item in tasks:
             try:
                 item.store.wait(item.task)
+                load_trace.emit("task_completed", item.trace)
             except Exception as error:
+                load_trace.emit(
+                    "task_failed", item.trace, error_type=type(error).__name__
+                )
                 if first_error is None:
                     first_error = error
         if first_error is not None:

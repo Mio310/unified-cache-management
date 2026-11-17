@@ -100,6 +100,50 @@ docker build --build-arg INSTALL_MODE=package \
     ```
 ## Step 2: Configuration
 
+### Direct Linker load tracing
+
+For the UCM **Direct Linker** path, enable request-to-block/task attribution before
+starting the server:
+
+```bash
+export ENABLE_UCM_PATCH=1
+export UCM_SGLANG_LOAD_TRACE=1
+```
+
+Keep the existing Direct Linker launch configuration. These variables do not
+switch a HiCache backend to Direct Linker; the legacy HiCache path is not traced.
+The opt-in patch wraps SGLang's `UnifiedCacheLinkerWrapper.match` and `load_back`
+on every worker and reads the request's top-level `req.session_id`. A missing
+session is logged as `null`, never substituted with the request ID.
+
+At INFO level, lines beginning with `[UCMTrace]` contain JSON events:
+
+| Event | Meaning |
+| --- | --- |
+| `request_match` | A match was evaluated; this alone does not imply a Store load |
+| `load_queued` | A request's transfers were queued with a new `load_attempt_id` |
+| `load_skipped` / `load_rejected` | No transfers, or an already queued request |
+| `load_cancelled` | Queued transfers were cancelled, including during reset |
+| `task_submitted` | A Store task was created, with exact `block_ids` and corresponding `page_keys` |
+| `task_submit_failed` | Store submission raised; includes attempted block IDs |
+| `task_completed` / `task_failed` | Store wait succeeded or raised |
+| `load_completed` / `load_failed` | The request's batch finished successfully or failed |
+
+Filter JSON events by `session_id`, then join on `load_attempt_id` and
+`task_trace_id`. Submission events also include `rid`, `load_batch_id`, worker
+ranks, `store_group`, logical `layer`, and Store-local `shard`. Attempt and task
+IDs are UUIDs, so retries and process restarts do not reuse IDs. Block IDs are
+hex-encoded actual Store keys; tracing does not change cache identity or sharing.
+One block can belong to multiple requests, and one request can create many tasks.
+Batch failure applies to every participating request even if some tasks succeeded.
+
+This traces Store API tasks, including the PipelineStore prepared fast path;
+internal C++ backend IO subtasks are outside its scope. Events use the normal
+logging handlers rather than a persistent index: retain/collect the server logs
+to query them later. A fully cached request may emit match events without tasks.
+Tracing is disabled by default; enable INFO logs and allow for the additional
+volume from recording full key lists per task when enabling it.
+
 ### Feature : Prefix Caching
 
 Create `/path/to/ucm_config.yaml` with exactly one Store entry, using the same
