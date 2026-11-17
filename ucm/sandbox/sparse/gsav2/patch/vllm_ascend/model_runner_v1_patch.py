@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import FunctionType
 
+import torch
+
 from ucm.integration.vllm.patch.utils import patch_or_inject, when_imported
 from ucm.logger import init_logger
 
@@ -2303,6 +2305,7 @@ def _patch(mod):
         )
         _patched.__annotations__ = execute_model.__annotations__
         _patched.__kwdefaults__ = execute_model.__kwdefaults__
+        _patched = torch.inference_mode()(_patched)
         patch_or_inject(mod.NPUModelRunner, "execute_model", _patched)
         logger.info("UCM GSA NPUModelRunner.execute_model patch applied")
 
@@ -2316,6 +2319,7 @@ def _patch(mod):
         )
         _patched.__annotations__ = sample_tokens.__annotations__
         _patched.__kwdefaults__ = sample_tokens.__kwdefaults__
+        _patched = torch.inference_mode()(_patched)
         patch_or_inject(mod.NPUModelRunner, "sample_tokens", _patched)
         logger.info("UCM GSA NPUModelRunner.sample_tokens patch applied")
 
