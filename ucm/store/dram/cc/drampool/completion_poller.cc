@@ -53,9 +53,17 @@ void ReportBatchMetrics(CompletionRecord& record)
             break;
         }
         case OpType::LOOKUP: {
-            // Misses are derived from the response vector (every slot starts as
-            // NotFound), keeping the lookup scan and its scan-duration timer free
-            // of bookkeeping.
+            // Query/hit/miss are derived from the response vector (every slot
+            // starts as NotFound), keeping the lookup scan and its
+            // scan-duration timer free of bookkeeping. Query and hit carry the
+            // hit-rate denominator and numerator; rate(hits)/rate(queries)
+            // yields the per-entry hit rate.
+            const auto hitEntries = std::count(record.results.begin(), record.results.end(),
+                                               static_cast<std::uint8_t>(LookupResult::Exists));
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID(kLookupQueryEntriesTotal),
+                                     static_cast<double>(record.results.size()));
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID(kLookupHitEntriesTotal),
+                                     static_cast<double>(hitEntries));
             const auto missEntries = std::count(record.results.begin(), record.results.end(),
                                                 static_cast<std::uint8_t>(LookupResult::NotFound));
             UC::Metrics::UpdateStats(NAME_TO_METRIC_ID(kLookupMissEntriesTotal),

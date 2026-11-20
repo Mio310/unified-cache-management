@@ -35,6 +35,14 @@ using BlockId = std::array<std::byte, 16>; /* 16-byte block hash */
 using TaskHandle = std::size_t;            /* Opaque task token (0 = invalid) */
 
 /**
+ * @brief Sentinel prefix depth for blocks whose chain position is unknown.
+ *
+ * Blocks dumped without a prefix depth keep this value; depth-ordered
+ * eviction policies treat them as the deepest candidates (evicted first).
+ */
+inline constexpr std::uint32_t kUnmarkedPrefixDepth = 0xFFFFFFFFU;
+
+/**
  * @brief Hasher of BlockId
  */
 struct BlockIdHasher {
@@ -52,6 +60,8 @@ struct Shard {
     BlockId owner;            /* Parent block identifier */
     std::size_t index;        /* Shard index inside the block */
     std::vector<void*> addrs; /* Device-side buffer addresses */
+    /* Prefix-chain depth of the block (kUnmarkedPrefixDepth = unmarked) */
+    std::uint32_t prefixPosition{kUnmarkedPrefixDepth};
 };
 
 /**

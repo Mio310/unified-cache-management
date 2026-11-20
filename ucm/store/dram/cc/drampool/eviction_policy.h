@@ -35,6 +35,7 @@ namespace UC::DramPool {
 enum class EvictionPolicyType {
     TTL = 0,
     POSITION,
+    PREFIX_TAIL,
 };
 
 /**

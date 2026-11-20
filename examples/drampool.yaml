@@ -45,14 +45,18 @@ gc:
   interval_ms: 1000
 
 metadata:
-  # Policy used by periodic eviction; supported values: TTL, POSITION.
+  # Policy used by periodic eviction; supported values: TTL, POSITION, PREFIX_TAIL.
   periodic_eviction_policy: TTL
-  # Policy used by deep eviction; supported values: TTL, POSITION.
-  deep_eviction_policy: POSITION
+  # Policy used by deep eviction; supported values: TTL, POSITION, PREFIX_TAIL.
+  # PREFIX_TAIL reclaims blocks from the tail of each prefix chain first,
+  # keeping shared prefix heads cached as long as possible.
+  deep_eviction_policy: PREFIX_TAIL
   # A lookup hit protects the entry from eviction for this duration.
   lease_time_ms: 5000
   # Fraction selected by ratio-based eviction policies; range: [0, 1].
-  default_evict_ratio: 0.0
+  # 0.0 makes the deep path reclaim nothing under NoSpace; 0.2 is the
+  # recommended pairing with PREFIX_TAIL.
+  default_evict_ratio: 0.2
   # Keep internal metadata eviction deferred until buffer reclamation is wired.
   evict_period_ms: 31536000000
 

@@ -113,9 +113,9 @@ protected:
         g_config = std::move(savedConfig_);
     }
 
-    EntryPtr PublishEntry(const BlockId& key)
+    EntryPtr PublishEntry(const BlockId& key, uint32_t position = 0)
     {
-        auto entry = MakeEntry(key, 0, Clock::now() + std::chrono::hours(1),
+        auto entry = MakeEntry(key, position, Clock::now() + std::chrono::hours(1),
                                EntryStatus::INITIALIZED, 0, {}, kValueLength);
         EXPECT_TRUE(metadata_->StoreBegin(key, entry).Success());
         EXPECT_TRUE(metadata_->StoreEnd(key).Success());
@@ -233,6 +233,30 @@ TEST_F(TaskWorkerTest, DuplicateDumpIsIdempotent)
     EXPECT_EQ(record.stage, CompletionStage::SubmitResponse);
     EXPECT_EQ(record.results, (std::vector<std::uint8_t>{DumpLoadCode(DumpLoadResult::Ok)}));
     EXPECT_TRUE(metadata_->Exist(key));
+}
+
+TEST_F(TaskWorkerTest, DuplicateDumpKeepsStoredPrefixDepth)
+{
+    const auto key = KeyFromHex("a1");
+    const auto entry = PublishEntry(key, /*position=*/9);
+
+    // A duplicated dump carries a different pos on the wire; chain hashing
+    // guarantees one depth per BlockId, so the server keeps the stored depth.
+    KvDumpRequest request;
+    request.opcode = OpType::DUMP;
+    request.request_id = kRequestId;
+    request.resp_addr = kResponseAddress;
+    request.entries = {
+        {key, 0x1000, kValueLength, 0, /*pos=*/7}
+    };
+    request.batch_size = static_cast<std::uint16_t>(request.entries.size());
+    ASSERT_TRUE(ProcessDump(request).Success());
+
+    const auto record = PopCompletion();
+    EXPECT_EQ(record.stage, CompletionStage::SubmitResponse);
+    EXPECT_EQ(record.results, (std::vector<std::uint8_t>{DumpLoadCode(DumpLoadResult::Ok)}));
+    EXPECT_TRUE(metadata_->Exist(key));
+    EXPECT_EQ(entry->position, 9U);
 }
 
 TEST_F(TaskWorkerTest, DumpStopsAfterFirstStoreBeginFailure)

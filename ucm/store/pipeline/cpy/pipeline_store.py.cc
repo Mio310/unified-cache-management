@@ -135,7 +135,8 @@ class PipelineStore {
     }
     static Detail::TaskDesc MakeTaskDesc(const pybind11::buffer& ids,
                                          const pybind11::buffer& indexes,
-                                         const pybind11::buffer& addrs)
+                                         const pybind11::buffer& addrs,
+                                         const pybind11::object& positions)
     {
         BufferArrayView<Detail::BlockId> idArr{ids};
         BufferArrayView<size_t> idxArr{indexes};
@@ -144,6 +145,16 @@ class PipelineStore {
             ThrowIfFailed(
                 Status::InvalidParam("invalid dim: {},{},{}", idArr.num, idxArr.num, addrArr.rows));
         }
+        std::vector<std::uint32_t> prefixPositions;
+        if (!positions.is_none()) {
+            const auto positionsBuffer = pybind11::cast<pybind11::buffer>(positions);
+            BufferArrayView<std::uint32_t> posArr{positionsBuffer};
+            if (posArr.num != idArr.num) {
+                ThrowIfFailed(Status::InvalidParam("positions dim: {} != ids dim: {}", posArr.num,
+                                                   idArr.num));
+            }
+            prefixPositions.assign(posArr.data, posArr.data + posArr.num);
+        }
         Detail::TaskDesc desc;
         desc.reserve(idArr.num);
         for (size_t i = 0; i < idArr.num; i++) {
@@ -151,6 +162,9 @@ class PipelineStore {
             shard.owner = *idArr[i];
             shard.index = *idxArr[i];
             shard.addrs.assign(addrArr[i], addrArr[i] + addrArr.cols);
+            shard.prefixPosition = prefixPositions.empty()
+                                       ? Detail::kUnmarkedPrefixDepth
+                                       : prefixPositions[i];
             desc.push_back(std::move(shard));
         }
         return desc;
@@ -242,7 +256,7 @@ public:
                             const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0,
                             bool distribute_backend_load = false)
     {
-        auto desc = MakeTaskDesc(ids, indexes, addrs);
+        auto desc = MakeTaskDesc(ids, indexes, addrs, pybind11::none());
         desc.brief = "Load";
         desc.prerequisiteHandle = prerequisite_handle;
         desc.distributeBackendLoad = distribute_backend_load;
@@ -251,9 +265,10 @@ public:
         ThrowError(res.Error());
     }
     Detail::TaskHandle Dump(const pybind11::buffer& ids, const pybind11::buffer& indexes,
-                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0)
+                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0,
+                            const pybind11::object& positions = pybind11::none())
     {
-        auto desc = MakeTaskDesc(ids, indexes, addrs);
+        auto desc = MakeTaskDesc(ids, indexes, addrs, positions);
         desc.brief = "Dump";
         desc.prerequisiteHandle = prerequisite_handle;
         auto res = StoreBack()->Dump(desc);
@@ -306,7 +321,8 @@ PYBIND11_MODULE(ucmpipelinestore, m)
           py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
           py::arg("distribute_backend_load") = false);
     s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
-          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
+          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
+          py::arg("positions") = py::none());
     s.def("Check", &PipelineStore::Check);
     s.def("Wait", &PipelineStore::Wait);
 }

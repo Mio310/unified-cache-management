@@ -50,6 +50,8 @@ constexpr const char* kCounterNames[] = {
     kDumpNospaceFailuresTotal,
     kDumpFailedEntriesTotal,
     kLoadMissEntriesTotal,
+    kLookupQueryEntriesTotal,
+    kLookupHitEntriesTotal,
     kLookupMissEntriesTotal,
     kTransferFailuresTotal,
     kResponseFailuresTotal,

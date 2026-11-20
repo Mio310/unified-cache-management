@@ -160,7 +160,9 @@ Status TaskWorker::ProcessDump(const KvDumpRequest& request,
         metadataEntry->key = entry.key;
         metadataEntry->size = entry.len;
         metadataEntry->lifeTimeout = lifeTimeout;
-        metadataEntry->position = entry.idx;
+        // Prefix-chain depth straight from the wire; the unmarked sentinel is
+        // passed through so unmarked blocks stay deepest for PREFIX_TAIL.
+        metadataEntry->position = entry.pos;
 
         const auto storeStatus = runtime_.metadata.StoreBegin(entry.key, metadataEntry);
         if (storeStatus == Status::DuplicateKey()) {

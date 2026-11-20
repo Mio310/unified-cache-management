@@ -216,6 +216,7 @@ std::vector<IoEntry> TaskManager::NormalizeTransfer(const Detail::TaskDesc& task
             entry.shardId = static_cast<std::uint32_t>(shard.index * tensorCount + tensorIndex);
             entry.buffer = BufferRef{reinterpret_cast<std::uintptr_t>(shard.addrs[tensorIndex]),
                                      config_.tensorSizes[tensorIndex]};
+            entry.prefixPosition = shard.prefixPosition;
             entries.push_back(std::move(entry));
         }
     }

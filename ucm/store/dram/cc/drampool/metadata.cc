@@ -27,6 +27,7 @@
 #include "drampool_metrics.h"
 #include "logger/logger.h"
 #include "pos_eviction_policy.h"
+#include "prefix_tail_eviction_policy.h"
 #include "ttl_eviction_policy.h"
 
 namespace UC::DramPool {
@@ -36,6 +37,7 @@ std::unique_ptr<EvictionPolicy> CreateEvictionPolicy(EvictionPolicyType type)
     switch (type) {
         case EvictionPolicyType::TTL: return std::make_unique<TtlEvictionPolicy>();
         case EvictionPolicyType::POSITION: return std::make_unique<PosEvictionPolicy>();
+        case EvictionPolicyType::PREFIX_TAIL: return std::make_unique<PrefixTailEvictionPolicy>();
         default: break;
     }
     UC_ERROR("CreateEvictionPolicy: invalid EvictionPolicyType {}, fallback to TTL.",

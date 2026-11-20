@@ -60,6 +60,8 @@ inline constexpr char kLoadPrepareDurationMs[] = "drampool_load_prepare_duration
 inline constexpr char kLoadMetadataDurationMs[] = "drampool_load_metadata_duration_ms";
 inline constexpr char kLoadSubmitDurationMs[] = "drampool_load_submit_duration_ms";
 // D. Lookup business
+inline constexpr char kLookupQueryEntriesTotal[] = "drampool_lookup_query_entries_total";
+inline constexpr char kLookupHitEntriesTotal[] = "drampool_lookup_hit_entries_total";
 inline constexpr char kLookupMissEntriesTotal[] = "drampool_lookup_miss_entries_total";
 inline constexpr char kLookupScanDurationMs[] = "drampool_lookup_scan_duration_ms";
 // E. Transfer and response. The transfer/RTT histograms run from submission to
@@ -199,6 +201,8 @@ inline const std::vector<DrampoolMetricDef>& DrampoolMetricDefs()
         {kLoadMetadataDurationMs, "histogram", kMsBucketsPrepare, std::size(kMsBucketsPrepare)},
         {kLoadSubmitDurationMs, "histogram", kMsBucketsSettlement, std::size(kMsBucketsSettlement)},
         // D. Lookup business
+        {kLookupQueryEntriesTotal, "counter"},
+        {kLookupHitEntriesTotal, "counter"},
         {kLookupMissEntriesTotal, "counter"},
         {kLookupScanDurationMs, "histogram", kMsBucketsScan, std::size(kMsBucketsScan)},
         // E. Transfer and response

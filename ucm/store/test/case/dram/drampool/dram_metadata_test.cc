@@ -332,6 +332,57 @@ TEST_F(UCShardMetadataTest, TryDeleteFailsWhenRefCntNonZero)
     EXPECT_EQ(entry->status, EntryStatus::READY);
 }
 
+TEST_F(UCShardMetadataTest, DeepPrefixTailEvictsDeepestEntryAndDeleteKeepsIndexesConsistent)
+{
+    ShardMetadata md(MakeConfig(EvictionPolicyType::TTL, EvictionPolicyType::PREFIX_TAIL));
+    auto kHead = KeyFromHex("a1");
+    auto kMid = KeyFromHex("a2");
+    auto kTail = KeyFromHex("a3");
+    auto head = MakeEntry(kHead, 0, future_, EntryStatus::INITIALIZED);
+    auto mid = MakeEntry(kMid, 2, future_, EntryStatus::INITIALIZED);
+    auto tail = MakeEntry(kTail, 5, future_, EntryStatus::INITIALIZED);
+    ASSERT_TRUE(md.StoreBegin(kHead, head).Success());
+    ASSERT_TRUE(md.StoreBegin(kMid, mid).Success());
+    ASSERT_TRUE(md.StoreBegin(kTail, tail).Success());
+    ASSERT_TRUE(md.StoreEnd(kHead).Success());
+    ASSERT_TRUE(md.StoreEnd(kMid).Success());
+    ASSERT_TRUE(md.StoreEnd(kTail).Success());
+
+    auto victims = md.EvictDeep(1.0 / 3.0);
+    ASSERT_EQ(victims.size(), 1UL);
+    EXPECT_EQ(victims[0]->key, kTail);
+
+    // Deleting the victim removes it from both policy indexes.
+    ASSERT_TRUE(md.Delete(kTail).Success());
+    EXPECT_EQ(md.GetKeyCnt(), 2UL);
+
+    auto rest = md.EvictDeep(1.0);
+    ASSERT_EQ(rest.size(), 2UL);
+    EXPECT_EQ(rest[0]->key, kMid);
+    EXPECT_EQ(rest[1]->key, kHead);
+}
+
+TEST_F(UCShardMetadataTest, TtlPeriodicAndPrefixTailDeepSplitExpiryAndDepth)
+{
+    ShardMetadata md(MakeConfig(EvictionPolicyType::TTL, EvictionPolicyType::PREFIX_TAIL));
+    auto kExpired = KeyFromHex("a1");  // expired shallow head
+    auto kDeep = KeyFromHex("a2");     // unexpired deep tail
+    auto expired = MakeEntry(kExpired, 0, past_, EntryStatus::INITIALIZED);
+    auto deep = MakeEntry(kDeep, 7, future_, EntryStatus::INITIALIZED);
+    ASSERT_TRUE(md.StoreBegin(kExpired, expired).Success());
+    ASSERT_TRUE(md.StoreBegin(kDeep, deep).Success());
+    ASSERT_TRUE(md.StoreEnd(kExpired).Success());
+    ASSERT_TRUE(md.StoreEnd(kDeep).Success());
+
+    auto periodic = md.EvictPeriodic(1.0);
+    ASSERT_EQ(periodic.size(), 1UL);
+    EXPECT_EQ(periodic[0]->key, kExpired);
+
+    auto deepVictims = md.EvictDeep(1.0);
+    ASSERT_EQ(deepVictims.size(), 1UL);
+    EXPECT_EQ(deepVictims[0]->key, kDeep);
+}
+
 class UCMetadataManagerTest : public testing::Test {
 protected:
     static void SetUpTestSuite()

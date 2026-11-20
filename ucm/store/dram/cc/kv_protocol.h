@@ -51,8 +51,9 @@ constexpr std::size_t kKvLookupRequestHeaderSize =
 constexpr std::size_t kKvDumpRequestHeaderSize = sizeof(std::uint8_t) + sizeof(std::uint64_t) +
                                                  sizeof(std::uint64_t) + sizeof(std::uint32_t) +
                                                  sizeof(std::uint16_t);
-constexpr std::size_t kKvDumpEntrySize =
-    kKvKeySize + sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t);
+constexpr std::size_t kKvDumpEntrySize = kKvKeySize + sizeof(std::uint64_t) +
+                                         sizeof(std::uint32_t) + sizeof(std::uint32_t) +
+                                         sizeof(std::uint32_t);
 constexpr std::size_t kKvLoadEntrySize =
     kKvKeySize + sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t);
 constexpr std::size_t kKvLookupEntrySize = kKvKeySize;
@@ -72,6 +73,8 @@ constexpr std::size_t kDumpLoadEntryKeyOffset = 0;
 constexpr std::size_t kDumpLoadEntryAddrOffset = 16;
 constexpr std::size_t kDumpLoadEntryLenOffset = 24;
 constexpr std::size_t kDumpLoadEntryIdxOffset = 28;
+// Dump entries only: prefix-chain depth used by depth-ordered eviction.
+constexpr std::size_t kDumpLoadEntryPosOffset = 32;
 
 constexpr std::size_t kLookupEntryKeyOffset = 0;
 
@@ -81,6 +84,9 @@ public:
     std::uint64_t addr{0};
     std::uint32_t len{0};
     std::uint32_t idx{0};
+    // Prefix-chain depth of the block; unmarked blocks keep the sentinel depth
+    // and are treated as the deepest eviction candidates.
+    std::uint32_t pos{UC::Detail::kUnmarkedPrefixDepth};
 };
 
 class KvLoadEntry {

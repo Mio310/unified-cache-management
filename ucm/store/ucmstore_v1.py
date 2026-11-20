@@ -197,6 +197,7 @@ class UcmKVStoreBaseV1(ABC):
         shard_index: List[int],
         src_addr: List[List[int]] | np.ndarray,
         prerequisite_handle: int = 0,
+        positions: List[int] | None = None,
     ) -> Task:
         """Low-level dump: copy KV data from device pointers.
 
@@ -206,6 +207,10 @@ class UcmKVStoreBaseV1(ABC):
             src_addr: Double-list of ``int`` pointers to device buffers.
             prerequisite_handle: Optional event handle for Python-C++ stream sync.
                 When non-zero, cache stream waits for this event before D2H.
+            positions: Optional prefix-chain depth of each block (same length
+                as ``block_ids``). Depth-ordered eviction (PREFIX_TAIL) evicts
+                the deepest blocks first. ``None`` leaves every block
+                unmarked, which the store treats as the deepest candidates.
 
         Returns:
             A ``Task`` handle for the asynchronous copy.

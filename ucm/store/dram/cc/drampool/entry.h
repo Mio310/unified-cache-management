@@ -67,6 +67,10 @@ struct Entry {
 
     // Attributes for eviction
     std::chrono::system_clock::time_point lifeTimeout{};
+    // Prefix-chain depth of the block (prefixDepth semantics): assigned once
+    // from the DUMP wire entry, ordered by depth-descending eviction policies
+    // (PREFIX_TAIL) so shallower blocks survive longer. Blocks dumped without
+    // a depth keep Detail::kUnmarkedPrefixDepth and sort as the deepest.
     uint32_t position{0};
 
     bool IsInitial()

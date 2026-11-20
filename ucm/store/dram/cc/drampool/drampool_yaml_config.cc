@@ -149,6 +149,10 @@ Status ParseEvictionPolicyValue(const std::string& key, const std::string& value
         output = EvictionPolicyType::POSITION;
         return Status::OK();
     }
+    if (normalized == "prefix_tail") {
+        output = EvictionPolicyType::PREFIX_TAIL;
+        return Status::OK();
+    }
     return Status::InvalidParam("unsupported eviction policy for {}: {}", key, value);
 }
 

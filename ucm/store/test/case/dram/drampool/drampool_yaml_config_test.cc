@@ -195,6 +195,45 @@ TEST(DramPoolRuntimeYamlTest, LoadsConfiguredEvictionPoliciesCaseInsensitively)
     EXPECT_EQ(config.metadataDeepEvictionPolicy, EvictionPolicyType::TTL);
 }
 
+TEST(DramPoolRuntimeYamlTest, LoadsPrefixTailEvictionPoliciesCaseInsensitively)
+{
+    for (const auto* deepValue : {"prefix_tail", "PREFIX_TAIL"}) {
+        auto yamlText = ReplaceOnce(ValidRuntimeYaml(), "deep_eviction_policy: POSITION",
+                                    std::string("deep_eviction_policy: ") + deepValue);
+        auto config = LaunchConfig();
+        RuntimeYamlFile yaml(yamlText);
+
+        const auto status = ParseYamlConfig(yaml.Path().string(), config);
+
+        ASSERT_TRUE(status.Success()) << status.ToString() << deepValue;
+        EXPECT_EQ(config.metadataDeepEvictionPolicy, EvictionPolicyType::PREFIX_TAIL);
+    }
+
+    auto yamlText = ReplaceOnce(ValidRuntimeYaml(), "periodic_eviction_policy: TTL",
+                                 "periodic_eviction_policy: prefix_tail");
+    auto config = LaunchConfig();
+    RuntimeYamlFile yaml(yamlText);
+
+    const auto status = ParseYamlConfig(yaml.Path().string(), config);
+
+    ASSERT_TRUE(status.Success()) << status.ToString();
+    EXPECT_EQ(config.metadataPeriodicEvictionPolicy, EvictionPolicyType::PREFIX_TAIL);
+}
+
+TEST(DramPoolRuntimeYamlTest, PrefixTailOmittedKeepsExistingDefaults)
+{
+    // The baseline YAML (no prefix_tail keys) keeps the historical defaults.
+    auto config = LaunchConfig();
+    RuntimeYamlFile yaml(ValidRuntimeYaml());
+
+    const auto status = ParseYamlConfig(yaml.Path().string(), config);
+
+    ASSERT_TRUE(status.Success()) << status.ToString();
+    EXPECT_EQ(config.metadataPeriodicEvictionPolicy, EvictionPolicyType::TTL);
+    EXPECT_EQ(config.metadataDeepEvictionPolicy, EvictionPolicyType::POSITION);
+    EXPECT_DOUBLE_EQ(config.metadataDefaultEvictRatio, 0.0);
+}
+
 TEST(DramPoolRuntimeYamlTest, RejectsMissingUnknownAndDuplicateKeys)
 {
     const std::vector<std::pair<std::string, std::string>> cases = {
@@ -266,6 +305,8 @@ INSTANTIATE_TEST_SUITE_P(
                         "periodic_eviction_policy: LRU", "unsupported eviction policy"},
         InvalidYamlCase{"UnsupportedDeepEvictionPolicy", "deep_eviction_policy: POSITION",
                         "deep_eviction_policy: LFU", "unsupported eviction policy"},
+        InvalidYamlCase{"UnsupportedPrefixTailPolicy", "deep_eviction_policy: POSITION",
+                        "deep_eviction_policy: foo", "unsupported eviction policy"},
         InvalidYamlCase{"EvictRatioAboveOne", "default_evict_ratio: 0.0",
                         "default_evict_ratio: 1.1", "must be in [0, 1]"},
         InvalidYamlCase{"EmptyLogDirectory", "dir: ./logs", "dir: ''", "must not be empty"}),

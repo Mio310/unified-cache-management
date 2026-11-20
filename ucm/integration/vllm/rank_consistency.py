@@ -232,6 +232,7 @@ class RankConsistencyManager:
         shard_indices: list[int],
         ptrs: Any,
         event_handle: int,
+        positions: list[int] | None = None,
     ) -> Any:
         """Track submitted blocks and the Store used by each dump task."""
         request_context = (
@@ -247,7 +248,9 @@ class RankConsistencyManager:
                 request_block_ids
             )
         try:
-            task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            task = store.dump_data(
+                block_ids, shard_indices, ptrs, event_handle, positions
+            )
         except Exception:
             self._record_dump_failure(request_context)
             raise

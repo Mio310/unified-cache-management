@@ -44,6 +44,13 @@ void PackDumpLoadEntry(std::uint8_t* output, const Entry& entry)
     std::memcpy(output + kDumpLoadEntryIdxOffset, &entry.idx, sizeof(entry.idx));
 }
 
+// Dump entries carry the prefix depth after the shared 36-byte prefix.
+void PackDumpEntry(std::uint8_t* output, const KvDumpEntry& entry)
+{
+    PackDumpLoadEntry(output, entry);
+    std::memcpy(output + kDumpLoadEntryPosOffset, &entry.pos, sizeof(entry.pos));
+}
+
 template <typename Entry>
 Status ValidateDumpLoadEntry(const Entry& entry, const char* protocol, std::size_t index)
 {
@@ -71,6 +78,16 @@ Status UnpackDumpLoadEntry(const std::uint8_t* input, Entry& entry, const char* 
     std::memcpy(&entry.len, input + kDumpLoadEntryLenOffset, sizeof(entry.len));
     std::memcpy(&entry.idx, input + kDumpLoadEntryIdxOffset, sizeof(entry.idx));
     return ValidateDumpLoadEntry(entry, protocol, index);
+}
+
+// Any prefix depth is valid on the wire, including the unmarked sentinel.
+Status UnpackDumpEntry(const std::uint8_t* input, KvDumpEntry& entry, const char* protocol,
+                       std::size_t index)
+{
+    auto status = UnpackDumpLoadEntry(input, entry, protocol, index);
+    if (status.Failure()) { return status; }
+    std::memcpy(&entry.pos, input + kDumpLoadEntryPosOffset, sizeof(entry.pos));
+    return status;
 }
 
 std::size_t GetPackedResultSize(std::size_t resultCount, std::size_t resultBitWidth)
@@ -235,7 +252,7 @@ Status KvDumpProtocol::PackRequest(const KvRequest& req, void* target)
     for (std::size_t i = 0; i < r.entries.size(); ++i) {
         const auto& entry = r.entries[i];
         std::uint8_t* base = out + kKvDumpRequestHeaderSize + i * kKvDumpEntrySize;
-        PackDumpLoadEntry(base, entry);
+        PackDumpEntry(base, entry);
     }
     return Status::OK();
 }
@@ -284,7 +301,7 @@ Status KvDumpProtocol::UnpackRequest(const void* data, std::size_t size,
     req->entries.resize(req->batch_size);
     for (std::size_t i = 0; i < req->batch_size; ++i) {
         const std::uint8_t* base = bytes + kKvDumpRequestHeaderSize + i * kKvDumpEntrySize;
-        if (auto status = UnpackDumpLoadEntry(base, req->entries[i], "Dump", i); status.Failure()) {
+        if (auto status = UnpackDumpEntry(base, req->entries[i], "Dump", i); status.Failure()) {
             return status;
         }
     }

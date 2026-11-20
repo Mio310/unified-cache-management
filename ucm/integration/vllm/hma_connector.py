@@ -48,6 +48,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Sentinel prefix depth: blocks without a known chain position are treated as
+# the deepest candidates by the store's PREFIX_TAIL eviction policy.
+_UNMARKED_PREFIX_DEPTH = 0xFFFFFFFF
+
 
 def _ascend_fawa_hash_suffix(
     vllm_config, kv_cache_config, group_metas, whole_page_sizes
@@ -1008,6 +1012,22 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         """
         first_index = (self.dump_owner_rank - dump_block_start) % self.dump_owner_size
         return slice(first_index, None, self.dump_owner_size)
+
+    def _dump_positions(self, request, count: int) -> list[int]:
+        """Prefix-chain depth for each dumped key of one FAWA request.
+
+        Depth = dump_hash_start + in-batch chain index. The owner slice keeps
+        every dump_owner_size-th key starting at first_index, so sliced index
+        k maps to chain index first_index + k * dump_owner_size. Requests
+        without a dump start fall back to the unmarked sentinel depth.
+        """
+        start = getattr(request, "dump_hash_start", None)
+        if start is None or count == 0:
+            return [_UNMARKED_PREFIX_DEPTH] * count
+        key_slice = self._get_mla_dump_slice(start)
+        first = key_slice.start if key_slice.start is not None else 0
+        step = key_slice.step if key_slice.step is not None else 1
+        return [start + first + k * step for k in range(count)]
 
     @staticmethod
     def ascend_compression_ratio(spec) -> int:
@@ -2329,6 +2349,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         ptrs: np.ndarray,
         event_handle: int,
         block_ids_by_request: dict[str, set[bytes]],
+        positions: list[int] | None = None,
     ) -> FAWADumpTask:
         """Submit one store dump for FA or WA rows."""
 
@@ -2340,6 +2361,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             shard_indices,
             ptrs,
             event_handle,
+            positions=positions,
         )
         return FAWADumpTask(
             label=label,
@@ -2635,6 +2657,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         fa_dump_keys: list[bytes] = []
         wa_dump_keys: list[bytes] = []
+        fa_dump_positions: list[int] = []
+        wa_dump_positions: list[int] = []
         fa_ptr_rows: list[np.ndarray] = []
         wa_ptr_rows: list[np.ndarray] = []
         dump_request_ids: tuple[str] = ()
@@ -2666,6 +2690,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     )
 
                     fa_dump_keys.extend(tp_dump_keys)
+                    fa_dump_positions.extend(
+                        self._dump_positions(request, len(tp_dump_keys))
+                    )
                     fa_ptr_rows.append(
                         self._extract_fa_ptr(
                             tp_dump_keys,
@@ -2698,6 +2725,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                             )
                         )
                         wa_dump_keys.extend(tp_dump_keys)
+                        wa_dump_positions.extend(
+                            self._dump_positions(request, len(tp_dump_keys))
+                        )
                         wa_ptr_rows.append(
                             self._extract_wa_ptr(
                                 tp_dump_keys,
@@ -2708,6 +2738,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     request_wa_dump_keys = request.dump_keys[-1:]
                     wa_dump_blocks_by_request[request_id] = set(request_wa_dump_keys)
                     wa_dump_keys.extend(request_wa_dump_keys)
+                    # Chunk-wise WA dumps the request's final boundary block.
+                    wa_dump_positions.append(request.dump_hash_end - 1)
                     wa_ptr_rows.append(
                         self._extract_wa_ptr(
                             request_wa_dump_keys,
@@ -2722,6 +2754,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 dump_request_ids += (request_id,)
                 fa_dump_blocks_by_request[request_id] = set(request.dump_keys)
                 fa_dump_keys.extend(request.dump_keys)
+                fa_dump_positions.extend(
+                    self._dump_positions(request, len(request.dump_keys))
+                )
                 fa_ptr_rows.append(
                     self._extract_fa_ptr(
                         request.dump_keys,
@@ -2735,6 +2770,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 if self.wa_dump_block_wise:
                     wa_dump_blocks_by_request[request_id] = set(request.dump_keys)
                     wa_dump_keys.extend(request.dump_keys)
+                    wa_dump_positions.extend(
+                        self._dump_positions(request, len(request.dump_keys))
+                    )
                     wa_ptr_rows.append(
                         self._extract_wa_ptr(
                             request.dump_keys,
@@ -2745,6 +2783,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     request_wa_dump_keys = request.dump_keys[-1:]
                     wa_dump_blocks_by_request[request_id] = set(request_wa_dump_keys)
                     wa_dump_keys.extend(request_wa_dump_keys)
+                    # Chunk-wise WA dumps the request's final boundary block.
+                    wa_dump_positions.append(request.dump_hash_end - 1)
                     wa_ptr_rows.append(
                         self._extract_wa_ptr(
                             request_wa_dump_keys,
@@ -2763,6 +2803,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     fa_ptrs,
                     event_handle,
                     fa_dump_blocks_by_request,
+                    positions=fa_dump_positions,
                 )
                 self.tp_dump_tasks.setdefault(dump_request_ids, []).append(fa_dump_task)
                 save_bytes += fa_dump_task.key_count * self.file_size["FA"]
@@ -2781,6 +2822,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     window_ptrs,
                     event_handle,
                     wa_dump_blocks_by_request,
+                    positions=wa_dump_positions,
                 )
                 self.tp_dump_tasks.setdefault(dump_request_ids, []).append(wa_dump_task)
                 save_bytes += wa_dump_task.key_count * self.file_size["WA"]

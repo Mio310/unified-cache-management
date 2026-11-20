@@ -46,6 +46,17 @@ Detail::BlockId StorageKey(const Detail::BlockId& blockId, std::uint32_t shardId
     return result;
 }
 
+// Dump wire entries carry the prefix depth; load entries have no such field.
+void FillPosField(DramPool::KvDumpEntry& target, const IoEntry& source)
+{
+    target.pos = source.prefixPosition;
+}
+
+template <typename RequestEntry>
+void FillPosField(RequestEntry& /*target*/, const IoEntry& /*source*/)
+{
+}
+
 template <typename RequestEntry>
 void FillTransferEntries(const std::vector<IoEntry>& entries,
                          std::vector<RequestEntry>& requestEntries)
@@ -59,6 +70,7 @@ void FillTransferEntries(const std::vector<IoEntry>& entries,
         target.addr = source.buffer.address;
         target.len = static_cast<std::uint32_t>(source.buffer.length);
         target.idx = source.shardId;
+        FillPosField(target, source);
     }
 }
 

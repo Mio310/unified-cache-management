@@ -287,6 +287,11 @@ def _record_counter(name: str, value: float = 1.0) -> None:
     ucmmetrics.update_stats({name: value})
 
 
+# Sentinel prefix depth: blocks without a known chain position are treated as
+# the deepest candidates by the store's PREFIX_TAIL eviction policy.
+_UNMARKED_PREFIX_DEPTH = 0xFFFFFFFF
+
+
 def _record_connector_interface_duration(func):
     metric_name = f"connector_{func.__name__}_duration_ms"
 
@@ -1868,6 +1873,27 @@ class UCMDirectConnector(KVConnectorBase_V1):
             keys, blocks = _drop_null_vllm_blocks(keys, blocks, "UCM rank dump")
         return keys, blocks
 
+    def _dump_positions(self, request, count: int) -> list[int]:
+        """Prefix-chain depth for each dumped block of one request.
+
+        Depth = dump_block_start + in-batch chain index. The MLA dump slice
+        keeps every tp_size-th block starting at first_index, so sliced index
+        k maps to chain index first_index + k * tp_size. Non-MLA dumps emit
+        cp_world_size entries per chain block, all sharing the block's depth.
+        Requests without a dump start fall back to the unmarked sentinel
+        depth, which the store treats as the deepest eviction candidates.
+        """
+        start = getattr(request, "dump_block_start", None)
+        if start is None:
+            return [_UNMARKED_PREFIX_DEPTH] * count
+        if self.is_mla:
+            key_slice = self._get_mla_dump_slice(start)
+            first = key_slice.start if key_slice.start is not None else 0
+            step = key_slice.step if key_slice.step is not None else 1
+            return [start + first + k * step for k in range(count)]
+        cp = getattr(self, "cp_world_size", 1) or 1
+        return [(start + j // cp) for j in range(count)]
+
     def _create_store(
         self,
         kv_cache_layout: Optional[KVCacheLayout],
@@ -2668,6 +2694,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         is_save = False
         num_saved_block = 0
         total_ucm_block_ids, total_vllm_block_ids = [], []
+        total_positions: list[int] = []
         dump_request_ids: set[str] = set()
         block_ids_by_request: dict[str, set[bytes]] = {}
         for request_id, request in metadata.request_meta.items():
@@ -2688,6 +2715,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 ]
             total_ucm_block_ids.extend(store_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
+            total_positions.extend(self._dump_positions(request, len(store_block_ids)))
 
         if is_save:
             event_handle = 0
@@ -2705,6 +2733,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     shard_indexs,
                     total_ptrs,
                     event_handle,
+                    positions=total_positions,
                 )
             except Exception as e:
                 logger.error(f"dump kv cache failed. {type(e).__name__}: {e}")
@@ -3088,6 +3117,17 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             )
             for request_id in dump_request_ids
         }
+        # Layerwise dumps share the per-request rank slice with the batch path,
+        # so the same dump-block-start arithmetic derives each block's depth.
+        # request_meta preserves insertion order, matching how the caller
+        # assembled total_ucm_block_ids, so positions stay aligned.
+        positions: list[int] = []
+        for request_id, request in metadata.request_meta.items():
+            if request_id not in dump_request_ids:
+                continue
+            positions.extend(
+                self._dump_positions(request, len(self._get_rank_dump_blocks(request)[0]))
+            )
         local_layer_id = layer_id - self.first_layer_id
         if self.dump_total_ptrs is None:
             self.dump_total_ptrs = self.kv_cache_layout.extract_block_addrs(
@@ -3107,6 +3147,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 shard_indexs,
                 layer_ptrs,
                 event_handle,
+                positions=positions,
             )
             self._pending_dump_tasks.append(
                 PendingDumpTask(

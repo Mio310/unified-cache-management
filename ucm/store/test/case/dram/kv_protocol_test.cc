@@ -78,6 +78,7 @@ TEST_F(UCDramKvProtocolTest, PackDumpRequestMatchesLayout)
     entry.addr = 0x1122334455667788ULL;
     entry.len = 0xAABBCCDD;
     entry.idx = 0x12345678;
+    entry.pos = 0xCAFEBABEU;
 
     KvDumpRequest req;
     req.opcode = OpType::DUMP;
@@ -102,6 +103,7 @@ TEST_F(UCDramKvProtocolTest, PackDumpRequestMatchesLayout)
     ExpectLe64(packed, kKvDumpRequestHeaderSize + 16, entry.addr);
     ExpectLe32(packed, kKvDumpRequestHeaderSize + 24, entry.len);
     ExpectLe32(packed, kKvDumpRequestHeaderSize + 28, entry.idx);
+    ExpectLe32(packed, kKvDumpRequestHeaderSize + kDumpLoadEntryPosOffset, entry.pos);
 }
 
 TEST_F(UCDramKvProtocolTest, PackLoadRequestMatchesLayout)
@@ -350,6 +352,72 @@ TEST_F(UCDramKvProtocolTest, ServerRoundTripLookup)
     ASSERT_TRUE(mgr_.UnpackResponse(flag.data(), req.opcode, req.request_id, req.batch_size, resp2)
                     .Success());
     EXPECT_EQ(resp2.results, resp.results);
+}
+
+// ---------------------------------------------------------------------------
+// Dump entry prefix depth (pos): pack/unpack round-trips and entry sizes
+// ---------------------------------------------------------------------------
+
+TEST_F(UCDramKvProtocolTest, DumpEntryPosRoundTrips)
+{
+    for (const auto pos : {0x00000000U, 0x00000042U, 0xFFFFFFFFU}) {
+        KvDumpEntry entry;
+        entry.key = KeyFromHex("60");
+        entry.addr = 0x1000;
+        entry.len = 0x40;
+        entry.idx = 0;
+        entry.pos = pos;
+
+        KvDumpRequest req;
+        req.opcode = OpType::DUMP;
+        req.request_id = kRequestId;
+        req.resp_addr = 0x1000;
+        req.batch_size = 1;
+        req.ttl = 0;
+        req.entries = {entry};
+
+        std::vector<std::uint8_t> packed(mgr_.GetPackedRequestSize(req.opcode, req), 0);
+        ASSERT_TRUE(mgr_.PackRequest(packed.data(), req.opcode, req).Success());
+
+        std::unique_ptr<KvRequest> parsed;
+        ASSERT_TRUE(mgr_.UnpackRequest(packed.data(), packed.size(), parsed).Success());
+        auto& dump = static_cast<KvDumpRequest&>(*parsed);
+        ASSERT_EQ(dump.entries.size(), 1UL);
+        EXPECT_EQ(dump.entries[0].pos, pos);
+    }
+}
+
+TEST_F(UCDramKvProtocolTest, DumpEntryPosDefaultsToUnmarkedSentinel)
+{
+    KvDumpEntry entry;  // pos left at its default
+    entry.key = KeyFromHex("70");
+    entry.addr = 0x1000;
+    entry.len = 0x40;
+    EXPECT_EQ(entry.pos, UC::Detail::kUnmarkedPrefixDepth);
+
+    KvDumpRequest req;
+    req.opcode = OpType::DUMP;
+    req.request_id = kRequestId;
+    req.resp_addr = 0x1000;
+    req.batch_size = 1;
+    req.ttl = 0;
+    req.entries = {entry};
+
+    std::vector<std::uint8_t> packed(mgr_.GetPackedRequestSize(req.opcode, req), 0);
+    ASSERT_TRUE(mgr_.PackRequest(packed.data(), req.opcode, req).Success());
+
+    std::unique_ptr<KvRequest> parsed;
+    ASSERT_TRUE(mgr_.UnpackRequest(packed.data(), packed.size(), parsed).Success());
+    auto& dump = static_cast<KvDumpRequest&>(*parsed);
+    EXPECT_EQ(dump.entries[0].pos, 0xFFFFFFFFU);
+}
+
+TEST_F(UCDramKvProtocolTest, DumpEntrySizeCoversPosWhileLoadEntryStaysLean)
+{
+    EXPECT_EQ(kKvDumpEntrySize, 40U);
+    EXPECT_EQ(kKvLoadEntrySize, 36U);
+    EXPECT_EQ(kDumpLoadEntryPosOffset, 32U);
+    EXPECT_EQ(kKvDumpEntrySize, kKvLoadEntrySize + sizeof(std::uint32_t));
 }
 
 // ---------------------------------------------------------------------------

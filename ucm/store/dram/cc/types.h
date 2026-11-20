@@ -83,6 +83,9 @@ struct IoEntry {
     std::uint32_t shardId{0};
     BufferRef buffer;
     std::size_t originalIndex{0};
+    // Prefix-chain depth carried into DUMP wire entries; the sentinel marks
+    // blocks whose depth was not provided by the caller.
+    std::uint32_t prefixPosition{Detail::kUnmarkedPrefixDepth};
 };
 
 struct EntryResult {
