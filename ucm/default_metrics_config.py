@@ -548,6 +548,14 @@ _COUNTER_METRICS = [
         "Total LOOKUP requests received and processed by DramPool",
     ),
     (
+        "drampool_lookup_query_entries_total",
+        "Total LOOKUP entries scanned by DramPool (hit-rate denominator)",
+    ),
+    (
+        "drampool_lookup_hit_entries_total",
+        "LOOKUP entries found and READY in DramPool (hit-rate numerator)",
+    ),
+    (
         "drampool_dump_nospace_failures_total",
         "DUMP entries whose buffer allocation finally failed with NoSpace after eviction retries (registration failures excluded)",
     ),

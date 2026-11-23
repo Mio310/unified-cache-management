@@ -64,6 +64,7 @@ public:
 private:
     void Run() noexcept;
     void CollectAndWrite() noexcept;
+    void LogLookupHitRate();
     std::string Render() const;
     void RenderHistogram(std::ostringstream& output, const DrampoolMetricDef& def) const;
     void WriteFile(const std::string& content) const;
@@ -83,6 +84,10 @@ private:
         double sum{0.0};
     };
     std::unordered_map<std::string, HistogramState> histogramValues_;
+    // Last cumulative lookup totals already written to the log. The reporter
+    // thread is the only writer, so these need no extra synchronization.
+    double loggedLookupQueries_{-1.0};
+    double loggedLookupHits_{-1.0};
     std::thread worker_;
 };
 

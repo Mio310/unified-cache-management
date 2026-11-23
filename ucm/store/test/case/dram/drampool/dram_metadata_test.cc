@@ -80,6 +80,31 @@ TEST_F(UCShardMetadataTest, StoreBeginDuplicateReturnsDuplicateKeyAndKeepsSingle
     EXPECT_EQ(md.GetKeyCnt(), 1UL);
 }
 
+TEST_F(UCShardMetadataTest, DuplicateDumpUpdatesPrefixDepthAndIgnoresSentinel)
+{
+    auto run = [](std::uint32_t secondDepth, const BlockId& expectedVictim) {
+        ShardMetadata md(MakeConfig(EvictionPolicyType::TTL, EvictionPolicyType::PREFIX_TAIL));
+        auto kUpdated = KeyFromHex("a1");
+        auto kOther = KeyFromHex("a2");
+        const TimePoint future = Clock::now() + std::chrono::seconds(10);
+        EXPECT_TRUE(
+            md.StoreBegin(kUpdated, MakeEntry(kUpdated, 1, future, EntryStatus::INITIALIZED))
+                .Success());
+        EXPECT_TRUE(
+            md.StoreBegin(kOther, MakeEntry(kOther, 4, future, EntryStatus::INITIALIZED)).Success());
+        EXPECT_TRUE(md.StoreEnd(kUpdated).Success());
+        EXPECT_TRUE(md.StoreEnd(kOther).Success());
+        EXPECT_EQ(md.StoreBegin(kUpdated, MakeEntry(kUpdated, secondDepth, future,
+                                                   EntryStatus::INITIALIZED)),
+                  Status::DuplicateKey());
+        auto victims = md.EvictDeep(1.0 / 2.0);
+        EXPECT_EQ(victims.size(), 1UL);
+        EXPECT_EQ(victims[0]->key, expectedVictim);
+    };
+    run(UC::Detail::kUnmarkedPrefixDepth, KeyFromHex("a2"));
+    run(9, KeyFromHex("a1"));
+}
+
 TEST_F(UCShardMetadataTest, StoreBeginNullptrReturnsInvalidParam)
 {
     ShardMetadata md(MakeConfig());
@@ -475,4 +500,77 @@ TEST_F(UCMetadataManagerTest, GetKeyCntAggregatesAcrossShards)
     EXPECT_EQ(mgr.GetKeyCnt(), 10U);
     for (int i = 0; i < 5; ++i) { EXPECT_TRUE(mgr.Delete(keys[i]).Success()); }
     EXPECT_EQ(mgr.GetKeyCnt(), 5U);
+}
+
+TEST_F(UCMetadataManagerTest, NoSpaceReclaimsDeepestBlockAcrossShards)
+{
+    auto pools = MakeBufferManager({{64, 2}});
+    MetadataManager mgr(
+        MakeConfig(EvictionPolicyType::TTL, EvictionPolicyType::PREFIX_TAIL,
+                   std::chrono::milliseconds(100), 1.0),
+        *pools);
+    auto kShallow = KeyFromHex("b1");
+    auto kDeep = KeyFromHex("b2");
+    auto kNew = KeyFromHex("b3");
+    ASSERT_TRUE(
+        mgr.StoreBegin(kShallow, MakeEntry(kShallow, 1, future_, EntryStatus::INITIALIZED))
+            .Success());
+    ASSERT_TRUE(
+        mgr.StoreBegin(kDeep, MakeEntry(kDeep, 8, future_, EntryStatus::INITIALIZED)).Success());
+    ASSERT_TRUE(mgr.StoreEnd(kShallow).Success());
+    ASSERT_TRUE(mgr.StoreEnd(kDeep).Success());
+
+    ASSERT_TRUE(
+        mgr.StoreBegin(kNew, MakeEntry(kNew, 2, future_, EntryStatus::INITIALIZED)).Success());
+    EXPECT_FALSE(mgr.Query(kDeep));
+    EXPECT_TRUE(mgr.Query(kShallow));
+    EXPECT_TRUE(mgr.Query(kNew));
+}
+
+TEST_F(UCMetadataManagerTest, LeasedTailIsKeptWhenPoolIsFull)
+{
+    auto pools = MakeBufferManager({{64, 2}});
+    MetadataManager mgr(
+        MakeConfig(EvictionPolicyType::TTL, EvictionPolicyType::PREFIX_TAIL,
+                   std::chrono::milliseconds(5000), 1.0),
+        *pools);
+    auto kShallow = KeyFromHex("c1");
+    auto kDeep = KeyFromHex("c2");
+    auto kNew = KeyFromHex("c3");
+    ASSERT_TRUE(
+        mgr.StoreBegin(kShallow, MakeEntry(kShallow, 1, future_, EntryStatus::INITIALIZED))
+            .Success());
+    ASSERT_TRUE(
+        mgr.StoreBegin(kDeep, MakeEntry(kDeep, 8, future_, EntryStatus::INITIALIZED)).Success());
+    ASSERT_TRUE(mgr.StoreEnd(kShallow).Success());
+    ASSERT_TRUE(mgr.StoreEnd(kDeep).Success());
+    EXPECT_TRUE(mgr.Exist(kDeep));
+
+    EXPECT_TRUE(
+        mgr.StoreBegin(kNew, MakeEntry(kNew, 2, future_, EntryStatus::INITIALIZED)).Failure());
+    EXPECT_TRUE(mgr.Query(kDeep));
+    EXPECT_TRUE(mgr.Query(kShallow));
+    EXPECT_FALSE(mgr.Query(kNew));
+}
+
+TEST_F(UCMetadataManagerTest, FullPoolGcTrimsOnlyTheDeepestFraction)
+{
+    auto pools = MakeBufferManager({{64, 2}});
+    MetadataManager mgr(
+        MakeConfig(EvictionPolicyType::TTL, EvictionPolicyType::PREFIX_TAIL,
+                   std::chrono::milliseconds(100), 0.5),
+        *pools);
+    auto kShallow = KeyFromHex("d1");
+    auto kDeep = KeyFromHex("d2");
+    ASSERT_TRUE(
+        mgr.StoreBegin(kShallow, MakeEntry(kShallow, 1, future_, EntryStatus::INITIALIZED))
+            .Success());
+    ASSERT_TRUE(
+        mgr.StoreBegin(kDeep, MakeEntry(kDeep, 8, future_, EntryStatus::INITIALIZED)).Success());
+    ASSERT_TRUE(mgr.StoreEnd(kShallow).Success());
+    ASSERT_TRUE(mgr.StoreEnd(kDeep).Success());
+
+    mgr.PerformEvict();
+    EXPECT_FALSE(mgr.Query(kDeep));
+    EXPECT_TRUE(mgr.Query(kShallow));
 }

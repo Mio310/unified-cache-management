@@ -88,9 +88,10 @@ struct DramPoolConfig {
 
     // MetadataManager internals are loaded from the runtime YAML file.
     EvictionPolicyType metadataPeriodicEvictionPolicy{EvictionPolicyType::TTL};
-    EvictionPolicyType metadataDeepEvictionPolicy{EvictionPolicyType::POSITION};
+    EvictionPolicyType metadataDeepEvictionPolicy{EvictionPolicyType::PREFIX_TAIL};
     std::uint64_t metadataLeaseTimeMs{5000};
-    double metadataDefaultEvictRatio{0.0};
+    // Fraction of a full size-pool reclaimed from the prefix tail. 0 disables it.
+    double metadataDefaultEvictRatio{0.2};
     std::uint64_t metadataEvictPeriodMs{365ULL * 24ULL * 60ULL * 60ULL * 1000ULL};
 
     std::uint32_t opTimeoutMs{5000};

@@ -32,6 +32,7 @@
 #include <string_view>
 #include <utility>
 #include "drampool_config.h"
+#include "drampool_metrics.h"
 #include "logger/logger.h"
 
 namespace UC::DramPool {
@@ -114,6 +115,22 @@ void MetricsReporter::Run() noexcept
     }
 }
 
+void MetricsReporter::LogLookupHitRate()
+{
+    // Cumulative since process start. Skip unchanged snapshots so a quiet pool
+    // does not emit the same line on every interval.
+    const auto queries = FindValue(counterValues_, kLookupQueryEntriesTotal);
+    const auto hits = FindValue(counterValues_, kLookupHitEntriesTotal);
+    if (queries <= 0.0 || (queries == loggedLookupQueries_ && hits == loggedLookupHits_)) {
+        return;
+    }
+    loggedLookupQueries_ = queries;
+    loggedLookupHits_ = hits;
+    UC_INFO_UNLIMITED("DramPool lookup hit rate: {:.2f}% (hits={}, queries={})",
+                      hits / queries * 100.0, static_cast<std::uint64_t>(hits),
+                      static_cast<std::uint64_t>(queries));
+}
+
 void MetricsReporter::CollectAndWrite() noexcept
 {
     try {
@@ -124,6 +141,7 @@ void MetricsReporter::CollectAndWrite() noexcept
             if (value < 0) { continue; }
             counterValues_[name] += value;
         }
+        LogLookupHitRate();
         // _update_gauge keeps the latest value.
         for (const auto& [name, value] : gaugeStats) { gaugeValues_[name] = value; }
         // _update_histogram merges per-bucket counts and the sum.

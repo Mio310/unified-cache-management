@@ -190,6 +190,8 @@ class DramPoolResourceReporter(FileResourceMetricsReporter):
             shared_memory_dir=shared_memory_dir,
         )
         self._registered_gauges: set[str] = set()
+        self._logged_lookup_queries: int | float | None = None
+        self._logged_lookup_hits: int | float | None = None
 
     def _read_state(self):
         try:
@@ -215,6 +217,26 @@ class DramPoolResourceReporter(FileResourceMetricsReporter):
                 ucmmetrics.create_stats(name, "gauge")
                 self._registered_gauges.add(name)
 
+    def _log_lookup_hit_rate(self, counters: dict[str, int | float]) -> None:
+        """Log the process-lifetime per-entry hit rate when the totals change."""
+        queries = counters.get("drampool_lookup_query_entries_total")
+        hits = counters.get("drampool_lookup_hit_entries_total", 0)
+        if not isinstance(queries, (int, float)) or queries <= 0:
+            return
+        if (
+            queries == self._logged_lookup_queries
+            and hits == self._logged_lookup_hits
+        ):
+            return
+        self._logged_lookup_queries = queries
+        self._logged_lookup_hits = hits
+        logger.info(
+            "DramPool lookup hit rate: %.2f%% (hits=%s, queries=%s)",
+            float(hits) / float(queries) * 100.0,
+            hits,
+            queries,
+        )
+
     def _report_snapshot(self, snapshot, previous):
         counters, gauges, histograms = snapshot_deltas(snapshot, previous)
         try:
@@ -224,6 +246,7 @@ class DramPoolResourceReporter(FileResourceMetricsReporter):
         except Exception as error:
             logger.warning(f"Failed to import DramPool resource metrics: {error}")
             return
+        self._log_lookup_hit_rate(snapshot.counters)
         try:
             self._write_state(snapshot)
         except OSError as error:

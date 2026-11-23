@@ -49,6 +49,15 @@ enum class EvictionPolicyType {
  * Callers must ensure that concurrent access to the same instance is
  * externally synchronized when required.
  */
+// Deepest READY block of one buffer size, plus the deepest block that can
+// actually be reclaimed. When deepestReady is greater than the evictable
+// block's position, a leased tail is in the way.
+struct DepthCandidate {
+    bool sawReady{false};
+    std::uint32_t deepestReady{0};
+    EntryPtr evictable;
+};
+
 class EvictionPolicy {
 public:
     virtual ~EvictionPolicy() = default;
@@ -97,6 +106,23 @@ public:
      *         The ordering is policy-defined.
      */
     virtual std::vector<EntryPtr> GetEvictionResults(double evict_ratio) = 0;
+
+    // Publish a new prefix depth and let the policy reorder. Policies that do
+    // not order by depth still update the shared entry when they override this.
+    virtual Status UpdatePosition(const BlockId& /*key*/, std::uint32_t /*position*/)
+    {
+        return Status::OK();
+    }
+
+    // PREFIX_TAIL reports the deepest READY block of this buffer size. Other
+    // policies leave the candidate empty.
+    virtual DepthCandidate FindDeepest(std::size_t /*size*/,
+                                       std::chrono::system_clock::time_point /*now*/)
+    {
+        return {};
+    }
+
+    virtual std::size_t CountSize(std::size_t /*size*/) const { return 0; }
 };
 
 /**
@@ -131,6 +157,19 @@ public:
     }
 
     Status AccessKey(const BlockId& /*key*/) override { return Status::OK(); }
+
+    // Reorders the entry after its prefix depth changes. Each policy that
+    // shares the entry must run this so its own ordered set is rebuilt.
+    Status UpdatePosition(const BlockId& key, std::uint32_t position) override
+    {
+        auto mapIt = index_.find(key);
+        if (mapIt == index_.end()) { return Status::NotFound(); }
+        auto entry = *mapIt->second;
+        entries_.erase(mapIt->second);
+        entry->position = position;
+        mapIt->second = entries_.insert(std::move(entry));
+        return Status::OK();
+    }
 
 protected:
     using EntrySet = std::multiset<EntryPtr, Cmp>;

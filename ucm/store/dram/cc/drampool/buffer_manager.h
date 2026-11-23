@@ -173,6 +173,25 @@ public:
      * @return used / slot_count; 0.0 if the size was not registered or the
      *         pool has no slots.
      */
+    bool IsFull(std::size_t size) const
+    {
+        const auto it = pools_.find(size);
+        if (it == pools_.end() || it->second == nullptr || it->second->GetSlotCount() == 0) {
+            return false;
+        }
+        const auto usedIt = usedBySize_.find(size);
+        if (usedIt == usedBySize_.end()) { return false; }
+        return usedIt->second.load(std::memory_order_relaxed) >= it->second->GetSlotCount();
+    }
+
+    std::vector<std::size_t> PoolSizes() const
+    {
+        std::vector<std::size_t> sizes;
+        sizes.reserve(pools_.size());
+        for (const auto& [size, _] : pools_) { sizes.push_back(size); }
+        return sizes;
+    }
+
     double GetUsedSlotRatio(std::size_t size) const
     {
         const auto it = pools_.find(size);

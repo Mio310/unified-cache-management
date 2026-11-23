@@ -53,9 +53,8 @@ metadata:
   deep_eviction_policy: PREFIX_TAIL
   # A lookup hit protects the entry from eviction for this duration.
   lease_time_ms: 5000
-  # Fraction selected by ratio-based eviction policies; range: [0, 1].
-  # 0.0 makes the deep path reclaim nothing under NoSpace; 0.2 is the
-  # recommended pairing with PREFIX_TAIL.
+  # Fraction of a full size-pool reclaimed from the prefix tail. Range: [0, 1].
+  # 0.0 disables that trim. This matches the code default.
   default_evict_ratio: 0.2
   # Keep internal metadata eviction deferred until buffer reclamation is wired.
   evict_period_ms: 31536000000

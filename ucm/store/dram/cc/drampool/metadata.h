@@ -137,6 +137,12 @@ public:
     std::vector<EntryPtr> EvictPeriodic(double evict_ratio);
     std::vector<EntryPtr> EvictDeep(double evict_ratio);
 
+    // Deepest READY block of this buffer size in the deep policy. Empty when
+    // the deep policy does not order by prefix depth.
+    DepthCandidate FindTail(std::size_t size, std::chrono::system_clock::time_point now);
+    std::size_t CountSize(std::size_t size) const;
+    bool TryMarkForEvict(const EntryPtr& entry, std::chrono::system_clock::time_point now);
+
 private:
     mutable RwLock mtx_;
     std::unordered_map<BlockId, EntryPtr, UC::Detail::BlockIdHasher> metadata_;
@@ -154,7 +160,10 @@ private:
 class MetadataManager {
 public:
     explicit MetadataManager(const MetadataConfig& config, BufferManager& bufferManager)
-        : shards_{}, bufferManager_(bufferManager), defaultEvictRatio_(config.defaultEvictRatio)
+        : shards_{},
+          bufferManager_(bufferManager),
+          defaultEvictRatio_(config.defaultEvictRatio),
+          deepType_(config.deepType)
     {
         for (auto& s : shards_) { s = std::make_unique<ShardMetadata>(config); }
     }
@@ -180,10 +189,7 @@ public:
         return total;
     }
 
-    void PerformEvict()
-    {
-        for (auto& s : shards_) { EvictOneShard(*s); }
-    }
+    void PerformEvict();
 
 private:
     static std::size_t ShardIdx(const BlockId& key)
@@ -193,6 +199,10 @@ private:
     ShardMetadata& ShardOf(const BlockId& key) { return *shards_[ShardIdx(key)]; }
     const ShardMetadata& ShardOf(const BlockId& key) const { return *shards_[ShardIdx(key)]; }
     void EvictOneShard(ShardMetadata& s, bool deep = false);
+    // Reclaim one deepest block of this size. A leased deeper block stops the
+    // search so a hot tail is not replaced by a shallower prefix block.
+    bool EvictDeepest(std::size_t size);
+    void EvictTailFraction(std::size_t size);
 
     static constexpr std::size_t kShardCnt = 1024;
     std::array<std::unique_ptr<ShardMetadata>, kShardCnt> shards_;
@@ -200,6 +210,7 @@ private:
     BufferManager& bufferManager_;
 
     double defaultEvictRatio_;
+    EvictionPolicyType deepType_;
 };
 
 }  // namespace UC::DramPool

@@ -234,6 +234,33 @@ TEST_F(UCPrefixTailEvictionPolicyTest, GetEvictionResultsMarksVictimsAsDeleting)
     EXPECT_EQ(entry->status, EntryStatus::DELETING);
 }
 
+TEST_F(UCPrefixTailEvictionPolicyTest, LeasedTailStopsBeforeShallowerEntries)
+{
+    auto kTail = KeyFromHex("a1");
+    auto kSameDepth = KeyFromHex("a2");
+    auto kHead = KeyFromHex("a3");
+    ASSERT_TRUE(
+        policy_.AddKey(kTail, MakeEntry(kTail, 5, past_, EntryStatus::READY, 0, future_)).Success());
+    ASSERT_TRUE(policy_.AddKey(kSameDepth, MakeEntry(kSameDepth, 5, past_)).Success());
+    ASSERT_TRUE(policy_.AddKey(kHead, MakeEntry(kHead, 1, past_)).Success());
+
+    auto victims = policy_.GetEvictionResults(1.0);
+
+    ASSERT_EQ(victims.size(), 1UL);
+    EXPECT_EQ(victims[0]->key, kSameDepth);
+}
+
+TEST_F(UCPrefixTailEvictionPolicyTest, LeasedTailAloneDoesNotEvictHead)
+{
+    auto kTail = KeyFromHex("a1");
+    auto kHead = KeyFromHex("a2");
+    ASSERT_TRUE(
+        policy_.AddKey(kTail, MakeEntry(kTail, 5, past_, EntryStatus::READY, 0, future_)).Success());
+    ASSERT_TRUE(policy_.AddKey(kHead, MakeEntry(kHead, 1, past_)).Success());
+
+    EXPECT_TRUE(policy_.GetEvictionResults(1.0).empty());
+}
+
 TEST_F(UCPrefixTailEvictionPolicyTest, GetEvictionResultsFillsTargetFromShallowerEntries)
 {
     // The two deepest blocks are pinned by refCnt; the third victim must come

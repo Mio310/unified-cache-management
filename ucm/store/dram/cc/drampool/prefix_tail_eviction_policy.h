@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <vector>
 #include "entry.h"
 #include "eviction_policy.h"
@@ -57,9 +58,10 @@ struct PrefixTailEntryCmp {
  * position in every chain that contains it. Ordering victims by depth
  * descending evicts each request's tail first while shared shallow prefixes
  * (the head every future hit depends on) survive longest. GetEvictionResults
- * evicts up to evict_ratio * size() entries from the front of the ordering,
- * skipping protected entries and continuing with shallower candidates until
- * the target is reached.
+ * evicts up to evict_ratio * size() entries from the front of the ordering.
+ * Busy entries are skipped. A leased READY tail stops the scan before any
+ * shallower depth, so a hot tail is not replaced by a prefix head. Other
+ * blocks at that same tail depth can still be taken.
  */
 class PrefixTailEvictionPolicy : public OrderedEvictionPolicy<PrefixTailEntryCmp> {
 public:
@@ -71,8 +73,16 @@ public:
         const auto now = std::chrono::system_clock::now();
         const auto target = std::max<std::size_t>(
             1, static_cast<std::size_t>(static_cast<double>(entries_.size()) * evict_ratio));
+        std::optional<std::uint32_t> leasedDepth;
         for (const auto& entry : entries_) {
             if (victims.size() >= target) { break; }
+            const auto probe = entry->ProbeEvict(now);
+            if (probe == Entry::EvictProbe::Busy) { continue; }
+            if (probe == Entry::EvictProbe::Leased) {
+                if (!leasedDepth.has_value()) { leasedDepth = entry->position; }
+                continue;
+            }
+            if (leasedDepth.has_value() && entry->position < *leasedDepth) { break; }
             if (!entry->TryMarkEvicting(now)) { continue; }
             victims.push_back(entry);
         }
@@ -81,6 +91,34 @@ public:
                     entries_.size());
         }
         return victims;
+    }
+
+    DepthCandidate FindDeepest(std::size_t size,
+                               std::chrono::system_clock::time_point now) override
+    {
+        DepthCandidate candidate;
+        for (const auto& entry : entries_) {
+            if (entry->size != size) { continue; }
+            const auto probe = entry->ProbeEvict(now);
+            if (probe == Entry::EvictProbe::Busy) { continue; }
+            if (!candidate.sawReady) {
+                candidate.sawReady = true;
+                candidate.deepestReady = entry->position;
+            }
+            if (probe == Entry::EvictProbe::Leased) { continue; }
+            candidate.evictable = entry;
+            return candidate;
+        }
+        return candidate;
+    }
+
+    std::size_t CountSize(std::size_t size) const override
+    {
+        std::size_t count = 0;
+        for (const auto& entry : entries_) {
+            if (entry->size == size) { ++count; }
+        }
+        return count;
     }
 };
 

@@ -452,6 +452,27 @@ def test_reporter_registers_dynamic_gauge_names(tmp_path, monkeypatch):
     assert native.created["drampool_buffer_pool_usage_ratio_4096"] == ("gauge", ())
 
 
+def test_reporter_logs_cumulative_lookup_hit_rate(tmp_path, monkeypatch, caplog):
+    reader = make_reporter(tmp_path, monkeypatch)
+    snapshot = parse(
+        {
+            "event": "drampool_metrics_snapshot",
+            "timestamp": 1788825600,
+            "counters": {
+                "drampool_lookup_query_entries_total": 200,
+                "drampool_lookup_hit_entries_total": 50,
+            },
+            "gauges": {},
+            "histograms": {},
+        }
+    )
+    with caplog.at_level(logging.INFO):
+        reader._report_snapshot(snapshot, None)
+        reader._report_snapshot(snapshot, snapshot)
+    messages = [record.message for record in caplog.records if "lookup hit rate" in record.message]
+    assert messages == ["DramPool lookup hit rate: 25.00% (hits=50, queries=200)"]
+
+
 def test_real_prometheus_export_dynamic_gauge_slot_size(tmp_path, monkeypatch):
     """Reporter -> native -> dispatcher -> connector -> Prometheus slot_size label."""
     from dataclasses import dataclass, field

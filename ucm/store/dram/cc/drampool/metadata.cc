@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "metadata.h"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include "drampool_metrics.h"
@@ -57,6 +58,12 @@ Status ShardMetadata::StoreBegin(const BlockId& key, EntryPtr entry)
 {
     ReadWriteGuard lock(mtx_);
     if (metadata_.find(key) != metadata_.end()) {
+        // A later dump can learn the real prefix depth. The unmarked sentinel
+        // must not overwrite a depth that is already known.
+        if (entry != nullptr && entry->position != UC::Detail::kUnmarkedPrefixDepth) {
+            periodicEvictor_->UpdatePosition(key, entry->position);
+            deepEvictor_->UpdatePosition(key, entry->position);
+        }
         UC_INFO("ShardMetadata StoreBegin: key already exists.");
         return Status::DuplicateKey();
     }
@@ -168,6 +175,26 @@ std::vector<EntryPtr> ShardMetadata::EvictDeep(double evict_ratio)
     return deepEvictor_->GetEvictionResults(evict_ratio);
 }
 
+DepthCandidate ShardMetadata::FindTail(std::size_t size, std::chrono::system_clock::time_point now)
+{
+    ReadOnlyGuard lock(mtx_);
+    return deepEvictor_->FindDeepest(size, now);
+}
+
+std::size_t ShardMetadata::CountSize(std::size_t size) const
+{
+    ReadOnlyGuard lock(mtx_);
+    return deepEvictor_->CountSize(size);
+}
+
+bool ShardMetadata::TryMarkForEvict(const EntryPtr& entry,
+                                    std::chrono::system_clock::time_point now)
+{
+    ReadOnlyGuard lock(mtx_);
+    if (entry == nullptr || metadata_.find(entry->key) == metadata_.end()) { return false; }
+    return entry->TryMarkEvicting(now);
+}
+
 Status MetadataManager::Delete(const BlockId& key)
 {
     EntryPtr entry;
@@ -185,14 +212,22 @@ Status MetadataManager::StoreBegin(const BlockId& key, EntryPtr entry)
     auto idx = ShardIdx(key);
     entry->shard = static_cast<uint32_t>(idx);
     auto st = bufferManager_.Allocate(entry->size, entry->buffer);
-    if (st == Status::NoSpace()) {
-        // TODO: Maybe the random shard doesn't have the data of current size
+    if (st == Status::NoSpace() && deepType_ == EvictionPolicyType::PREFIX_TAIL) {
+        // Reclaim same-size blocks from the deepest prefix tail across every
+        // shard until this size pool has a free slot, or no tail can be taken.
+        const auto attemptLimit = std::max<std::size_t>(GetKeyCnt(), 1);
+        for (std::size_t attempt = 0; attempt < attemptLimit && st == Status::NoSpace();
+             ++attempt) {
+            if (!EvictDeepest(entry->size)) { break; }
+            st = bufferManager_.Allocate(entry->size, entry->buffer);
+        }
+    } else if (st == Status::NoSpace()) {
         EvictOneShard(*shards_[rand() % kShardCnt]);
         st = bufferManager_.Allocate(entry->size, entry->buffer);
-    }
-    if (st == Status::NoSpace()) {
-        EvictOneShard(*shards_[rand() % kShardCnt], true);
-        st = bufferManager_.Allocate(entry->size, entry->buffer);
+        if (st == Status::NoSpace()) {
+            EvictOneShard(*shards_[rand() % kShardCnt], true);
+            st = bufferManager_.Allocate(entry->size, entry->buffer);
+        }
     }
     if (!st.Success()) {
         UC_ERROR("StoreBegin: Allocate for size {} failed, status {}.", entry->size, st.ToString());
@@ -215,6 +250,18 @@ Status MetadataManager::StoreBegin(const BlockId& key, EntryPtr entry)
     return st;
 }
 
+void MetadataManager::PerformEvict()
+{
+    for (auto& shard : shards_) { EvictOneShard(*shard); }
+    if (deepType_ != EvictionPolicyType::PREFIX_TAIL || defaultEvictRatio_ == 0.0) { return; }
+    // Trim tails only after a size pool is already full. Doing this on every
+    // GC tick while the pool still has free slots would drain the cache.
+    for (const auto size : bufferManager_.PoolSizes()) {
+        if (!bufferManager_.IsFull(size)) { continue; }
+        EvictTailFraction(size);
+    }
+}
+
 void MetadataManager::EvictOneShard(ShardMetadata& s, bool deep)
 {
     auto victims = deep ? s.EvictDeep(defaultEvictRatio_) : s.EvictPeriodic(defaultEvictRatio_);
@@ -225,6 +272,55 @@ void MetadataManager::EvictOneShard(ShardMetadata& s, bool deep)
                      st.ToString());
         }
         s.Delete(entry->key);
+    }
+}
+
+bool MetadataManager::EvictDeepest(std::size_t size)
+{
+    const auto now = std::chrono::system_clock::now();
+    // A mark can lose a race with a load. Rescan a few times before giving up
+    // so one busy tail block does not hide the next deepest candidate.
+    constexpr int kMarkAttempts = 8;
+    for (int attempt = 0; attempt < kMarkAttempts; ++attempt) {
+        bool sawReady = false;
+        std::uint32_t deepestReady = 0;
+        EntryPtr victim;
+        ShardMetadata* victimShard = nullptr;
+        for (auto& shard : shards_) {
+            const auto candidate = shard->FindTail(size, now);
+            if (candidate.sawReady && (!sawReady || candidate.deepestReady > deepestReady)) {
+                sawReady = true;
+                deepestReady = candidate.deepestReady;
+            }
+            if (candidate.evictable &&
+                (victim == nullptr || candidate.evictable->position > victim->position)) {
+                victim = candidate.evictable;
+                victimShard = shard.get();
+            }
+        }
+        if (victim == nullptr || victimShard == nullptr) { return false; }
+        if (sawReady && deepestReady > victim->position) { return false; }
+        if (!victimShard->TryMarkForEvict(victim, now)) { continue; }
+        const auto freeStatus = bufferManager_.Free(victim->size, victim->buffer.slot);
+        if (!freeStatus.Success()) {
+            UC_ERROR("EvictDeepest: Free slot {} failed, status {}.", victim->buffer.slot,
+                     freeStatus.ToString());
+        }
+        victimShard->Delete(victim->key);
+        return true;
+    }
+    return false;
+}
+
+void MetadataManager::EvictTailFraction(std::size_t size)
+{
+    std::size_t count = 0;
+    for (const auto& shard : shards_) { count += shard->CountSize(size); }
+    if (count == 0) { return; }
+    const auto target = std::max<std::size_t>(
+        1, static_cast<std::size_t>(static_cast<double>(count) * defaultEvictRatio_));
+    for (std::size_t index = 0; index < target; ++index) {
+        if (!EvictDeepest(size)) { return; }
     }
 }
 
