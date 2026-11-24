@@ -4,6 +4,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
  */
 #include "cache/v2/cache_buffer.h"
+#include "metrics_api.h"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -766,6 +768,34 @@ TEST(Cache2BufferPrefixTailTest, LaterDumpRefreshesDepthAndSentinelDoesNotWipeIt
         EXPECT_FALSE(deeper.Owner());
         EXPECT_EQ(position.load(), 7U);
     }
+}
+
+TEST(Cache2BufferPrefixTailTest, DramUsageAndEvictionMetricsFollowOccupiedSlots)
+{
+    UC::Metrics::SetUp();
+    UC::Metrics::CreateStats("cache_dram_evict_blocks_total", "counter");
+    UC::Metrics::CreateStats("cache_dram_used_bytes", "gauge");
+    UC::Metrics::CreateStats("cache_dram_capacity_bytes", "gauge");
+    UC::Metrics::CreateStats("cache_dram_usage_ratio", "gauge");
+    UC::Metrics::GetAllStatsAndClear();
+
+    PrefixBuffer buf;
+    buf.Put(1, 1);
+    buf.Put(2, 5);
+    buf.Put(3, 9);
+    auto& layout = BufferTestAccess::Layout(buf.buffer);
+    for (size_t slot = 0; slot < PrefixBuffer::kSlots; ++slot) {
+        layout.SlotMetaArr()[slot].accessed.store(0, std::memory_order_relaxed);
+    }
+    buf.Put(4, 2);
+
+    const auto stats = UC::Metrics::GetAllStatsAndClear();
+    const auto& counters = std::get<0>(stats);
+    const auto& gauges = std::get<1>(stats);
+    EXPECT_EQ(counters.at("cache_dram_evict_blocks_total"), 1.0);
+    EXPECT_EQ(gauges.at("cache_dram_used_bytes"), 3.0 * 4096.0);
+    EXPECT_EQ(gauges.at("cache_dram_capacity_bytes"), 3.0 * 4096.0);
+    EXPECT_DOUBLE_EQ(gauges.at("cache_dram_usage_ratio"), 1.0);
 }
 
 }  // namespace
