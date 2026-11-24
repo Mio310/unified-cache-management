@@ -178,8 +178,9 @@ private:
             ShardTask shardTask;
             auto handle =
                 task->desc.distributeBackendLoad
-                    ? buffer_->Get(shard.owner, shard.index, true, originalIndex % localRankSize_)
-                    : buffer_->Get(shard.owner, shard.index, true);
+                    ? buffer_->Get(shard.owner, shard.index, true, originalIndex % localRankSize_,
+                                   shard.prefixPosition)
+                    : buffer_->Get(shard.owner, shard.index, true, kInvalid, shard.prefixPosition);
             shardTask.fromCache = handle.GetState() == SlotState::Ready;
             if (!shardTask.fromCache) { ++waitShardCount; }
             if (handle.Owner() && !shardTask.fromCache) {

@@ -197,7 +197,8 @@ private:
         const auto startTp = NowTime::Now();
         if (backend_ != nullptr) { backendDesc.reserve(task->desc.size()); }
         for (auto& shard : task->desc) {
-            auto handle = buffer_->Get(shard.owner, shard.index);
+            auto handle = buffer_->Get(shard.owner, shard.index, false, kInvalid,
+                                        shard.prefixPosition);
             if (!handle.Owner()) { continue; }
             ctx.bufferHandles.push_back(std::move(handle));
             auto& pinned = ctx.bufferHandles.back();
@@ -220,7 +221,8 @@ private:
                 ++copiedShards;
             }
             if (backend_ != nullptr && hostAccessible) {
-                backendDesc.push_back(Detail::Shard{shard.owner, shard.index, {pinned.Data()}});
+                backendDesc.push_back(Detail::Shard{shard.owner, shard.index, {pinned.Data()},
+                                                    shard.prefixPosition});
             }
         }
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_mkbuf_duration_ms"),

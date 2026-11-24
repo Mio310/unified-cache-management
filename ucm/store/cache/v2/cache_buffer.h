@@ -188,7 +188,8 @@ public:
     // Requires successful worker-side Setup; observers must not call Get.
     // Waits for a slot reference and always returns a valid handle, not necessarily Ready.
     Handle Get(const Detail::BlockId& blockId, size_t offset, bool allowReserved = false,
-               size_t preferredRank = kInvalid)
+               size_t preferredRank = kInvalid,
+               uint32_t prefixPosition = Detail::kUnmarkedPrefixDepth)
     {
         assert(myRank_ < rankCount_);
         assert(preferredRank == kInvalid || preferredRank < rankCount_);
@@ -199,15 +200,16 @@ public:
                             : 2 * usable;
         for (;;) {
             bool owner = false;
-            auto slot =
-                TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank);
+            auto slot = TryAcquireSlot(blockId, offset, allowReserved, attempts, owner,
+                                       preferredRank, prefixPosition);
             if (slot != kInvalid) { return Handle{this, slot, owner}; }
             std::this_thread::yield();
         }
     }
 
     void Prealloc(const Detail::BlockId& blockId, size_t offset, bool allowReserved = false,
-                  size_t preferredRank = kInvalid)
+                  size_t preferredRank = kInvalid,
+                  uint32_t prefixPosition = Detail::kUnmarkedPrefixDepth)
     {
         if (myRank_ == kInvalid) { return; }
         assert(preferredRank == kInvalid || preferredRank < rankCount_);
@@ -217,7 +219,7 @@ public:
         auto attempts = usable > std::numeric_limits<size_t>::max() / 2
                             ? std::numeric_limits<size_t>::max()
                             : 2 * usable;
-        TryPrealloc(blockId, offset, allowReserved, attempts);
+        TryPrealloc(blockId, offset, allowReserved, attempts, prefixPosition);
     }
 
     bool Exist(const Detail::BlockId& blockId, size_t offset)
@@ -309,14 +311,16 @@ private:
     // On success, the caller owns one reference and must transfer it into a Handle.
     // kInvalid means retry; owner is only meaningful on success.
     size_t TryAcquireSlot(const Detail::BlockId& blockId, size_t offset, bool allowReserved,
-                          size_t attempts, bool& owner, size_t preferredRank = kInvalid)
+                          size_t attempts, bool& owner, size_t preferredRank = kInvalid,
+                          uint32_t prefixPosition = Detail::kUnmarkedPrefixDepth)
     {
         auto iBucket = HashKey(blockId, offset);
         auto& layout = ctrl_.Layout();
         const bool mayOwn = preferredRank == kInvalid || myRank_ == preferredRank;
         auto iNode = LookupOptimistic(layout, iBucket, blockId, offset);
         if (iNode != kInvalid) {
-            if (PinHit(layout, iNode, iBucket, blockId, offset, kPinSpinFast, owner, mayOwn)) {
+            if (PinHit(layout, iNode, iBucket, blockId, offset, kPinSpinFast, owner, mayOwn,
+                       prefixPosition)) {
                 return iNode;
             }
         }
@@ -329,18 +333,19 @@ private:
         if (!targetLock->TryLock()) { return kInvalid; }
         iNode = Lookup(layout, iBucket, blockId, offset);
         if (iNode != kInvalid) {
-            auto pinned = PinHit(layout, iNode, iBucket, blockId, offset, kPinSpinFast, owner);
+            auto pinned = PinHit(layout, iNode, iBucket, blockId, offset, kPinSpinFast, owner,
+                                 true, prefixPosition);
             targetLock->Unlock();
             return pinned ? iNode : kInvalid;
         }
-        iNode = Alloc(layout, blockId, offset, iBucket, allowReserved, attempts, 1);
+        iNode = Alloc(layout, blockId, offset, iBucket, allowReserved, attempts, 1, prefixPosition);
         targetLock->Unlock();
         if (iNode != kInvalid) { owner = true; }
         return iNode;
     }
 
     bool TryPrealloc(const Detail::BlockId& blockId, size_t offset, bool allowReserved,
-                     size_t attempts)
+                     size_t attempts, uint32_t prefixPosition = Detail::kUnmarkedPrefixDepth)
     {
         auto iBucket = HashKey(blockId, offset);
         auto& layout = ctrl_.Layout();
@@ -348,17 +353,26 @@ private:
         if (!targetLock->TryLock()) { return false; }
         auto iNode = Lookup(layout, iBucket, blockId, offset);
         if (iNode != kInvalid) {
-            layout.SlotMetaArr()[iNode].accessed.store(1, std::memory_order_relaxed);
+            auto* meta = &layout.SlotMetaArr()[iNode];
+            meta->accessed.store(1, std::memory_order_relaxed);
+            RememberPrefix(*meta, prefixPosition, true);
             targetLock->Unlock();
             return true;
         }
-        iNode = Alloc(layout, blockId, offset, iBucket, allowReserved, attempts, 0);
+        iNode = Alloc(layout, blockId, offset, iBucket, allowReserved, attempts, 0, prefixPosition);
         targetLock->Unlock();
         return iNode != kInvalid;
     }
 
+    static void RememberPrefix(SlotMeta& meta, uint32_t prefixPosition, bool refresh)
+    {
+        if (refresh && prefixPosition == Detail::kUnmarkedPrefixDepth) { return; }
+        meta.position.store(prefixPosition, std::memory_order_relaxed);
+    }
+
     bool PinHit(CtrlLayout& layout, size_t iNode, size_t iBucket, const Detail::BlockId& blockId,
-                size_t offset, size_t spinBudget, bool& owner, bool takeOwnership = true)
+                size_t offset, size_t spinBudget, bool& owner, bool takeOwnership = true,
+                uint32_t prefixPosition = Detail::kUnmarkedPrefixDepth)
     {
         auto* meta = &layout.SlotMetaArr()[iNode];
         for (size_t spin = 0; spin < spinBudget;) {
@@ -390,6 +404,7 @@ private:
                 meta->state.store(State::Loading, std::memory_order_release);
             }
             meta->accessed.store(1, std::memory_order_relaxed);
+            RememberPrefix(*meta, prefixPosition, true);
             return true;
         }
         return false;
@@ -421,9 +436,13 @@ private:
     }
 
     size_t Alloc(CtrlLayout& layout, const Detail::BlockId& blockId, size_t offset, size_t iBucket,
-                 bool allowReserved, size_t attempts, size_t initialReference)
+                 bool allowReserved, size_t attempts, size_t initialReference,
+                 uint32_t prefixPosition)
     {
-        for (size_t scan = 0; scan < attempts; ++scan) {
+        /* FetchNode scans the rank, so a handful of passes covers CAS races
+         * and one second-chance pass. Get() retries if every slot is pinned. */
+        const auto scans = std::min(attempts, size_t{8});
+        for (size_t scan = 0; scan < scans; ++scan) {
             auto iNode = FetchNode(layout, allowReserved);
             if (iNode == kInvalid) { continue; }
             auto* meta = &layout.SlotMetaArr()[iNode];
@@ -435,6 +454,8 @@ private:
             }
 
             auto oldBucket = meta->hash.load(std::memory_order_acquire);
+            const bool sameKey =
+                oldBucket == iBucket && MatchKey(*meta, iBucket, blockId, offset);
             if (oldBucket != iBucket) {
                 if (oldBucket != kInvalid) {
                     auto* oldLock = layout.LockOf(oldBucket);
@@ -454,6 +475,7 @@ private:
                 StoreKey(*meta, blockId, offset);
                 meta->state.store(State::Loading, std::memory_order_relaxed);
             }
+            RememberPrefix(*meta, prefixPosition, sameKey);
             meta->accessed.store(1, std::memory_order_relaxed);
             meta->reference.store(initialReference, std::memory_order_release);
             return iNode;
@@ -465,11 +487,44 @@ private:
     {
         auto usable = slotsPerRank_ - (allowReserved ? 0 : reservedSlots_);
         if (usable == 0 || myRank_ == kInvalid) { return kInvalid; }
-        auto iNode = layout.NextClockSlot(myRank_, usable);
-        if (layout.SlotMetaArr()[iNode].accessed.exchange(0, std::memory_order_relaxed) != 0) {
+        const auto base = myRank_ * slotsPerRank_;
+        size_t empty = kInvalid;
+        size_t cold = kInvalid;
+        uint32_t coldPos = 0;
+        size_t hot = kInvalid;
+        uint32_t hotPos = 0;
+        bool sawHot = false;
+        auto* metas = layout.SlotMetaArr();
+        for (size_t local = 0; local < usable; ++local) {
+            const auto iNode = base + local;
+            auto& meta = metas[iNode];
+            if (meta.reference.load(std::memory_order_acquire) != 0) { continue; }
+            if (meta.hash.load(std::memory_order_acquire) == kInvalid) {
+                empty = iNode;
+                break;
+            }
+            const auto pos = meta.position.load(std::memory_order_relaxed);
+            if (meta.accessed.load(std::memory_order_relaxed) != 0) {
+                if (!sawHot || pos > hotPos) {
+                    sawHot = true;
+                    hotPos = pos;
+                    hot = iNode;
+                }
+                continue;
+            }
+            if (cold == kInvalid || pos > coldPos) {
+                cold = iNode;
+                coldPos = pos;
+            }
+        }
+        if (empty != kInvalid) { return empty; }
+        /* A hotter accessed tail keeps its second chance. Shallower cold
+         * blocks stay until that tail is cold too. Same depth may be taken. */
+        if (sawHot && (cold == kInvalid || hotPos > coldPos)) {
+            metas[hot].accessed.store(0, std::memory_order_relaxed);
             return kInvalid;
         }
-        return iNode;
+        return cold;
     }
 
     static void MoveTo(CtrlLayout& layout, size_t iBucket, size_t iNode)

@@ -652,5 +652,121 @@ TEST(Cache2BufferOptimisticTest, PinnedHitPreventsSlotReconfigurationUntilReleas
     ::operator delete(memory, std::align_val_t{64});
 }
 
+struct PrefixBuffer {
+    static constexpr size_t kSlots{3};
+    void* memory{::operator new(BufferTestAccess::TotalSize(8, 4, kSlots), std::align_val_t{64})};
+    Buffer buffer;
+
+    PrefixBuffer()
+    {
+        BufferTestAccess::Init(buffer, memory, 1, kSlots, 8, 4);
+    }
+    ~PrefixBuffer() { ::operator delete(memory, std::align_val_t{64}); }
+
+    size_t Put(uint32_t id, uint32_t depth)
+    {
+        auto handle = buffer.Get(MakeBlockId(id), 0, false, kInvalid, depth);
+        EXPECT_TRUE(handle.Owner());
+        const auto slot = handle.SlotIndex();
+        handle.MarkReady();
+        return slot;
+    }
+};
+
+TEST(Cache2BufferPrefixTailTest, FreeSlotIsUsedBeforeAnyOccupiedTail)
+{
+    PrefixBuffer buf;
+    const auto head = buf.Put(1, 1);
+    const auto tail = buf.Put(2, 9);
+    const auto fresh = buf.Put(3, 3);
+    EXPECT_NE(fresh, head);
+    EXPECT_NE(fresh, tail);
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(1), 0));
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(2), 0));
+    EXPECT_EQ(BufferTestAccess::Layout(buf.buffer).SlotMetaArr()[fresh].position.load(), 3U);
+}
+
+TEST(Cache2BufferPrefixTailTest, FullBufferEvictsTheDeepestColdBlock)
+{
+    PrefixBuffer buf;
+    buf.Put(1, 1);
+    buf.Put(2, 5);
+    const auto tail = buf.Put(3, 9);
+    auto& layout = BufferTestAccess::Layout(buf.buffer);
+    for (size_t slot = 0; slot < PrefixBuffer::kSlots; ++slot) {
+        layout.SlotMetaArr()[slot].accessed.store(0, std::memory_order_relaxed);
+    }
+
+    const auto replacement = buf.Put(4, 2);
+    EXPECT_EQ(replacement, tail);
+    EXPECT_FALSE(buf.buffer.Exist(MakeBlockId(3), 0));
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(1), 0));
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(2), 0));
+    EXPECT_EQ(layout.SlotMetaArr()[replacement].position.load(), 2U);
+}
+
+TEST(Cache2BufferPrefixTailTest, HotTailGetsASecondChanceBeforeAShallowerBlock)
+{
+    PrefixBuffer buf;
+    buf.Put(1, 1);
+    buf.Put(2, 5);
+    const auto tail = buf.Put(3, Detail::kUnmarkedPrefixDepth);
+    auto& meta = BufferTestAccess::Layout(buf.buffer).SlotMetaArr();
+    for (size_t slot = 0; slot < PrefixBuffer::kSlots; ++slot) {
+        meta[slot].accessed.store(0, std::memory_order_relaxed);
+    }
+    meta[tail].accessed.store(1, std::memory_order_relaxed);
+
+    bool owner = false;
+    auto blocked = BufferTestAccess::TryAcquireSlot(buf.buffer, MakeBlockId(4), 0, 1, owner);
+    EXPECT_EQ(blocked, kInvalid);
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(3), 0));
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(2), 0));
+    EXPECT_EQ(meta[tail].accessed.load(), 0);
+
+    const auto replacement = buf.Put(4, 2);
+    EXPECT_EQ(replacement, tail);
+    EXPECT_FALSE(buf.buffer.Exist(MakeBlockId(3), 0));
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(2), 0));
+}
+
+TEST(Cache2BufferPrefixTailTest, PinnedTailIsSkippedAndTheNextDeepestColdBlockGoes)
+{
+    PrefixBuffer buf;
+    buf.Put(1, 1);
+    const auto mid = buf.Put(2, 5);
+    auto pinned = buf.buffer.Get(MakeBlockId(3), 0, false, kInvalid, 9);
+    pinned.MarkReady();
+    auto& meta = BufferTestAccess::Layout(buf.buffer).SlotMetaArr();
+    for (size_t slot = 0; slot < PrefixBuffer::kSlots; ++slot) {
+        if (slot == pinned.SlotIndex()) { continue; }
+        meta[slot].accessed.store(0, std::memory_order_relaxed);
+    }
+
+    const auto replacement = buf.Put(4, 2);
+    EXPECT_EQ(replacement, mid);
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(3), 0));
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(1), 0));
+    EXPECT_FALSE(buf.buffer.Exist(MakeBlockId(2), 0));
+}
+
+TEST(Cache2BufferPrefixTailTest, LaterDumpRefreshesDepthAndSentinelDoesNotWipeIt)
+{
+    PrefixBuffer buf;
+    const auto slot = buf.Put(1, 4);
+    auto& position = BufferTestAccess::Layout(buf.buffer).SlotMetaArr()[slot].position;
+    {
+        auto again = buf.buffer.Get(MakeBlockId(1), 0, false, kInvalid,
+                                     Detail::kUnmarkedPrefixDepth);
+        EXPECT_FALSE(again.Owner());
+        EXPECT_EQ(position.load(), 4U);
+    }
+    {
+        auto deeper = buf.buffer.Get(MakeBlockId(1), 0, false, kInvalid, 7);
+        EXPECT_FALSE(deeper.Owner());
+        EXPECT_EQ(position.load(), 7U);
+    }
+}
+
 }  // namespace
 }  // namespace UC::Cache2

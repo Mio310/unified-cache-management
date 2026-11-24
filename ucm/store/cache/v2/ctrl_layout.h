@@ -43,7 +43,7 @@ inline constexpr size_t kMaxRanks{128};
 inline constexpr size_t kMaxLockStripes{1ULL << 16};
 inline constexpr size_t kMinBuckets{1ULL << 10};
 inline constexpr size_t kMaxBuckets{1ULL << 24};
-inline constexpr uint32_t kCtrlMagic{0x55433201U};  // "UC2" + layout version 1.
+inline constexpr uint32_t kCtrlMagic{0x55433202U};  // "UC2" + layout version 2.
 
 class CtrlLayout {
 public:
@@ -59,8 +59,11 @@ public:
         std::atomic<size_t> prev{kInvalid};
         std::atomic<size_t> next{kInvalid};
         alignas(64) std::atomic<State> state{State::Loading};
-        /* Hot line: CLOCK second-chance bit. */
+        /* Hot line: second-chance bit for the deepest unpinned slot. */
         alignas(64) std::atomic<uint8_t> accessed{0};
+        /* Prefix-chain depth. Larger is closer to the request tail.
+         * Detail::kUnmarkedPrefixDepth sorts as the deepest candidate. */
+        std::atomic<uint32_t> position{0};
 
         void Init()
         {
@@ -73,6 +76,7 @@ public:
             next.store(kInvalid, std::memory_order_relaxed);
             state.store(State::Loading, std::memory_order_relaxed);
             accessed.store(0, std::memory_order_relaxed);
+            position.store(0, std::memory_order_relaxed);
         }
     };
     struct RankDataDesc {

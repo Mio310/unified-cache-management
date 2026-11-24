@@ -4218,6 +4218,128 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
+      "description": "指标：`ucm:cache_lookup_hit_blocks_total` 与 `ucm:cache_lookup_miss_blocks_total`。命中率 = hit / (hit + miss)，Hits/s 与 Queries/s 在右轴。代码位置：`ucm/store/cache/v2/buffer_manager.h` / `BufferManager::ReportLookupStats`。",
+      "fieldConfig": {
+        "defaults": {
+          "max": 100,
+          "min": 0,
+          "unit": "percent"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": null
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": null
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 89
+      },
+      "id": 120,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "100 * sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])) / clamp_min(sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])) + sum(rate(ucm:cache_lookup_miss_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "Lookup hit rate",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "Hits/s",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(ucm:cache_lookup_miss_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])) + sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "Queries/s",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Cache lookup hit rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "description": "指标：`ucm:cache_dump_backend_wait_duration_ms` 表示等待下层 Store 完成 Cache Dump 写入的时间，本面板展示 p50、p90、p99 和平均值。代码位置：`ucm/store/cache/v2/dump_queue.h` / `DumpQueue::BackendWaitStage` / `backend_->Wait` 返回后。",
       "fieldConfig": {
         "defaults": {
