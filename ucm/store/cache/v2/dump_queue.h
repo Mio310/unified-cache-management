@@ -26,6 +26,7 @@
 #include <atomic>
 #include <future>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -197,10 +198,23 @@ private:
         const auto startTp = NowTime::Now();
         if (backend_ != nullptr) { backendDesc.reserve(task->desc.size()); }
         for (auto& shard : task->desc) {
-            auto handle = buffer_->Get(shard.owner, shard.index, false, kInvalid,
-                                        shard.prefixPosition);
-            if (!handle.Owner()) { continue; }
-            ctx.bufferHandles.push_back(std::move(handle));
+            auto handle = AcquireDumpSlot(shard);
+            if (!handle.has_value()) {
+                // This task already pins every usable slot. Finish that prefix so
+                // those handles drop before the next shard is allocated.
+                if (!ctx.bufferHandles.empty()) {
+                    auto flushed =
+                        ReleasePinnedDump(stream, task, ctx, backendDesc, copiedShards);
+                    if (flushed.Failure()) [[unlikely]] { return flushed; }
+                    handle = AcquireDumpSlot(shard);
+                }
+                if (!handle.has_value()) {
+                    handle = buffer_->Get(shard.owner, shard.index, false, kInvalid,
+                                          shard.prefixPosition);
+                }
+            }
+            if (!handle->Owner()) { continue; }
+            ctx.bufferHandles.push_back(std::move(*handle));
             auto& pinned = ctx.bufferHandles.back();
             const auto hostAccessible = pinned.HostAccessible();
             if (pinned.GetState() != SlotState::Ready) {
@@ -227,6 +241,58 @@ private:
         }
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_mkbuf_duration_ms"),
                              (NowTime::Now() - startTp) * 1e3);
+        return Status::OK();
+    }
+    std::optional<Handle> AcquireDumpSlot(const Detail::Shard& shard)
+    {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            auto handle = buffer_->TryGet(shard.owner, shard.index, false, kInvalid,
+                                          shard.prefixPosition);
+            if (handle.has_value()) { return handle; }
+        }
+        return std::nullopt;
+    }
+    // Copies the pinned prefix into the backend and drops those handles.
+    Status ReleasePinnedDump(StreamT& stream, const TaskPtr& task, DumpCtx& ctx,
+                             Detail::TaskDesc& backendDesc, size_t& copiedShards)
+    {
+        auto s = CompleteD2h(stream, task, ctx, copiedShards);
+        if (s.Failure()) [[unlikely]] { return s; }
+        if (backend_ != nullptr && !backendDesc.empty()) {
+            const auto startTp = NowTime::Now();
+            const auto nBackendShards = backendDesc.size();
+            auto res = backend_->Dump(std::move(backendDesc));
+            backendDesc.clear();
+            if (!res) [[unlikely]] {
+                auto error = res.Error();
+                if (error != Status::StoreUnhealthy()) {
+                    UC_ERROR("Failed({}) to submit dump task({}) to backend.", error, task->id);
+                    Metrics::UpdateStats(
+                        NAME_TO_METRIC_ID("cache_backend_dump_submit_errors_total"), 1.0);
+                }
+                FailOwnedHandles(ctx);
+                return error;
+            }
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_shards_total"),
+                                 static_cast<double>(nBackendShards));
+            s = backend_->Wait(res.Value());
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_wait_duration_ms"),
+                                 (NowTime::Now() - startTp) * 1e3);
+            if (s.Failure()) [[unlikely]] {
+                if (s != Status::StoreUnhealthy()) {
+                    UC_ERROR("Failed({}) to wait backend({}) for dump task({}).", s, res.Value(),
+                             task->id);
+                }
+                Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_backend_dump_wait_errors_total"),
+                                     1.0);
+                FailOwnedHandles(ctx);
+                return s;
+            }
+        } else {
+            backendDesc.clear();
+        }
+        ctx.bufferHandles.clear();
+        copiedShards = 0;
         return Status::OK();
     }
     Status CompleteD2h(StreamT& stream, const TaskPtr& task, DumpCtx& ctx, size_t copiedShards)

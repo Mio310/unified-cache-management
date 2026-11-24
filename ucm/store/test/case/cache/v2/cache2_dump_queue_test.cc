@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -129,7 +130,8 @@ public:
         bool allowReserved;
     };
 
-    Handle Get(const UC::Detail::BlockId& blockId, size_t offset, bool allowReserved = false)
+    Handle Get(const UC::Detail::BlockId& blockId, size_t offset, bool allowReserved = false,
+               size_t = 0, uint32_t = 0)
     {
         getCalls_.push_back(GetCall{blockId, offset, allowReserved});
         const auto key = std::make_pair(blockId, offset);
@@ -141,6 +143,12 @@ public:
         const auto slotIdx = nextSlotIdx_++;
         slots_.emplace(key, slotIdx);
         return Handle{this, slotIdx, true, ownerState_, HostAccessibleOf(blockId, offset)};
+    }
+    std::optional<Handle> TryGet(const UC::Detail::BlockId& blockId, size_t offset,
+                                 bool allowReserved = false, size_t preferredRank = 0,
+                                 uint32_t prefixPosition = 0)
+    {
+        return Get(blockId, offset, allowReserved, preferredRank, prefixPosition);
     }
     void SetOwnerState(SlotState state) { ownerState_ = state; }
     void SetHostAccessible(bool accessible) { defaultHostAccessible_ = accessible; }

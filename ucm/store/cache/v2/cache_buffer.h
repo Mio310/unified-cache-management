@@ -30,6 +30,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <utility>
@@ -231,12 +232,29 @@ public:
                             ? std::numeric_limits<size_t>::max()
                             : 2 * usable;
         for (;;) {
-            bool owner = false;
-            auto slot = TryAcquireSlot(blockId, offset, allowReserved, attempts, owner,
-                                       preferredRank, prefixPosition);
-            if (slot != kInvalid) { return Handle{this, slot, owner}; }
+            auto handle = TryGet(blockId, offset, allowReserved, preferredRank, prefixPosition);
+            if (handle.has_value()) { return std::move(*handle); }
             std::this_thread::yield();
         }
+    }
+
+    // One attempt. Empty when every usable slot is pinned or the stripe is busy.
+    std::optional<Handle> TryGet(const Detail::BlockId& blockId, size_t offset,
+                                 bool allowReserved = false, size_t preferredRank = kInvalid,
+                                 uint32_t prefixPosition = Detail::kUnmarkedPrefixDepth)
+    {
+        assert(myRank_ < rankCount_);
+        assert(preferredRank == kInvalid || preferredRank < rankCount_);
+        assert(reservedSlots_ < slotsPerRank_);
+        auto usable = slotsPerRank_ - (allowReserved ? 0 : reservedSlots_);
+        auto attempts = usable > std::numeric_limits<size_t>::max() / 2
+                            ? std::numeric_limits<size_t>::max()
+                            : 2 * usable;
+        bool owner = false;
+        auto slot = TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank,
+                                   prefixPosition);
+        if (slot == kInvalid) { return std::nullopt; }
+        return Handle{this, slot, owner};
     }
 
     void Prealloc(const Detail::BlockId& blockId, size_t offset, bool allowReserved = false,
@@ -547,9 +565,28 @@ private:
         std::lock_guard<std::mutex> lock(evictMu_);
         if (!EvictIndexCurrent()) { RebuildEvictIndexLocked(); }
         const auto begin = myRank_ * slotsPerRank_;
+        const auto end = begin + usable;
         const auto freeSlot = TakeFreeLocked(allowReserved);
         if (freeSlot != kInvalid) { return freeSlot; }
-        return SelectOccupiedLocked(layout, begin, begin + usable);
+        // A tail is spared once. The next pick takes it even if a lookup marked it hot again.
+        static thread_local size_t pendingSpare = kInvalid;
+        if (pendingSpare != kInvalid) {
+            const auto spared = pendingSpare;
+            pendingSpare = kInvalid;
+            if (SpareStillEvictable(layout, spared, begin, end)) { return spared; }
+        }
+        size_t spared = kInvalid;
+        const auto chosen = SelectOccupiedLocked(layout, begin, end, spared);
+        if (chosen == kInvalid && spared != kInvalid) { pendingSpare = spared; }
+        return chosen;
+    }
+
+    bool SpareStillEvictable(CtrlLayout& layout, size_t slot, size_t begin, size_t end) const
+    {
+        if (slot < begin || slot >= end) { return false; }
+        auto& meta = layout.SlotMetaArr()[slot];
+        if (meta.reference.load(std::memory_order_acquire) != 0) { return false; }
+        return meta.hash.load(std::memory_order_acquire) != kInvalid;
     }
 
     bool EvictIndexCurrent() const
@@ -656,7 +693,7 @@ private:
         return from.end();
     }
 
-    size_t SelectOccupiedLocked(CtrlLayout& layout, size_t begin, size_t end)
+    size_t SelectOccupiedLocked(CtrlLayout& layout, size_t begin, size_t end, size_t& spared)
     {
         auto hot = FindEvictSlot(evictHot_, evictCold_, layout, begin, end, true);
         auto cold = FindEvictSlot(evictCold_, evictHot_, layout, begin, end, false);
@@ -668,8 +705,10 @@ private:
             evictHot_.erase(hot);
             layout.SlotMetaArr()[key.index].accessed.store(0, std::memory_order_relaxed);
             evictCold_.insert(key);
+            spared = key.index;
             return kInvalid;
         }
+        spared = kInvalid;
         if (cold == evictCold_.end()) { return kInvalid; }
         return cold->index;
     }
