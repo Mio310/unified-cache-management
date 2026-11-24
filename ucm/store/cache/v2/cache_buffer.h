@@ -29,8 +29,11 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <utility>
+#include <vector>
 #include "ctrl_layout.h"
 #include "ctrl_strategy.h"
 #include "data_strategy.h"
@@ -57,6 +60,30 @@ class Buffer {
     size_t bucketCount_{0};
     size_t reservedSlots_{0};
     std::atomic<size_t> occupiedSlots_{0};
+
+    // Deeper prefix first, then the lower slot index. Victim choice is O(log n);
+    // a full-rank scan under the stripe lock stalls once the partition is full.
+    struct EvictKey {
+        uint32_t position{0};
+        size_t index{0};
+    };
+    struct EvictOrder {
+        bool operator()(const EvictKey& lhs, const EvictKey& rhs) const
+        {
+            if (lhs.position != rhs.position) { return lhs.position > rhs.position; }
+            return lhs.index < rhs.index;
+        }
+    };
+    using EvictSet = std::set<EvictKey, EvictOrder>;
+    std::mutex evictMu_;
+    bool evictReady_{false};
+    size_t evictRank_{kInvalid};
+    size_t evictSlotsPerRank_{0};
+    size_t evictReserved_{0};
+    std::vector<size_t> evictFree_;
+    std::vector<size_t> evictFreeReserved_;
+    EvictSet evictHot_;
+    EvictSet evictCold_;
 
     static constexpr size_t kPinSpinFast{64};
 
@@ -160,6 +187,7 @@ public:
         myRank_ = static_cast<size_t>(cfg.deviceId);
         myRank_ = myRank_ % rankCount_;
         layout.InitSlotRange(myRank_);
+        RebuildEvictIndex();
         DataOptions dataOptions;
         dataOptions.domainId = cfg.uniqueId;
         dataOptions.deviceId = cfg.deviceId;
@@ -243,7 +271,7 @@ public:
         lock->Lock();
         iNode = Lookup(layout, iBucket, blockId, offset);
         auto found = iNode != kInvalid;
-        if (found) { layout.SlotMetaArr()[iNode].accessed.store(1, std::memory_order_relaxed); }
+        if (found) { MarkAccessedHot(layout.SlotMetaArr()[iNode], iNode); }
         lock->Unlock();
         return found;
     }
@@ -257,9 +285,7 @@ public:
             for (size_t offset = 0; offset < shardsPerBlock_; ++offset) {
                 auto iBucket = HashKey(blocks[i], offset);
                 auto iNode = LookupOptimistic(layout, iBucket, blocks[i], offset);
-                if (iNode != kInvalid) {
-                    layout.SlotMetaArr()[iNode].accessed.store(1, std::memory_order_relaxed);
-                }
+                if (iNode != kInvalid) { MarkAccessedHot(layout.SlotMetaArr()[iNode], iNode); }
             }
         }
     }
@@ -358,8 +384,9 @@ private:
         auto iNode = Lookup(layout, iBucket, blockId, offset);
         if (iNode != kInvalid) {
             auto* meta = &layout.SlotMetaArr()[iNode];
-            meta->accessed.store(1, std::memory_order_relaxed);
+            const auto oldPos = meta->position.load(std::memory_order_relaxed);
             RememberPrefix(*meta, prefixPosition, true);
+            MarkAccessedHot(*meta, iNode, oldPos);
             targetLock->Unlock();
             return true;
         }
@@ -429,8 +456,9 @@ private:
             if (owner && state == State::Failed) {
                 meta->state.store(State::Loading, std::memory_order_release);
             }
-            meta->accessed.store(1, std::memory_order_relaxed);
+            const auto oldPos = meta->position.load(std::memory_order_relaxed);
             RememberPrefix(*meta, prefixPosition, true);
+            MarkAccessedHot(*meta, iNode, oldPos);
             return true;
         }
         return false;
@@ -487,7 +515,7 @@ private:
                     auto* oldLock = layout.LockOf(oldBucket);
                     auto sameStripe = oldLock == layout.LockOf(iBucket);
                     if (!sameStripe && !oldLock->TryLock()) {
-                        meta->accessed.store(1, std::memory_order_relaxed);
+                        MarkAccessedHot(*meta, iNode);
                         meta->reference.store(0, std::memory_order_release);
                         continue;
                     }
@@ -501,10 +529,12 @@ private:
                 StoreKey(*meta, blockId, offset);
                 meta->state.store(State::Loading, std::memory_order_relaxed);
             }
+            const auto oldPos = meta->position.load(std::memory_order_relaxed);
             RememberPrefix(*meta, prefixPosition, sameKey);
             meta->accessed.store(1, std::memory_order_relaxed);
             meta->reference.store(initialReference, std::memory_order_release);
             NoteDramInstall(oldBucket == kInvalid, oldBucket != kInvalid && !sameKey);
+            NoteEvictInstalled(iNode, oldBucket == kInvalid, oldPos);
             return iNode;
         }
         return kInvalid;
@@ -514,44 +544,183 @@ private:
     {
         auto usable = slotsPerRank_ - (allowReserved ? 0 : reservedSlots_);
         if (usable == 0 || myRank_ == kInvalid) { return kInvalid; }
+        std::lock_guard<std::mutex> lock(evictMu_);
+        if (!EvictIndexCurrent()) { RebuildEvictIndexLocked(); }
+        const auto begin = myRank_ * slotsPerRank_;
+        const auto freeSlot = TakeFreeLocked(allowReserved);
+        if (freeSlot != kInvalid) { return freeSlot; }
+        return SelectOccupiedLocked(layout, begin, begin + usable);
+    }
+
+    bool EvictIndexCurrent() const
+    {
+        return evictReady_ && evictRank_ == myRank_ && evictSlotsPerRank_ == slotsPerRank_ &&
+               evictReserved_ == reservedSlots_;
+    }
+
+    void RebuildEvictIndex()
+    {
+        std::lock_guard<std::mutex> lock(evictMu_);
+        RebuildEvictIndexLocked();
+    }
+
+    void RebuildEvictIndexLocked()
+    {
+        evictHot_.clear();
+        evictCold_.clear();
+        evictFree_.clear();
+        evictFreeReserved_.clear();
+        evictReady_ = false;
+        if (myRank_ == kInvalid || slotsPerRank_ == 0) { return; }
+        auto& layout = ctrl_.Layout();
         const auto base = myRank_ * slotsPerRank_;
-        size_t empty = kInvalid;
-        size_t cold = kInvalid;
-        uint32_t coldPos = 0;
-        size_t hot = kInvalid;
-        uint32_t hotPos = 0;
-        bool sawHot = false;
-        auto* metas = layout.SlotMetaArr();
-        for (size_t local = 0; local < usable; ++local) {
-            const auto iNode = base + local;
-            auto& meta = metas[iNode];
-            if (meta.reference.load(std::memory_order_acquire) != 0) { continue; }
-            if (meta.hash.load(std::memory_order_acquire) == kInvalid) {
-                empty = iNode;
-                break;
+        const auto reserved = reservedSlots_ < slotsPerRank_ ? reservedSlots_ : slotsPerRank_;
+        const auto usable = slotsPerRank_ - reserved;
+        auto pushFree = [&](size_t limit, std::vector<size_t>& dest) {
+            for (size_t n = limit; n > 0; --n) {
+                const auto local = n - 1;
+                const auto index = base + local;
+                auto& meta = layout.SlotMetaArr()[index];
+                if (meta.hash.load(std::memory_order_relaxed) != kInvalid) { continue; }
+                dest.push_back(index);
             }
-            const auto pos = meta.position.load(std::memory_order_relaxed);
+        };
+        pushFree(usable, evictFree_);
+        for (size_t n = slotsPerRank_; n > usable; --n) {
+            const auto index = base + n - 1;
+            auto& meta = layout.SlotMetaArr()[index];
+            if (meta.hash.load(std::memory_order_relaxed) == kInvalid) {
+                evictFreeReserved_.push_back(index);
+            }
+        }
+        for (size_t local = 0; local < slotsPerRank_; ++local) {
+            const auto index = base + local;
+            auto& meta = layout.SlotMetaArr()[index];
+            if (meta.hash.load(std::memory_order_relaxed) == kInvalid) { continue; }
+            EvictKey key{meta.position.load(std::memory_order_relaxed), index};
             if (meta.accessed.load(std::memory_order_relaxed) != 0) {
-                if (!sawHot || pos > hotPos) {
-                    sawHot = true;
-                    hotPos = pos;
-                    hot = iNode;
-                }
+                evictHot_.insert(key);
+            } else {
+                evictCold_.insert(key);
+            }
+        }
+        evictRank_ = myRank_;
+        evictSlotsPerRank_ = slotsPerRank_;
+        evictReserved_ = reservedSlots_;
+        evictReady_ = true;
+    }
+
+    size_t TakeFreeLocked(bool allowReserved)
+    {
+        if (!evictFree_.empty()) {
+            const auto index = evictFree_.back();
+            evictFree_.pop_back();
+            return index;
+        }
+        if (allowReserved && !evictFreeReserved_.empty()) {
+            const auto index = evictFreeReserved_.back();
+            evictFreeReserved_.pop_back();
+            return index;
+        }
+        return kInvalid;
+    }
+
+    EvictSet::iterator FindEvictSlot(EvictSet& from, EvictSet& other, CtrlLayout& layout,
+                                     size_t begin, size_t end, bool wantHot)
+    {
+        for (auto it = from.begin(); it != from.end();) {
+            if (it->index < begin || it->index >= end) {
+                ++it;
                 continue;
             }
-            if (cold == kInvalid || pos > coldPos) {
-                cold = iNode;
-                coldPos = pos;
+            auto& meta = layout.SlotMetaArr()[it->index];
+            if (meta.reference.load(std::memory_order_acquire) != 0) {
+                ++it;
+                continue;
             }
+            if (meta.hash.load(std::memory_order_acquire) == kInvalid) {
+                const auto index = it->index;
+                it = from.erase(it);
+                ReturnFreeLocked(index);
+                continue;
+            }
+            const bool hot = meta.accessed.load(std::memory_order_relaxed) != 0;
+            if (hot != wantHot) {
+                const auto key = *it;
+                it = from.erase(it);
+                other.insert(key);
+                continue;
+            }
+            return it;
         }
-        if (empty != kInvalid) { return empty; }
-        /* A hotter accessed tail keeps its second chance. Shallower cold
-         * blocks stay until that tail is cold too. Same depth may be taken. */
-        if (sawHot && (cold == kInvalid || hotPos > coldPos)) {
-            metas[hot].accessed.store(0, std::memory_order_relaxed);
+        return from.end();
+    }
+
+    size_t SelectOccupiedLocked(CtrlLayout& layout, size_t begin, size_t end)
+    {
+        auto hot = FindEvictSlot(evictHot_, evictCold_, layout, begin, end, true);
+        auto cold = FindEvictSlot(evictCold_, evictHot_, layout, begin, end, false);
+        /* A hotter accessed tail keeps its second chance. Shallower cold blocks
+         * stay until that tail is cold too. Same depth may be taken. */
+        if (hot != evictHot_.end() &&
+            (cold == evictCold_.end() || hot->position > cold->position)) {
+            const auto key = *hot;
+            evictHot_.erase(hot);
+            layout.SlotMetaArr()[key.index].accessed.store(0, std::memory_order_relaxed);
+            evictCold_.insert(key);
             return kInvalid;
         }
-        return cold;
+        if (cold == evictCold_.end()) { return kInvalid; }
+        return cold->index;
+    }
+
+    void ReturnFreeLocked(size_t index)
+    {
+        const auto base = myRank_ * slotsPerRank_;
+        const auto reserved = reservedSlots_ < slotsPerRank_ ? reservedSlots_ : slotsPerRank_;
+        const auto usable = slotsPerRank_ - reserved;
+        if (index - base < usable) {
+            evictFree_.push_back(index);
+        } else {
+            evictFreeReserved_.push_back(index);
+        }
+    }
+
+    void MarkAccessedHot(SlotMeta& meta, size_t index)
+    {
+        const auto oldPos = meta.position.load(std::memory_order_relaxed);
+        meta.accessed.store(1, std::memory_order_relaxed);
+        NoteEvictHot(index, oldPos);
+    }
+
+    void MarkAccessedHot(SlotMeta& meta, size_t index, uint32_t oldPos)
+    {
+        meta.accessed.store(1, std::memory_order_relaxed);
+        NoteEvictHot(index, oldPos);
+    }
+
+    void NoteEvictHot(size_t index, uint32_t oldPos)
+    {
+        std::lock_guard<std::mutex> lock(evictMu_);
+        if (!evictReady_) { return; }
+        evictHot_.erase(EvictKey{oldPos, index});
+        evictCold_.erase(EvictKey{oldPos, index});
+        const auto pos =
+            ctrl_.Layout().SlotMetaArr()[index].position.load(std::memory_order_relaxed);
+        evictHot_.insert(EvictKey{pos, index});
+    }
+
+    void NoteEvictInstalled(size_t index, bool wasEmpty, uint32_t oldPos)
+    {
+        std::lock_guard<std::mutex> lock(evictMu_);
+        if (!evictReady_) { return; }
+        if (!wasEmpty) {
+            evictHot_.erase(EvictKey{oldPos, index});
+            evictCold_.erase(EvictKey{oldPos, index});
+        }
+        const auto pos =
+            ctrl_.Layout().SlotMetaArr()[index].position.load(std::memory_order_relaxed);
+        evictHot_.insert(EvictKey{pos, index});
     }
 
     static void MoveTo(CtrlLayout& layout, size_t iBucket, size_t iNode)
