@@ -137,6 +137,10 @@ _COUNTER_METRICS = [
         "Total bytes dumped through the Cache stage (per-task size summed)",
     ),
     (
+        "cache_dram_evict_blocks_total",
+        "Cache DRAM blocks replaced by a newer block after the rank buffer was occupied",
+    ),
+    (
         "posix_s2h_bytes_total",
         (
             "Total bytes transferred from posix storage to host buffer (load path, "
@@ -593,6 +597,21 @@ _COUNTER_METRICS = [
     ),
 ]
 _GAUGE_METRICS = [
+    (
+        "cache_dram_used_bytes",
+        "Occupied bytes in this worker's Cache DRAM rank partition",
+        {"multiprocess_mode": 'livemostrecent'},
+    ),
+    (
+        "cache_dram_capacity_bytes",
+        "Capacity in bytes of this worker's Cache DRAM rank partition",
+        {"multiprocess_mode": 'livemostrecent'},
+    ),
+    (
+        "cache_dram_usage_ratio",
+        "Occupied fraction of this worker's Cache DRAM rank partition",
+        {"multiprocess_mode": 'livemostrecent'},
+    ),
     (
         "yuanrong_dram_used_bytes",
         "YuanRong physical shared-memory usage in bytes",

@@ -4,6 +4,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
  */
 #include "cache/v2/cache_buffer.h"
+#include "metrics_api.h"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -649,6 +651,49 @@ TEST(Cache2BufferOptimisticTest, PinnedHitPreventsSlotReconfigurationUntilReleas
     EXPECT_EQ(BufferTestAccess::FindSlot(buffer, newBlock, 0), slot);
 
     BufferTestAccess::Release(buffer, replacement);
+    ::operator delete(memory, std::align_val_t{64});
+}
+
+TEST(Cache2BufferMetricsTest, DramUsageAndEvictionFollowOccupiedSlots)
+{
+    UC::Metrics::SetUp();
+    UC::Metrics::CreateStats("cache_dram_evict_blocks_total", "counter");
+    UC::Metrics::CreateStats("cache_dram_used_bytes", "gauge");
+    UC::Metrics::CreateStats("cache_dram_capacity_bytes", "gauge");
+    UC::Metrics::CreateStats("cache_dram_usage_ratio", "gauge");
+    UC::Metrics::GetAllStatsAndClear();
+
+    constexpr size_t kRanks{1};
+    constexpr size_t kSlotsPerRank{1};
+    constexpr size_t kBuckets{8};
+    constexpr size_t kLocks{4};
+    auto bytes = BufferTestAccess::TotalSize(kBuckets, kLocks, kRanks * kSlotsPerRank);
+    auto* memory = ::operator new(bytes, std::align_val_t{64});
+    Buffer buffer;
+    BufferTestAccess::Init(buffer, memory, kRanks, kSlotsPerRank, kBuckets, kLocks);
+
+    const auto oldBlock = MakeBlockId(1);
+    size_t slot;
+    {
+        auto handle = buffer.Get(oldBlock, 0);
+        handle.MarkReady();
+        slot = handle.SlotIndex();
+    }
+    auto& meta = BufferTestAccess::Layout(buffer).SlotMetaArr()[slot];
+    meta.accessed.store(0, std::memory_order_relaxed);
+    const auto newBlock = MakeBlockId(2);
+    {
+        auto handle = buffer.Get(newBlock, 0);
+        handle.MarkReady();
+    }
+
+    const auto stats = UC::Metrics::GetAllStatsAndClear();
+    const auto& counters = std::get<0>(stats);
+    const auto& gauges = std::get<1>(stats);
+    EXPECT_EQ(counters.at("cache_dram_evict_blocks_total"), 1.0);
+    EXPECT_EQ(gauges.at("cache_dram_used_bytes"), 4096.0);
+    EXPECT_EQ(gauges.at("cache_dram_capacity_bytes"), 4096.0);
+    EXPECT_DOUBLE_EQ(gauges.at("cache_dram_usage_ratio"), 1.0);
     ::operator delete(memory, std::align_val_t{64});
 }
 

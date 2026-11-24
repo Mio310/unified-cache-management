@@ -35,6 +35,7 @@
 #include "ctrl_strategy.h"
 #include "data_strategy.h"
 #include "global_config.h"
+#include "metrics_api.h"
 #include "status/status.h"
 #include "type/types.h"
 
@@ -55,6 +56,7 @@ class Buffer {
     size_t shardsPerBlock_{0};
     size_t bucketCount_{0};
     size_t reservedSlots_{0};
+    std::atomic<size_t> occupiedSlots_{0};
 
     static constexpr size_t kPinSpinFast{64};
 
@@ -182,7 +184,9 @@ public:
         if (cfg.fallbackNumaRankCount.has_value()) {
             dataOptions.fallbackNumaRankCount = static_cast<size_t>(*cfg.fallbackNumaRankCount);
         }
-        return data_.Setup(layout, dataOptions);
+        auto s2 = data_.Setup(layout, dataOptions);
+        if (s2.Success()) { PublishDramUsage(); }
+        return s2;
     }
 
     // Requires successful worker-side Setup; observers must not call Get.
@@ -420,6 +424,27 @@ private:
         return LookupT<std::memory_order_acquire>(layout, iBucket, blockId, offset);
     }
 
+    void NoteDramInstall(bool newlyOccupied, bool evicted)
+    {
+        if (newlyOccupied) { occupiedSlots_.fetch_add(1, std::memory_order_relaxed); }
+        if (evicted) {
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_evict_blocks_total"), 1.0);
+        }
+        PublishDramUsage();
+    }
+
+    void PublishDramUsage() const
+    {
+        if (slotSize_ == 0 || slotsPerRank_ == 0 || myRank_ == kInvalid) { return; }
+        const auto capacity = static_cast<double>(slotsPerRank_) * static_cast<double>(slotSize_);
+        const auto used = static_cast<double>(occupiedSlots_.load(std::memory_order_relaxed)) *
+                          static_cast<double>(slotSize_);
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_used_bytes"), used);
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_capacity_bytes"), capacity);
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_usage_ratio"),
+                             capacity == 0.0 ? 0.0 : used / capacity);
+    }
+
     size_t Alloc(CtrlLayout& layout, const Detail::BlockId& blockId, size_t offset, size_t iBucket,
                  bool allowReserved, size_t attempts, size_t initialReference)
     {
@@ -435,6 +460,7 @@ private:
             }
 
             auto oldBucket = meta->hash.load(std::memory_order_acquire);
+            const bool sameKey = oldBucket == iBucket && MatchKey(*meta, iBucket, blockId, offset);
             if (oldBucket != iBucket) {
                 if (oldBucket != kInvalid) {
                     auto* oldLock = layout.LockOf(oldBucket);
@@ -456,6 +482,7 @@ private:
             }
             meta->accessed.store(1, std::memory_order_relaxed);
             meta->reference.store(initialReference, std::memory_order_release);
+            NoteDramInstall(oldBucket == kInvalid, oldBucket != kInvalid && !sameKey);
             return iNode;
         }
         return kInvalid;

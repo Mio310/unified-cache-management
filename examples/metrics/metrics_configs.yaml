@@ -154,6 +154,8 @@ counter:
     documentation: "Total bytes loaded through the Cache stage (per-task size summed)"
   - name: "cache_dump_bytes_total"
     documentation: "Total bytes dumped through the Cache stage (per-task size summed)"
+  - name: "cache_dram_evict_blocks_total"
+    documentation: "Cache DRAM blocks replaced by a newer block after the rank buffer was occupied"
 
   # -- Pipeline Posix stage: real per-worker throughput counters ------------
   # Accumulated per completed Posix task. Use
@@ -385,6 +387,15 @@ counter:
 
 # Gauge metrics configuration
 gauge:
+  - name: "cache_dram_used_bytes"
+    documentation: "Occupied bytes in this worker's Cache DRAM rank partition"
+    multiprocess_mode: "livemostrecent"
+  - name: "cache_dram_capacity_bytes"
+    documentation: "Capacity in bytes of this worker's Cache DRAM rank partition"
+    multiprocess_mode: "livemostrecent"
+  - name: "cache_dram_usage_ratio"
+    documentation: "Occupied fraction of this worker's Cache DRAM rank partition"
+    multiprocess_mode: "livemostrecent"
   - name: "yuanrong_dram_used_bytes"
     documentation: "YuanRong physical shared-memory usage in bytes"
     multiprocess_mode: "livemostrecent"

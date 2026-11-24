@@ -23,10 +23,14 @@
  * */
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <sys/types.h>
 #include <vector>
 #include "cache_buffer.h"
+#include "logger/logger.h"
 #include "metrics_api.h"
 #include "time/stopwatch.h"
 #include "ucmstore_v1.h"
@@ -139,6 +143,30 @@ private:
                              static_cast<double>(hits));
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_lookup_miss_blocks_total"),
                              static_cast<double>(misses));
+        LogLookupHitRate(hits, misses);
+    }
+    static void LogLookupHitRate(size_t hits, size_t misses)
+    {
+        if (hits == 0 && misses == 0) { return; }
+        static std::atomic<uint64_t> totalHits{0};
+        static std::atomic<uint64_t> totalMisses{0};
+        static std::atomic<int64_t> nextLogMs{0};
+        const auto hitsNow = totalHits.fetch_add(hits, std::memory_order_relaxed) + hits;
+        const auto missesNow = totalMisses.fetch_add(misses, std::memory_order_relaxed) + misses;
+        const auto queries = hitsNow + missesNow;
+        if (queries == 0) { return; }
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        auto scheduled = nextLogMs.load(std::memory_order_relaxed);
+        if (nowMs < scheduled) { return; }
+        if (!nextLogMs.compare_exchange_strong(scheduled, nowMs + 10000,
+                                               std::memory_order_relaxed)) {
+            return;
+        }
+        const auto rate = 100.0 * static_cast<double>(hitsNow) / static_cast<double>(queries);
+        UC_INFO_UNLIMITED("Cache lookup hit rate: {:.2f}% (hits={}, queries={})", rate, hitsNow,
+                          queries);
     }
     void ReportBackendLookupStats(const StopWatch& sw)
     {

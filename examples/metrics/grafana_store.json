@@ -4218,6 +4218,128 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
+      "description": "指标：`ucm:cache_lookup_hit_blocks_total` 与 `ucm:cache_lookup_miss_blocks_total`。命中率 = hit / (hit + miss)，Hits/s 与 Queries/s 在右轴。代码位置：`ucm/store/cache/v2/buffer_manager.h` / `BufferManager::ReportLookupStats`。",
+      "fieldConfig": {
+        "defaults": {
+          "max": 100,
+          "min": 0,
+          "unit": "percent"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": null
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": null
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 89
+      },
+      "id": 120,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "100 * sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])) / clamp_min(sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])) + sum(rate(ucm:cache_lookup_miss_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "Lookup hit rate",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "Hits/s",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(ucm:cache_lookup_miss_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])) + sum(rate(ucm:cache_lookup_hit_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "Queries/s",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Cache lookup hit rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "description": "指标：`ucm:cache_dump_backend_wait_duration_ms` 表示等待下层 Store 完成 Cache Dump 写入的时间，本面板展示 p50、p90、p99 和平均值。代码位置：`ucm/store/cache/v2/dump_queue.h` / `DumpQueue::BackendWaitStage` / `backend_->Wait` 返回后。",
       "fieldConfig": {
         "defaults": {
@@ -4421,6 +4543,154 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "指标：`ucm:cache_dram_used_bytes` 与 `ucm:cache_dram_capacity_bytes`。每个 worker 上报自己 rank 分区里已占用的 host DRAM 和分区容量。代码位置：`ucm/store/cache/v2/cache_buffer.h` / `Buffer::PublishDramUsage`。",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 97
+      },
+      "id": 121,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (${perWorker:raw}) (ucm:cache_dram_used_bytes{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"})",
+          "legendFormat": "Used {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (${perWorker:raw}) (ucm:cache_dram_capacity_bytes{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"})",
+          "legendFormat": "Capacity {{engine}} {{worker_rank}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Cache DRAM capacity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "占用率 = used / capacity。淘汰速率来自 `ucm:cache_dram_evict_blocks_total`，表示 Cache DRAM 里已有 block 被新 block 换出的次数，右轴单位为 blocks/s。代码位置：`ucm/store/cache/v2/cache_buffer.h` / `Buffer::NoteDramInstall`。",
+      "fieldConfig": {
+        "defaults": {
+          "max": 1,
+          "min": 0,
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": null
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "id": 122,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(ucm:cache_dram_used_bytes{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}) / clamp_min(sum(ucm:cache_dram_capacity_bytes{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}), 1)",
+          "legendFormat": "Usage",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(ucm:cache_dram_evict_blocks_total{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+          "legendFormat": "Evictions/s",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Cache DRAM usage and eviction",
+      "type": "timeseries"
+    },
+    {
       "type": "row",
       "collapsed": true,
       "datasource": {
@@ -4433,7 +4703,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 97
+        "y": 105
       },
       "panels": [
         {
@@ -4449,7 +4719,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 98
+            "y": 106
           },
           "targets": [
             {
@@ -4534,7 +4804,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 98
+            "y": 106
           },
           "targets": [
             {
@@ -4619,7 +4889,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 106
+            "y": 114
           },
           "targets": [
             {
@@ -4704,7 +4974,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 106
+            "y": 114
           },
           "targets": [
             {
@@ -4785,7 +5055,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 114
+        "y": 122
       },
       "id": 62,
       "panels": [
@@ -4805,7 +5075,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 115
+            "y": 123
           },
           "id": 63,
           "options": {
@@ -4858,7 +5128,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 115
+            "y": 123
           },
           "id": 64,
           "options": {
@@ -4933,7 +5203,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 123
+            "y": 131
           },
           "id": 65,
           "options": {
@@ -4997,7 +5267,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 123
+            "y": 131
           },
           "id": 66,
           "options": {
@@ -5061,7 +5331,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 131
+            "y": 139
           },
           "id": 67,
           "options": {
@@ -5180,7 +5450,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 131
+            "y": 139
           },
           "id": 68,
           "options": {
@@ -5299,7 +5569,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 139
+            "y": 147
           },
           "id": 69,
           "options": {
@@ -5385,7 +5655,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 139
+            "y": 147
           },
           "id": 70,
           "options": {
@@ -5488,7 +5758,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 147
+        "y": 155
       },
       "id": 38,
       "panels": [],
@@ -5558,7 +5828,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 148
+        "y": 156
       },
       "id": 51,
       "options": {
@@ -5654,7 +5924,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 148
+        "y": 156
       },
       "id": 52,
       "options": {
@@ -5827,7 +6097,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 156
+        "y": 164
       },
       "id": 31,
       "options": {
@@ -6034,7 +6304,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 156
+        "y": 164
       },
       "id": 32,
       "options": {
@@ -6164,7 +6434,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 164
+        "y": 172
       },
       "id": 41,
       "options": {
@@ -6272,7 +6542,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 164
+        "y": 172
       },
       "id": 42,
       "options": {
@@ -6380,7 +6650,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 172
+        "y": 180
       },
       "id": 25,
       "options": {
@@ -6477,7 +6747,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 172
+        "y": 180
       },
       "id": 26,
       "options": {
@@ -6651,7 +6921,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 180
+        "y": 188
       },
       "id": 36,
       "options": {
@@ -6858,7 +7128,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 180
+        "y": 188
       },
       "id": 46,
       "options": {
@@ -7065,7 +7335,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 188
+        "y": 196
       },
       "id": 10,
       "options": {
@@ -7272,7 +7542,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 188
+        "y": 196
       },
       "id": 11,
       "options": {
@@ -7353,7 +7623,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 196
+        "y": 204
       },
       "panels": [
         {
@@ -7369,7 +7639,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 197
+            "y": 205
           },
           "targets": [
             {
@@ -7454,7 +7724,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 197
+            "y": 205
           },
           "targets": [
             {
@@ -7539,7 +7809,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 205
+            "y": 213
           },
           "targets": [
             {
@@ -7624,7 +7894,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 205
+            "y": 213
           },
           "targets": [
             {
@@ -7705,7 +7975,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 213
+        "y": 221
       },
       "id": 71,
       "panels": [],
@@ -7776,7 +8046,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 214
+        "y": 222
       },
       "id": 72,
       "options": {
@@ -7899,7 +8169,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 214
+        "y": 222
       },
       "id": 73,
       "options": {
@@ -8009,7 +8279,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 222
+        "y": 230
       },
       "id": 74,
       "options": {
@@ -8119,7 +8389,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 222
+        "y": 230
       },
       "id": 75,
       "options": {
@@ -8229,7 +8499,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 230
+        "y": 238
       },
       "id": 76,
       "options": {
@@ -8339,7 +8609,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 230
+        "y": 238
       },
       "id": 77,
       "options": {
@@ -8449,7 +8719,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 238
+        "y": 246
       },
       "id": 78,
       "options": {
@@ -8559,7 +8829,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 246
+        "y": 254
       },
       "id": 79,
       "options": {
@@ -8670,7 +8940,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 246
+        "y": 254
       },
       "id": 80,
       "options": {
@@ -8780,7 +9050,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 254
+        "y": 262
       },
       "id": 81,
       "options": {
@@ -8903,7 +9173,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 254
+        "y": 262
       },
       "id": 82,
       "options": {
