@@ -511,8 +511,8 @@ private:
                  bool allowReserved, size_t attempts, size_t initialReference,
                  uint32_t prefixPosition)
     {
-        /* FetchNode scans the rank, so a handful of passes covers CAS races
-         * and one second-chance pass. Get() retries if every slot is pinned. */
+        /* Each pass already returns the deepest unpinned block. Further passes
+         * cover a lost CAS or a busy stripe. Get() retries if every slot is pinned. */
         const auto scans = std::min(attempts, size_t{8});
         for (size_t scan = 0; scan < scans; ++scan) {
             auto iNode = FetchNode(layout, allowReserved);
@@ -568,25 +568,7 @@ private:
         const auto end = begin + usable;
         const auto freeSlot = TakeFreeLocked(allowReserved);
         if (freeSlot != kInvalid) { return freeSlot; }
-        // A tail is spared once. The next pick takes it even if a lookup marked it hot again.
-        static thread_local size_t pendingSpare = kInvalid;
-        if (pendingSpare != kInvalid) {
-            const auto spared = pendingSpare;
-            pendingSpare = kInvalid;
-            if (SpareStillEvictable(layout, spared, begin, end)) { return spared; }
-        }
-        size_t spared = kInvalid;
-        const auto chosen = SelectOccupiedLocked(layout, begin, end, spared);
-        if (chosen == kInvalid && spared != kInvalid) { pendingSpare = spared; }
-        return chosen;
-    }
-
-    bool SpareStillEvictable(CtrlLayout& layout, size_t slot, size_t begin, size_t end) const
-    {
-        if (slot < begin || slot >= end) { return false; }
-        auto& meta = layout.SlotMetaArr()[slot];
-        if (meta.reference.load(std::memory_order_acquire) != 0) { return false; }
-        return meta.hash.load(std::memory_order_acquire) != kInvalid;
+        return SelectOccupiedLocked(layout, begin, end);
     }
 
     bool EvictIndexCurrent() const
@@ -693,24 +675,23 @@ private:
         return from.end();
     }
 
-    size_t SelectOccupiedLocked(CtrlLayout& layout, size_t begin, size_t end, size_t& spared)
+    size_t SelectOccupiedLocked(CtrlLayout& layout, size_t begin, size_t end)
     {
         auto hot = FindEvictSlot(evictHot_, evictCold_, layout, begin, end, true);
         auto cold = FindEvictSlot(evictCold_, evictHot_, layout, begin, end, false);
-        /* A hotter accessed tail keeps its second chance. Shallower cold blocks
-         * stay until that tail is cold too. Same depth may be taken. */
-        if (hot != evictHot_.end() &&
-            (cold == evictCold_.end() || hot->position > cold->position)) {
-            const auto key = *hot;
-            evictHot_.erase(hot);
-            layout.SlotMetaArr()[key.index].accessed.store(0, std::memory_order_relaxed);
-            evictCold_.insert(key);
-            spared = key.index;
-            return kInvalid;
+        if (hot == evictHot_.end() && cold == evictCold_.end()) { return kInvalid; }
+        // Deepest unpinned block wins. Equal depth keeps the lower slot index.
+        // A hot tail is cleared and taken in this same choice.
+        if (cold == evictCold_.end()) {
+            layout.SlotMetaArr()[hot->index].accessed.store(0, std::memory_order_relaxed);
+            return hot->index;
         }
-        spared = kInvalid;
-        if (cold == evictCold_.end()) { return kInvalid; }
-        return cold->index;
+        if (hot == evictHot_.end() || cold->position > hot->position ||
+            (cold->position == hot->position && cold->index < hot->index)) {
+            return cold->index;
+        }
+        layout.SlotMetaArr()[hot->index].accessed.store(0, std::memory_order_relaxed);
+        return hot->index;
     }
 
     void ReturnFreeLocked(size_t index)

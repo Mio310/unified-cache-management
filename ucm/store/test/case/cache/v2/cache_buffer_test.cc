@@ -707,7 +707,7 @@ TEST(Cache2BufferPrefixTailTest, FullBufferEvictsTheDeepestColdBlock)
     EXPECT_EQ(layout.SlotMetaArr()[replacement].position.load(), 2U);
 }
 
-TEST(Cache2BufferPrefixTailTest, HotTailGetsASecondChanceBeforeAShallowerBlock)
+TEST(Cache2BufferPrefixTailTest, HotTailIsEvictedBeforeAShallowerBlock)
 {
     PrefixBuffer buf;
     buf.Put(1, 1);
@@ -720,16 +720,13 @@ TEST(Cache2BufferPrefixTailTest, HotTailGetsASecondChanceBeforeAShallowerBlock)
     meta[tail].accessed.store(1, std::memory_order_relaxed);
 
     bool owner = false;
-    auto blocked = BufferTestAccess::TryAcquireSlot(buf.buffer, MakeBlockId(4), 0, 1, owner);
-    EXPECT_EQ(blocked, kInvalid);
-    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(3), 0));
-    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(2), 0));
-    EXPECT_EQ(meta[tail].accessed.load(), 0);
-
-    const auto replacement = buf.Put(4, 2);
+    auto replacement =
+        BufferTestAccess::TryAcquireSlot(buf.buffer, MakeBlockId(4), 0, 1, owner);
     EXPECT_EQ(replacement, tail);
+    EXPECT_TRUE(owner);
     EXPECT_FALSE(buf.buffer.Exist(MakeBlockId(3), 0));
     EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(2), 0));
+    EXPECT_TRUE(buf.buffer.Exist(MakeBlockId(1), 0));
 }
 
 TEST(Cache2BufferPrefixTailTest, PinnedTailIsSkippedAndTheNextDeepestColdBlockGoes)
