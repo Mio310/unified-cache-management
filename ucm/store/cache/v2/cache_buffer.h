@@ -521,7 +521,7 @@ private:
             size_t expected = 0;
             if (!meta->reference.compare_exchange_strong(expected, kSlotClaimed,
                                                          std::memory_order_acq_rel)) {
-                meta->accessed.store(1, std::memory_order_relaxed);
+                NoteEvictClaimFailed(iNode);
                 continue;
             }
 
@@ -692,6 +692,32 @@ private:
         }
         layout.SlotMetaArr()[hot->index].accessed.store(0, std::memory_order_relaxed);
         return hot->index;
+    }
+
+    // A free-list pop is undone when the claim CAS loses. Re-read under evictMu_:
+    // the winner may already have published the slot.
+    void NoteEvictClaimFailed(size_t index)
+    {
+        std::lock_guard<std::mutex> lock(evictMu_);
+        if (!evictReady_) { return; }
+        auto& meta = ctrl_.Layout().SlotMetaArr()[index];
+        const auto hash = meta.hash.load(std::memory_order_acquire);
+        const auto reference = meta.reference.load(std::memory_order_acquire);
+        const auto pos = meta.position.load(std::memory_order_relaxed);
+        if (hash == kInvalid && reference == 0) {
+            evictHot_.erase(EvictKey{pos, index});
+            evictCold_.erase(EvictKey{pos, index});
+            ReturnFreeLocked(index);
+            return;
+        }
+        if (hash == kInvalid) { return; }
+        evictHot_.erase(EvictKey{pos, index});
+        evictCold_.erase(EvictKey{pos, index});
+        if (meta.accessed.load(std::memory_order_relaxed) != 0) {
+            evictHot_.insert(EvictKey{pos, index});
+        } else {
+            evictCold_.insert(EvictKey{pos, index});
+        }
     }
 
     void ReturnFreeLocked(size_t index)
