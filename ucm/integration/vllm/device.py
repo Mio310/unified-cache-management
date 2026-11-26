@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Event-based sync between Python compute stream and C++ cache stream.
+Sync between the Python compute stream and the C++ cache stream.
 
-When dump_data is called, the cache's C++ stream does D2H from device memory.
-We must ensure the Python compute stream has finished writing KVCache before
-the cache reads. Event sync: record event on compute stream, pass to C++,
-cache stream waits for event before D2H. This avoids blocking the CPU.
+CUDA records an event on the compute stream and the cache stream waits for it.
+NPU finishes the current compute stream on the worker and passes no event.
+The cache thread uses another ACL context, and a wait on the worker event
+there does not complete.
 """
 import os
 import re
@@ -271,35 +271,21 @@ class NpuDevice(Device):
 
     def __init__(self):
         super().__init__()
+        self.stream_synced_for_transfer = False
 
     def get_event_handle(self) -> int:
-        import acl
         import torch_npu
 
+        self.stream_synced_for_transfer = False
         try:
-            stream = torch_npu.npu.current_stream().npu_stream
-            event, ret = acl.rt.create_event()
-            if ret != 0:
-                logger.error(f"acl create_event failed: {ret}")
-                return 0
-            ret = acl.rt.record_event(event, stream)
-            if ret != 0:
-                logger.error(f"acl record_event failed: {ret}")
-                acl.rt.destroy_event(event)
-                return 0
-            try:
-                # The dump thread waits on this event. Finish it on the worker
-                # stream before that thread can block in Store.Wait.
-                torch_npu.npu.current_stream().synchronize()
-            except Exception:
-                acl.rt.destroy_event(event)
-                raise
-            handle = int(event)
-            self.events[handle] = event
-            return handle
+            # Finish writes on this worker stream. Return no event: the cache
+            # thread's ACL context does not observe an event recorded here.
+            torch_npu.npu.current_stream().synchronize()
         except Exception as e:
-            logger.error(f"get npu event handle failed. {e}")
+            logger.error(f"synchronize npu stream failed. {e}")
             return 0
+        self.stream_synced_for_transfer = True
+        return 0
 
     def synchronize(self):
         torch.npu.synchronize()

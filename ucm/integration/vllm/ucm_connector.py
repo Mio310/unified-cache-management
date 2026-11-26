@@ -2584,7 +2584,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
             return 0
 
         event_handle = self.device.get_event_handle()
-        if event_handle == 0:
+        if event_handle == 0 and not getattr(
+            self.device, "stream_synced_for_transfer", False
+        ):
             self.device.synchronize()
         return event_handle
 

@@ -574,7 +574,9 @@ class UCMECConnector(ECConnectorBase):
             self._save_device.synchronize()
             return 0
         event_handle = self._save_device.get_event_handle()
-        if event_handle == 0:
+        if event_handle == 0 and not getattr(
+            self._save_device, "stream_synced_for_transfer", False
+        ):
             logger.warning("Failed to record EC load event; synchronizing before load.")
             self._save_device.synchronize()
         return event_handle
@@ -775,7 +777,9 @@ class UCMECConnector(ECConnectorBase):
             # Record after both encoder compute and tail padding. The Store's
             # copy stream must wait for these writes before reading raw pointers.
             event_handle = self._save_device.get_event_handle()
-            if event_handle == 0:
+            if event_handle == 0 and not getattr(
+                self._save_device, "stream_synced_for_transfer", False
+            ):
                 raise RuntimeError("Failed to record EC save prerequisite event.")
             task = self.store.dump_data(
                 list(chunk_ids),
