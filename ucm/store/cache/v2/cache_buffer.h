@@ -675,6 +675,17 @@ private:
         return from.end();
     }
 
+    // Drop the victim from both sets before Alloc publishes it. Remove() clears
+    // hash outside evictMu_; a slot still indexed there is pushed onto the free
+    // list by the next FindEvictSlot and then inserted again by NoteEvictInstalled.
+    size_t DetachEvictIndex(EvictSet::iterator it)
+    {
+        const EvictKey key = *it;
+        evictHot_.erase(key);
+        evictCold_.erase(key);
+        return key.index;
+    }
+
     size_t SelectOccupiedLocked(CtrlLayout& layout, size_t begin, size_t end)
     {
         auto hot = FindEvictSlot(evictHot_, evictCold_, layout, begin, end, true);
@@ -684,14 +695,14 @@ private:
         // A hot tail is cleared and taken in this same choice.
         if (cold == evictCold_.end()) {
             layout.SlotMetaArr()[hot->index].accessed.store(0, std::memory_order_relaxed);
-            return hot->index;
+            return DetachEvictIndex(hot);
         }
         if (hot == evictHot_.end() || cold->position > hot->position ||
             (cold->position == hot->position && cold->index < hot->index)) {
-            return cold->index;
+            return DetachEvictIndex(cold);
         }
         layout.SlotMetaArr()[hot->index].accessed.store(0, std::memory_order_relaxed);
-        return hot->index;
+        return DetachEvictIndex(hot);
     }
 
     // A free-list pop is undone when the claim CAS loses. Re-read under evictMu_:
