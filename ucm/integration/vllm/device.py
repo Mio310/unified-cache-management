@@ -287,6 +287,13 @@ class NpuDevice(Device):
                 logger.error(f"acl record_event failed: {ret}")
                 acl.rt.destroy_event(event)
                 return 0
+            try:
+                # The dump thread waits on this event. Finish it on the worker
+                # stream before that thread can block in Store.Wait.
+                torch_npu.npu.current_stream().synchronize()
+            except Exception:
+                acl.rt.destroy_event(event)
+                raise
             handle = int(event)
             self.events[handle] = event
             return handle
