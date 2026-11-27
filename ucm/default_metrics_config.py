@@ -59,6 +59,18 @@ _COUNTER_METRICS = [
         "Number of lookup misses at the Cache stage (had to query the backend)",
     ),
     (
+        "cache_dram_hit_shards_total",
+        "Successfully delivered shards found Ready at the first state check after slot acquisition",
+    ),
+    (
+        "cache_dram_load_shards_total",
+        "Total shards successfully delivered to the device through the Cache DRAM buffer",
+    ),
+    (
+        "cache_dram_evicted_bytes_total",
+        "Ready Cache DRAM slot bytes replaced by another key",
+    ),
+    (
         "cache_load_shards_total",
         "Total shards whose Cache buffer state was inspected during load",
     ),
@@ -593,6 +605,16 @@ _COUNTER_METRICS = [
     ),
 ]
 _GAUGE_METRICS = [
+    (
+        "cache_dram_capacity_bytes",
+        "Effective capacity in bytes of Cache DRAM data regions reported by this process",
+        {"multiprocess_mode": "livesum"},
+    ),
+    (
+        "cache_dram_used_bytes",
+        "Capacity in bytes of allocated Cache DRAM slots reported by this process",
+        {"multiprocess_mode": "livesum"},
+    ),
     (
         "yuanrong_dram_used_bytes",
         "YuanRong physical shared-memory usage in bytes",

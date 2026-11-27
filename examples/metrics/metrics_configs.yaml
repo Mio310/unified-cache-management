@@ -112,6 +112,12 @@ counter:
     documentation: "Number of lookup hits served by the Cache stage (no descent to backend)"
   - name: "cache_lookup_miss_blocks_total"
     documentation: "Number of lookup misses at the Cache stage (had to query the backend)"
+  - name: "cache_dram_hit_shards_total"
+    documentation: "Successfully delivered shards found Ready at the first state check after slot acquisition"
+  - name: "cache_dram_load_shards_total"
+    documentation: "Total shards successfully delivered to the device through the Cache DRAM buffer"
+  - name: "cache_dram_evicted_bytes_total"
+    documentation: "Ready Cache DRAM slot bytes replaced by another key"
   - name: "cache_load_shards_total"
     documentation: "Total shards whose Cache buffer state was inspected during load"
   - name: "cache_load_wait_shards_total"
@@ -385,6 +391,12 @@ counter:
 
 # Gauge metrics configuration
 gauge:
+  - name: "cache_dram_capacity_bytes"
+    documentation: "Effective capacity in bytes of Cache DRAM data regions reported by this process"
+    multiprocess_mode: "livesum"
+  - name: "cache_dram_used_bytes"
+    documentation: "Capacity in bytes of allocated Cache DRAM slots reported by this process"
+    multiprocess_mode: "livesum"
   - name: "yuanrong_dram_used_bytes"
     documentation: "YuanRong physical shared-memory usage in bytes"
     multiprocess_mode: "livemostrecent"

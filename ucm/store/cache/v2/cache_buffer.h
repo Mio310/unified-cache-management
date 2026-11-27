@@ -26,16 +26,23 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include "ctrl_layout.h"
 #include "ctrl_strategy.h"
 #include "data_strategy.h"
 #include "global_config.h"
+#include "metrics_api.h"
 #include "status/status.h"
 #include "type/types.h"
 
@@ -56,6 +63,8 @@ class Buffer {
     size_t shardsPerBlock_{0};
     size_t bucketCount_{0};
     size_t reservedSlots_{0};
+    bool metricsRegistered_{false};
+    std::string metricsDomainId_;
 
     static constexpr size_t kPinSpinFast{64};
 
@@ -126,6 +135,10 @@ public:
     };
 
     Buffer() = default;
+    ~Buffer()
+    {
+        if (metricsRegistered_) { Reporter().Remove(this); }
+    }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 
@@ -183,7 +196,19 @@ public:
         if (cfg.fallbackNumaRankCount.has_value()) {
             dataOptions.fallbackNumaRankCount = static_cast<size_t>(*cfg.fallbackNumaRankCount);
         }
-        return data_.Setup(layout, dataOptions);
+        s = data_.Setup(layout, dataOptions);
+        if (s.Failure()) { return s; }
+        if (myRank_ == 0) {
+            try {
+                metricsDomainId_ = cfg.uniqueId;
+                Reporter().Add(this);
+                metricsRegistered_ = true;
+            } catch (const std::exception& error) {
+                return Status::Error(
+                    std::string("failed to register cache2 capacity metrics: ") + error.what());
+            }
+        }
+        return Status::OK();
     }
 
     // Requires successful worker-side Setup; observers must not call Get.
@@ -292,6 +317,112 @@ public:
     size_t BucketCount() const { return bucketCount_; }
 
 private:
+    // Metrics aggregates process-local Gauge writes without domain labels. One
+    // reporter thread must therefore sum all rank-zero domains in this process.
+    class CapacityReporter {
+        std::mutex mutex_;
+        std::condition_variable wake_;
+        std::unordered_map<std::string, std::unordered_set<Buffer*>> domains_;
+        bool stopping_{false};
+        bool dirty_{false};
+        std::thread thread_;
+
+    public:
+        CapacityReporter() : thread_([this] { Run(); }) {}
+        ~CapacityReporter()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            wake_.notify_one();
+            if (thread_.joinable()) { thread_.join(); }
+        }
+        void Add(Buffer* buffer)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto existing = domains_.find(buffer->metricsDomainId_);
+            if (existing == domains_.end()) {
+                // Prepare the set before publishing it: an allocation failure
+                // must never leave an empty domain for SnapshotLocked().
+                std::unordered_set<Buffer*> members;
+                members.insert(buffer);
+                domains_.emplace(buffer->metricsDomainId_, std::move(members));
+            } else {
+                existing->second.insert(buffer);
+            }
+            dirty_ = true;
+            wake_.notify_one();
+        }
+        void Remove(Buffer* buffer)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = domains_.find(buffer->metricsDomainId_);
+            if (it != domains_.end()) {
+                it->second.erase(buffer);
+                if (it->second.empty()) { domains_.erase(it); }
+            }
+            dirty_ = true;
+            wake_.notify_one();
+        }
+        std::pair<double, double> Snapshot()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return SnapshotLocked();
+        }
+
+    private:
+        std::pair<double, double> SnapshotLocked()
+        {
+            double capacity = 0;
+            double used = 0;
+            // The registry lock keeps the mapped control memory alive here.
+            for (const auto& [domain, buffers] : domains_) {
+                (void)domain;
+                auto* buffer = *buffers.begin();
+                auto& layout = buffer->ctrl_.Layout();
+                capacity += static_cast<double>(layout.SlotCount()) * buffer->slotSize_;
+                used += static_cast<double>(layout.Hdr()->usedSlots.load(
+                            std::memory_order_relaxed)) * buffer->slotSize_;
+            }
+            return {capacity, used};
+        }
+
+        void Run()
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            while (!stopping_) {
+                wake_.wait_for(lock, std::chrono::seconds(10),
+                               [this] { return stopping_ || dirty_; });
+                if (stopping_) { break; }
+                dirty_ = false;
+                const auto [capacity, used] = SnapshotLocked();
+                // Avoid reporter-thread function-local statics: their destruction
+                // could precede the reporter's static destructor and join.
+                Metrics::UpdateStats("cache_dram_capacity_bytes", capacity);
+                Metrics::UpdateStats("cache_dram_used_bytes", used);
+            }
+        }
+    };
+
+    static CapacityReporter& Reporter()
+    {
+        // Ensure the metrics singleton outlives the reporter thread.
+        (void)Metrics::Metrics::GetInstance();
+        static CapacityReporter reporter;
+        return reporter;
+    }
+
+    void ReportCapacityStats()
+    {
+        auto& layout = ctrl_.Layout();
+        const auto usedSlots = layout.Hdr()->usedSlots.load(std::memory_order_relaxed);
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_capacity_bytes"),
+                             static_cast<double>(layout.SlotCount()) * slotSize_);
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_used_bytes"),
+                             static_cast<double>(usedSlots) * slotSize_);
+    }
+
     static void BlockKeyWords(const Detail::BlockId& blockId, size_t (&words)[2])
     {
         static_assert(sizeof(Detail::BlockId) == sizeof(words));
@@ -463,6 +594,8 @@ private:
             }
 
             auto oldBucket = meta->hash.load(std::memory_order_acquire);
+            const bool evictsReady = oldBucket != kInvalid &&
+                meta->state.load(std::memory_order_acquire) == State::Ready;
             if (oldBucket != iBucket) {
                 if (oldBucket != kInvalid) {
                     auto* oldLock = layout.LockOf(oldBucket);
@@ -481,6 +614,12 @@ private:
             } else {
                 StoreKey(*meta, blockId, offset);
                 meta->state.store(State::Loading, std::memory_order_relaxed);
+            }
+            if (oldBucket == kInvalid) {
+                layout.Hdr()->usedSlots.fetch_add(1, std::memory_order_relaxed);
+            } else if (evictsReady) {
+                Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_evicted_bytes_total"),
+                                     static_cast<double>(slotSize_));
             }
             meta->accessed.store(1, std::memory_order_relaxed);
             meta->reference.store(initialReference, std::memory_order_release);

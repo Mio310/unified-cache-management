@@ -75,7 +75,12 @@ void Metrics::CreateStats(const std::string& name, const std::string& type,
 void Metrics::UpdateStats(const std::string& name, double value)
 {
     if (!isInited_.load(std::memory_order_acquire)) { return; }
-    UpdateStats(ResolveMetricId(name), value);
+    MetricId id;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        id = ResolveMetricId(name);
+    }
+    UpdateStats(id, value);
 }
 
 void Metrics::UpdateStats(CachedMetric& metric, double value)
@@ -85,11 +90,10 @@ void Metrics::UpdateStats(CachedMetric& metric, double value)
 
 void Metrics::UpdateStats(MetricId id, double value)
 {
-    if (!isInited_.load(std::memory_order_acquire) || id == INVALID_METRIC_ID ||
-        id >= metrics_.size()) {
-        return;
-    }
+    if (!isInited_.load(std::memory_order_acquire) || id == INVALID_METRIC_ID) { return; }
     RegisterCurrentThread();
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (id >= metrics_.size()) { return; }
     MetricBuffer::WriteGuard guard{*threadBuffer_};
     UpdateBuffer(*threadBuffer_, guard.Index(), id, value);
 }
@@ -98,7 +102,7 @@ void Metrics::UpdateStats(const std::unordered_map<std::string, double>& values)
 {
     if (!isInited_.load(std::memory_order_acquire) || values.empty()) { return; }
 
-    for (const auto& pair : values) { UpdateStats(ResolveMetricId(pair.first), pair.second); }
+    for (const auto& pair : values) { UpdateStats(pair.first, pair.second); }
 }
 
 void Metrics::MergeHistogramStats(const HistogramStatsMap& values)
@@ -175,7 +179,10 @@ MetricId Metrics::ResolveCachedMetric(CachedMetric& metric) const
     if (!isInited_.load(std::memory_order_acquire)) { return INVALID_METRIC_ID; }
     auto epoch = registerEpoch_.load(std::memory_order_acquire);
     if (metric.seenEpoch.load(std::memory_order_acquire) == epoch) { return INVALID_METRIC_ID; }
-    id = ResolveMetricId(metric.name);
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        id = ResolveMetricId(metric.name);
+    }
     metric.id.store(id, std::memory_order_release);
     metric.seenEpoch.store(epoch, std::memory_order_release);
     return id;
@@ -231,6 +238,9 @@ Metrics::GetAllStatsAndClear()
         buffers.assign(buffers_.begin(), buffers_.end());
     }
 
+    // Metric names/types are append-only, but registration can reallocate the
+    // backing vector while this snapshot is being decoded.
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     for (const auto& buf : buffers) {
         int oldIdx = buf->SwitchBuffer();
         buf->WaitNoActiveWriter(oldIdx);

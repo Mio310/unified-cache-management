@@ -293,6 +293,23 @@ public:
 
 using TestedQueue = UC::Cache2::LoadQ<FakeBuffer, FakeStream>;
 
+TEST(UCCache2HitWindowTest, SnapshotResetsAndEmptyWindowHasNoRate)
+{
+    UC::Cache2::DramHitWindow window;
+    EXPECT_FALSE(window.Take().HitRate().has_value());
+    window.Add(3, 4);
+    window.Add(1, 2);
+    const auto snapshot = window.Take();
+    EXPECT_EQ(snapshot.hits, 4);
+    EXPECT_EQ(snapshot.loads, 6);
+    ASSERT_TRUE(snapshot.HitRate().has_value());
+    EXPECT_DOUBLE_EQ(*snapshot.HitRate(), 100.0 * 4.0 / 6.0);
+    const auto empty = window.Take();
+    EXPECT_EQ(empty.hits, 0);
+    EXPECT_EQ(empty.loads, 0);
+    EXPECT_FALSE(empty.HitRate().has_value());
+}
+
 UC::Detail::TaskHandle NextBackendHandle()
 {
     static std::atomic<UC::Detail::TaskHandle> next{1};
@@ -346,6 +363,8 @@ protected:
         UC::Metrics::CreateStats("cache_load_shards_total", "counter");
         UC::Metrics::CreateStats("cache_load_wait_shards_total", "counter");
         UC::Metrics::CreateStats("cache_load_success_shards_total", "counter");
+        UC::Metrics::CreateStats("cache_dram_hit_shards_total", "counter");
+        UC::Metrics::CreateStats("cache_dram_load_shards_total", "counter");
         UC::Metrics::CreateStats("cache_posix_load_success_shards_total", "counter");
         UC::Metrics::CreateStats("cache_load_failed_shards_total", "counter");
         UC::Metrics::CreateStats("cache_load_queue_full_total", "counter");
@@ -397,6 +416,27 @@ TEST_F(UCCache2LoadQueueTest, SetupPassesStreamParams)
     EXPECT_EQ(FakeStream::setupCalls.load(), 1);
     EXPECT_EQ(FakeStream::lastDeviceId.load(), 0);
     EXPECT_EQ(FakeStream::lastStreamNumber.load(), 2);
+}
+
+TEST_F(UCCache2LoadQueueTest, CloseDoesNotWaitForStatsInterval)
+{
+    const auto start = std::chrono::steady_clock::now();
+    loadQ_.Close();
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
+}
+
+TEST_F(UCCache2LoadQueueTest, FailedDeviceSyncDoesNotCountAsSuccessfulLoad)
+{
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    buffer_.SetExisting(block);
+    FakeStream::onSync = [] { return UC::Status::Error(); };
+    auto [task, waiter] = SubmitOne(MakeDesc(block));
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    const auto stats = UC::Metrics::GetAllStatsAndClear();
+    const auto& counters = std::get<0>(stats);
+    EXPECT_EQ(counters.count("cache_dram_hit_shards_total"), 0u);
+    EXPECT_EQ(counters.count("cache_dram_load_shards_total"), 0u);
 }
 
 TEST_F(UCCache2LoadQueueTest, PrerequisiteWaitPrecedesAllH2dShards)
@@ -498,6 +538,8 @@ TEST_F(UCCache2LoadQueueTest, LoadCacheHitSkipsBackend)
     EXPECT_EQ(counters.at("cache_posix_load_success_shards_total"), 0);
     EXPECT_EQ(counters.at("cache_load_shards_total"), 1);
     EXPECT_EQ(counters.at("cache_load_wait_shards_total"), 0);
+    EXPECT_EQ(counters.at("cache_dram_hit_shards_total"), 1);
+    EXPECT_EQ(counters.at("cache_dram_load_shards_total"), 1);
     EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
 }
 
@@ -537,6 +579,8 @@ TEST_F(UCCache2LoadQueueTest, LoadMissSubmitsBackendAndH2d)
     EXPECT_EQ(counters.at("cache_load_wait_shards_total"), 1);
     EXPECT_EQ(counters.at("cache_posix_load_success_shards_total"), 1);
     EXPECT_EQ(counters.at("cache_load_success_shards_total"), 0);
+    EXPECT_EQ(counters.at("cache_dram_hit_shards_total"), 0);
+    EXPECT_EQ(counters.at("cache_dram_load_shards_total"), 1);
 }
 
 TEST_F(UCCache2LoadQueueTest, LoadNonOwnerWaitsForSlotReady)
@@ -557,6 +601,10 @@ TEST_F(UCCache2LoadQueueTest, LoadNonOwnerWaitsForSlotReady)
     EXPECT_EQ(FakeStream::scatters[0].src, gSlotBase + slotIdx * kShardSize);
     EXPECT_EQ(buffer_.MarkedReady(), 0);
     EXPECT_EQ(buffer_.MarkedFailed(), 0);
+    auto stats = UC::Metrics::GetAllStatsAndClear();
+    const auto& counters = std::get<0>(stats);
+    EXPECT_EQ(counters.at("cache_dram_hit_shards_total"), 0);
+    EXPECT_EQ(counters.at("cache_dram_load_shards_total"), 1);
 }
 
 TEST_F(UCCache2LoadQueueTest, LoadHostInaccessibleHitUsesD2d)

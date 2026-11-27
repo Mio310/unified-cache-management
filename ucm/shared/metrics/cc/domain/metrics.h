@@ -166,7 +166,7 @@ private:
         std::vector<double> buckets;
     };
 
-    std::shared_mutex mutex_;
+    mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, MetricId> nameToId_;
     std::vector<MetricInfo> metrics_;
     std::list<std::shared_ptr<MetricBuffer>> buffers_;
@@ -179,6 +179,8 @@ private:
     std::atomic<bool> isInited_{false};
     std::atomic<uint64_t> registerEpoch_{1};
 
+    // ResolveMetricId, UpdateBuffer and MetricName require mutex_ held shared
+    // or exclusive. Registration appends to the containers they access.
     MetricId ResolveMetricId(const std::string& name) const;
     MetricId ResolveMetricId(const char* name) const;
     MetricId ResolveCachedMetric(CachedMetric& metric) const;

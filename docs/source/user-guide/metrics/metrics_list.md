@@ -3,7 +3,7 @@
 
 ## 1. Metrics Exported by Default
 
-KVClient and transport metrics use the `kv:` prefix; other metrics in the tables below use `ucm:` by default. The default configuration contains 162 Counters, 37 Gauges, and 133 Histograms.
+KVClient and transport metrics use the `kv:` prefix; other metrics in the tables below use `ucm:` by default.
 
 See [UCM Health Metrics](health_metrics.md) for Store health metrics and recommended aggregation.
 
@@ -62,6 +62,9 @@ No Connector-specific Gauges are exported by default.
 
 | Metric                                        | Description                                                                |
 | --------------------------------------------- | -------------------------------------------------------------------------- |
+| `ucm:cache_dram_hit_shards_total` | Successfully loaded shards found Ready at the first state check after slot acquisition |
+| `ucm:cache_dram_load_shards_total` | All successfully loaded shards, including shared-wait and backend loads |
+| `ucm:cache_dram_evicted_bytes_total` | Bytes of Ready slots replaced by Clock; shard-granular, not complete-block evictions |
 | `ucm:cache_lookup_hit_blocks_total`         | Blocks served directly by Cache Lookup without descending to the backend   |
 | `ucm:cache_lookup_miss_blocks_total`        | Blocks missed by Cache Lookup and passed to the backend                    |
 | `ucm:cache_load_shards_total`               | Total shards whose Cache buffer state was inspected during Load            |
@@ -78,7 +81,31 @@ For a Cache | Posix pipeline, the Cache load share is `(total shards - wait shar
 
 #### Gauges
 
-No Cache Store-specific Gauges are exported by default.
+| Metric | Description |
+| --- | --- |
+| `ucm:cache_dram_capacity_bytes` | Capacity of the shared DRAM slot data area |
+| `ucm:cache_dram_used_bytes` | Capacity of assigned slots, including Loading, Ready, Failed and preallocated slots |
+
+Capacity sampling runs on rank 0 every 10 seconds. In each process, shared domains are deduplicated by unique ID and their values are summed into one pair of gauges. Prometheus multiprocess mode uses `livesum` only across processes with identical labels; different `worker_id` or `worker_rank` values remain separate series. A series is not necessarily one shared domain. If the same domain is incorrectly reported by rank 0 in multiple processes, it will be counted multiple times. Values are slot capacities, not RSS. Clock normally replaces assigned slots instead of freeing them, so used capacity can stay high after evictions.
+
+For Grafana, examples using a five-minute window are:
+
+```promql
+sum(rate(ucm:cache_dram_hit_shards_total[5m])) / sum(rate(ucm:cache_dram_load_shards_total[5m]))
+  and on() (sum(rate(ucm:cache_dram_load_shards_total[5m])) > 0)
+```
+
+```promql
+sum(ucm:cache_dram_used_bytes) / sum(ucm:cache_dram_capacity_bytes)
+```
+
+```promql
+sum(rate(ucm:cache_dram_evicted_bytes_total[5m]))
+```
+
+Filter these queries by deployment and available labels; the aggregate requires an explicit `sum`. There is no shared-domain label, so individual domains cannot be selected directly. Retain worker or instance labels for diagnosis. The hit ratio is successful shards found Ready at the first state check after acquisition divided by all successful loads. Shards first observed Loading and then waiting for another task's fill are not direct hits. A concurrent fill between acquisition and the state check is counted as a hit. Failures are excluded. An idle window has no ratio rather than a zero hit rate. The existing lookup and inspected-shard counters use different denominators.
+
+Each Load worker logs a `cache_dram_stats` interval summary every 60 seconds, including domain, device, hit and loaded shard counts and hit rate; an idle interval reports `N/A`. Full-block eviction and tail metadata capacity metrics are unavailable until the tail policy is integrated; the current eviction byte counter reports Clock slot replacement only.
 
 #### Histograms
 

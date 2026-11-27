@@ -33,6 +33,72 @@
 
 using namespace UC::Metrics;
 
+TEST(UCMetricsStress, RegisterWhileWritingAndCollecting)
+{
+    constexpr int kWrites = 6000;
+    constexpr int kRegistrations = 500;
+    const std::string counter = "registration_race_counter";
+    const std::string histogram = "registration_race_histogram";
+    const std::string dynamicPrefix = "registration_race_dynamic_";
+    SetUp();
+    CreateStats(counter, "counter");
+    CreateStats(histogram, "histogram", {1.0});
+    GetAllStatsAndClear();
+    GetAllStatsAndClear();
+
+    std::atomic<bool> start{false};
+    std::atomic<int> remaining{2};
+    std::thread writer([&] {
+        CachedMetric cached{counter};
+        while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+        for (int i = 0; i < kWrites; ++i) {
+            if (i % 2 == 0) { UpdateStats(cached, 1); }
+            else { UpdateStats(counter, 1); }
+            if (i % 100 == 0) {
+                HistogramStatsMap batch;
+                batch.emplace(histogram, HistogramStat{{1, 0}, 1.0});
+                MergeHistogramStats(batch);
+            }
+        }
+        remaining.fetch_sub(1, std::memory_order_release);
+    });
+    std::thread registrar([&] {
+        while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+        for (int i = 0; i < kRegistrations; ++i) {
+            auto name = dynamicPrefix + std::to_string(i);
+            CreateStats(name, "counter");
+            UpdateStats(name, 1);
+        }
+        remaining.fetch_sub(1, std::memory_order_release);
+    });
+
+    double written = 0;
+    double registered = 0;
+    uint64_t histogramCount = 0;
+    auto collect = [&] {
+        auto [counters, gauges, histograms] = GetAllStatsAndClear();
+        (void)gauges;
+        for (const auto& [name, value] : counters) {
+            if (name == counter) { written += value; }
+            else if (name.rfind(dynamicPrefix, 0) == 0) { registered += value; }
+        }
+        auto it = histograms.find(histogram);
+        if (it != histograms.end()) {
+            histogramCount += std::accumulate(it->second.bucketCounts.begin(),
+                                              it->second.bucketCounts.end(), uint64_t{0});
+        }
+    };
+    start.store(true, std::memory_order_release);
+    while (remaining.load(std::memory_order_acquire) != 0) { collect(); }
+    writer.join();
+    registrar.join();
+    collect();
+    collect();
+    EXPECT_EQ(written, kWrites);
+    EXPECT_EQ(registered, kRegistrations);
+    EXPECT_EQ(histogramCount, kWrites / 100);
+}
+
 TEST(UCMetricsStress, DISABLED_TenWritersOneCollector)
 {
     constexpr int numWriters = 10;

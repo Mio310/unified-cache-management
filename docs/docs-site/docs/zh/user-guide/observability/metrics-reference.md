@@ -89,6 +89,9 @@ Cache Store 利用主机缓冲衔接设备与下层存储，适合判断**加载
 
 | 指标 | 说明 |
 | --------------------------------------------- | -------------------------------------------------------------------------- |
+| `ucm:cache_dram_hit_shards_total` | 获取 slot 后首次状态检查为 Ready、最终成功加载的分片数 |
+| `ucm:cache_dram_load_shards_total` | 成功加载的分片数，包括等待其他任务填充或从后端加载 |
+| `ucm:cache_dram_evicted_bytes_total` | Clock 替换 Ready slot 的累计字节数，按分片统计，并非完整 block 淘汰量 |
 | `ucm:cache_lookup_hit_blocks_total` | Cache Lookup 直接命中、未向后端查询的块数 |
 | `ucm:cache_lookup_miss_blocks_total` | Cache Lookup 未命中并继续查询后端的块数 |
 | `ucm:cache_load_shards_total` | Load 时检查过 Cache 缓冲状态的分片总数 |
@@ -105,7 +108,31 @@ Cache Store 利用主机缓冲衔接设备与下层存储，适合判断**加载
 
 #### Gauges
 
-默认不导出 Cache Store 专用 Gauge。
+| 指标 | 说明 |
+| --- | --- |
+| `ucm:cache_dram_capacity_bytes` | 共享 DRAM slot 数据区总容量 |
+| `ucm:cache_dram_used_bytes` | 已分配 slot 的容量，包括 Loading、Ready、Failed 和预分配 slot |
+
+rank 0 每 10 秒采集容量。同一进程内按 unique ID 对共享域去重，并将各域容量汇总为一组 Gauge；Prometheus 多进程模式的 `livesum` 只汇总标签完全相同的进程，`worker_id` 或 `worker_rank` 不同时仍是不同序列；一条序列不一定对应单个共享域。如果同一共享域异常地被多个进程的 rank 0 重复上报，会产生重复计数。这是 slot 容量而非进程 RSS；Clock 通常直接替换已分配 slot，因此淘汰后已用容量可能仍维持高位。
+
+Grafana 可使用以下 PromQL，并按部署和已有标签过滤；跨域总量需要显式 `sum`，当前没有共享域标签，不能直接筛选单个域。无成功加载的窗口不显示命中率：
+
+```promql
+sum(rate(ucm:cache_dram_hit_shards_total[5m])) / sum(rate(ucm:cache_dram_load_shards_total[5m]))
+  and on() (sum(rate(ucm:cache_dram_load_shards_total[5m])) > 0)
+```
+
+```promql
+sum(ucm:cache_dram_used_bytes) / sum(ucm:cache_dram_capacity_bytes)
+```
+
+```promql
+sum(rate(ucm:cache_dram_evicted_bytes_total[5m]))
+```
+
+命中率的分母是成功加载的 shard，分子是获取 slot 后首次检查为 Ready 的成功加载 shard；首次检查为 Loading 且随后等待其他任务填充不算直接命中，失败加载不计入分母。其他任务可能在获取 slot 和首次状态检查之间完成填充，相关 shard 会计为命中。旧的 lookup 和检查分片数指标口径不同，不能混用。
+
+每个 Load worker 默认每 60 秒输出一次 `cache_dram_stats` 汇总日志，包含共享域、设备、命中及成功加载数和命中率；空闲窗口显示 `N/A`。完整 block 淘汰和尾部策略元数据容量指标尚未接入；当前淘汰字节数仅表示 Clock 的 slot 替换。
 
 #### Histograms
 

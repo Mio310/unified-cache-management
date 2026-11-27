@@ -85,6 +85,28 @@ struct BufferTestAccess {
 
     static CtrlLayout& Layout(Buffer& buffer) { return buffer.ctrl_.Layout(); }
 
+    static size_t UsedSlots(Buffer& buffer)
+    {
+        return buffer.ctrl_.Layout().Hdr()->usedSlots.load(std::memory_order_relaxed);
+    }
+
+    static void ReportCapacityStats(Buffer& buffer) { buffer.ReportCapacityStats(); }
+
+    static void RegisterMetricsDomain(Buffer& buffer, const std::string& id)
+    {
+        buffer.metricsDomainId_ = id;
+        Buffer::Reporter().Add(&buffer);
+        buffer.metricsRegistered_ = true;
+    }
+
+    static void UnregisterMetricsDomain(Buffer& buffer)
+    {
+        Buffer::Reporter().Remove(&buffer);
+        buffer.metricsRegistered_ = false;
+    }
+
+    static std::pair<double, double> CapacitySnapshot() { return Buffer::Reporter().Snapshot(); }
+
     static size_t BucketOf(Buffer& buffer, const Detail::BlockId& blockId, size_t offset = 0)
     {
         return buffer.HashKey(blockId, offset);
@@ -151,6 +173,95 @@ TEST_F(Cache2BufferTest, GetUntilReturnsPinnedHandleOnSuccess)
     ASSERT_TRUE(hit.HasValue());
     EXPECT_FALSE(hit.Value().Owner());
     EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 2u);
+}
+
+TEST_F(Cache2BufferTest, UsedSlotsCountsReservationsWithoutDoubleCountingHits)
+{
+    Metrics::SetUp();
+    Metrics::CreateStats("cache_dram_capacity_bytes", "gauge");
+    Metrics::CreateStats("cache_dram_used_bytes", "gauge");
+    Metrics::GetAllStatsAndClear();
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer_), 0u);
+    const auto block = MakeBlockId(10500);
+    buffer_.Prealloc(block, 0);
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer_), 1u);
+    {
+        auto first = buffer_.Get(block, 0);
+        auto hit = buffer_.Get(block, 0);
+        EXPECT_EQ(BufferTestAccess::UsedSlots(buffer_), 1u);
+        first.MarkFailed();
+    }
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer_), 1u);
+    BufferTestAccess::ReportCapacityStats(buffer_);
+    auto stats = Metrics::GetAllStatsAndClear();
+    const auto& gauges = std::get<1>(stats);
+    ASSERT_EQ(gauges.count("cache_dram_capacity_bytes"), 1u);
+    ASSERT_EQ(gauges.count("cache_dram_used_bytes"), 1u);
+    EXPECT_EQ(gauges.at("cache_dram_capacity_bytes"), kSlotsPerRank * 4096);
+    EXPECT_EQ(gauges.at("cache_dram_used_bytes"), 4096);
+}
+
+TEST(Cache2BufferMetricsTest, EvictsOnlyReadySlotsIncludingSameBucketReplacement)
+{
+    Metrics::SetUp();
+    Metrics::CreateStats("cache_dram_evicted_bytes_total", "counter");
+    Metrics::GetAllStatsAndClear();
+    constexpr size_t kRanks{1}, kSlotsPerRank{1}, kBuckets{1}, kLocks{1};
+    auto bytes = BufferTestAccess::TotalSize(kBuckets, kLocks, kRanks * kSlotsPerRank);
+    auto* memory = ::operator new(bytes, std::align_val_t{64});
+    {
+        Buffer buffer;
+        BufferTestAccess::Init(buffer, memory, kRanks, kSlotsPerRank, kBuckets, kLocks);
+        buffer.Prealloc(MakeBlockId(20000), 0);  // Loading without an owner.
+        {
+            auto failed = buffer.Get(MakeBlockId(20001), 0);
+            failed.MarkFailed();
+        }
+        {
+            auto ready = buffer.Get(MakeBlockId(20002), 0);
+            ready.MarkReady();
+        }
+        {
+            auto replacement = buffer.Get(MakeBlockId(20003), 0);
+            replacement.MarkReady();
+        }
+        auto stats = Metrics::GetAllStatsAndClear();
+        const auto& counters = std::get<0>(stats);
+        ASSERT_EQ(counters.count("cache_dram_evicted_bytes_total"), 1u);
+        EXPECT_EQ(counters.at("cache_dram_evicted_bytes_total"), 4096);
+        EXPECT_EQ(BufferTestAccess::UsedSlots(buffer), 1u);
+    }
+    ::operator delete(memory, std::align_val_t{64});
+}
+
+TEST(Cache2BufferMetricsTest, ReporterSumsDomainsAndDeduplicatesSharedMappings)
+{
+    constexpr size_t kRanks{2}, kSlotsPerRank{2}, kBuckets{8}, kLocks{4};
+    const auto bytes = BufferTestAccess::TotalSize(kBuckets, kLocks, kRanks * kSlotsPerRank);
+    auto* firstMemory = ::operator new(bytes, std::align_val_t{64});
+    auto* secondMemory = ::operator new(bytes, std::align_val_t{64});
+    {
+        Buffer first;
+        Buffer duplicate;
+        Buffer second;
+        BufferTestAccess::Init(first, firstMemory, kRanks, kSlotsPerRank, kBuckets, kLocks);
+        BufferTestAccess::Attach(duplicate, firstMemory, kRanks, kSlotsPerRank, kBuckets, kLocks, 1);
+        BufferTestAccess::Init(second, secondMemory, kRanks, kSlotsPerRank, kBuckets, kLocks);
+        first.Prealloc(MakeBlockId(21000), 0);
+        second.Prealloc(MakeBlockId(21001), 0);
+        BufferTestAccess::RegisterMetricsDomain(first, "first");
+        BufferTestAccess::RegisterMetricsDomain(duplicate, "first");
+        BufferTestAccess::RegisterMetricsDomain(second, "second");
+        EXPECT_EQ(BufferTestAccess::CapacitySnapshot(),
+                  std::make_pair(2.0 * kRanks * kSlotsPerRank * 4096, 2.0 * 4096));
+        BufferTestAccess::UnregisterMetricsDomain(first);
+        EXPECT_EQ(BufferTestAccess::CapacitySnapshot().first, 2.0 * kRanks * kSlotsPerRank * 4096);
+        BufferTestAccess::UnregisterMetricsDomain(duplicate);
+        EXPECT_EQ(BufferTestAccess::CapacitySnapshot(),
+                  std::make_pair(1.0 * kRanks * kSlotsPerRank * 4096, 1.0 * 4096));
+    }
+    ::operator delete(firstMemory, std::align_val_t{64});
+    ::operator delete(secondMemory, std::align_val_t{64});
 }
 
 TEST_F(Cache2BufferTest, GetUntilRejectsPrecancelAndExpiredDeadlineWithoutPinning)
@@ -509,6 +620,8 @@ TEST(Cache2BufferPartitionTest, PreferredRankClaimsPreallocatedKeyInItsOwnSegmen
 
     auto block = MakeBlockId(1000);
     rank1.Prealloc(block, 0, false, 1);
+    EXPECT_EQ(BufferTestAccess::UsedSlots(rank0), 1u);
+    EXPECT_EQ(BufferTestAccess::UsedSlots(rank1), 1u);
 
     bool owner = false;
     auto wrongRank = BufferTestAccess::TryAcquireSlot(rank0, block, 0, 1, owner, 1);
@@ -584,6 +697,9 @@ TEST(Cache2BufferPartitionTest, NonPreferredRankCanObserveFailedSlotWithoutTakin
 
 TEST(Cache2BufferLockTest, CrossStripeMigrationRollsBackAndCanRetry)
 {
+    Metrics::SetUp();
+    Metrics::CreateStats("cache_dram_evicted_bytes_total", "counter");
+    Metrics::GetAllStatsAndClear();
     constexpr size_t kRanks{1};
     constexpr size_t kSlotsPerRank{1};
     constexpr size_t kBuckets{8};
@@ -625,6 +741,9 @@ TEST(Cache2BufferLockTest, CrossStripeMigrationRollsBackAndCanRetry)
     EXPECT_EQ(layout.SlotMetaArr()[slot].reference.load(std::memory_order_acquire), 0);
     EXPECT_EQ(layout.SlotMetaArr()[slot].hash.load(std::memory_order_acquire), oldBucket);
     EXPECT_EQ(BufferTestAccess::FindSlot(buffer, oldBlock, 0), slot);
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer), 1u);
+    auto failedStats = Metrics::GetAllStatsAndClear();
+    EXPECT_EQ(std::get<0>(failedStats).count("cache_dram_evicted_bytes_total"), 0u);
     oldLock->Unlock();
 
     layout.SlotMetaArr()[slot].accessed.store(0, std::memory_order_relaxed);
@@ -635,6 +754,10 @@ TEST(Cache2BufferLockTest, CrossStripeMigrationRollsBackAndCanRetry)
     BufferTestAccess::MarkReady(buffer, replacement);
     EXPECT_EQ(BufferTestAccess::FindSlot(buffer, oldBlock, 0), kInvalid);
     EXPECT_EQ(BufferTestAccess::FindSlot(buffer, newBlock, 0), slot);
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer), 1u);
+    auto replacementStats = Metrics::GetAllStatsAndClear();
+    ASSERT_EQ(std::get<0>(replacementStats).count("cache_dram_evicted_bytes_total"), 1u);
+    EXPECT_EQ(std::get<0>(replacementStats).at("cache_dram_evicted_bytes_total"), 4096);
 
     BufferTestAccess::Release(buffer, replacement);
     ::operator delete(memory, std::align_val_t{64});

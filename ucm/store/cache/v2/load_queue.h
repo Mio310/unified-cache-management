@@ -25,11 +25,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -47,6 +50,35 @@
 #include "ucmstore_v1.h"
 
 namespace UC::Cache2 {
+
+// Per-worker interval counts. Taking a snapshot also starts a new window.
+class DramHitWindow {
+public:
+    struct Snapshot {
+        size_t hits;
+        size_t loads;
+        std::optional<double> HitRate() const
+        {
+            if (loads == 0) { return std::nullopt; }
+            return 100.0 * static_cast<double>(hits) / static_cast<double>(loads);
+        }
+    };
+    void Add(size_t hits, size_t loads)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        hits_ += hits;
+        loads_ += loads;
+    }
+    Snapshot Take()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {std::exchange(hits_, 0), std::exchange(loads_, 0)};
+    }
+private:
+    std::mutex mutex_{};
+    size_t hits_{0};
+    size_t loads_{0};
+};
 
 /**
  * @brief Load pipeline: host cache buffer (filled from backend) -> device.
@@ -97,6 +129,12 @@ class LoadQ {
     SpscRingQueue<ShardTask> running_{};
     std::thread dispatcher_{};
     std::thread transfer_{};
+    std::thread hitStatsReporter_{};
+    std::mutex hitStatsMutex_{};
+    std::condition_variable hitStatsWake_{};
+    bool hitStatsStop_{false};
+    DramHitWindow hitWindow_{};
+    std::string domainId_{};
     std::vector<ShardTask> holder_{};
 
 public:
@@ -111,6 +149,7 @@ public:
         buffer_ = buffer;
         backend_ = config.storeBackend;
         deviceId_ = config.deviceId;
+        domainId_ = config.uniqueId;
         streamNumber_ = config.EffectiveStreamNumber();
         sdmaDirect_ = config.sdmaDirect;
         ioAggregation_ = config.ioAggregation;
@@ -123,11 +162,20 @@ public:
         running_.Setup(config.runningQueueDepth);
         std::promise<Status> started;
         auto fut = started.get_future();
-        transfer_ = std::thread{&LoadQ::TransferStage, this, std::ref(started)};
-        auto status = fut.get();
-        if (status.Failure()) { return status; }
-        dispatcher_ = std::thread{&LoadQ::DispatchStage, this};
-        return status;
+        try {
+            transfer_ = std::thread{&LoadQ::TransferStage, this, std::ref(started)};
+            auto status = fut.get();
+            if (status.Failure()) {
+                Close();
+                return status;
+            }
+            hitStatsReporter_ = std::thread{&LoadQ::ReportHitStats, this};
+            dispatcher_ = std::thread{&LoadQ::DispatchStage, this};
+            return status;
+        } catch (const std::system_error& e) {
+            Close();
+            return Status::Error(std::string("failed to start cache load threads: ") + e.what());
+        }
     }
     void Submit(TaskPtr task, WaiterPtr waiter)
     {
@@ -169,6 +217,12 @@ public:
         transferStop_.store(true, std::memory_order_release);
         if (transfer_.joinable()) { transfer_.join(); }
         DrainRunning();
+        {
+            std::lock_guard<std::mutex> lock(hitStatsMutex_);
+            hitStatsStop_ = true;
+        }
+        hitStatsWake_.notify_one();
+        if (hitStatsReporter_.joinable()) { hitStatsReporter_.join(); }
     }
 
 private:
@@ -472,7 +526,7 @@ private:
         holder_.clear();
     }
     void RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
-                            bool success) const
+                            bool success)
     {
         size_t cache = 0;
         size_t posix = 0;
@@ -486,6 +540,31 @@ private:
                              static_cast<double>(cache));
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_posix_load_success_shards_total"),
                              static_cast<double>(posix));
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_hit_shards_total"),
+                             static_cast<double>(cache));
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_load_shards_total"),
+                             static_cast<double>(cache + posix));
+        hitWindow_.Add(cache, cache + posix);
+    }
+    void ReportHitStats()
+    {
+        std::unique_lock<std::mutex> lock(hitStatsMutex_);
+        while (!hitStatsWake_.wait_for(lock, std::chrono::seconds(60),
+                                       [this] { return hitStatsStop_; })) {
+            const auto snapshot = hitWindow_.Take();
+            const auto rate = snapshot.HitRate();
+            lock.unlock();
+            if (!rate.has_value()) {
+                UC_INFO_UNLIMITED("cache_dram_stats domain={} device={} interval=60s "
+                                  "hit_shards={} load_shards={} hit_rate=N/A",
+                                  domainId_, deviceId_, snapshot.hits, snapshot.loads);
+            } else {
+                UC_INFO_UNLIMITED("cache_dram_stats domain={} device={} interval=60s "
+                                  "hit_shards={} load_shards={} hit_rate={:.2f}%",
+                                  domainId_, deviceId_, snapshot.hits, snapshot.loads, *rate);
+            }
+            lock.lock();
+        }
     }
     void RecordLoadSourceShards(size_t total, size_t wait) const
     {
