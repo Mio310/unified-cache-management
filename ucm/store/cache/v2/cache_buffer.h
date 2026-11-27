@@ -33,6 +33,8 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include "ctrl_layout.h"
@@ -85,6 +87,10 @@ class Buffer {
     std::vector<size_t> evictFreeReserved_;
     EvictSet evictHot_;
     EvictSet evictCold_;
+    // The key actually stored for each slot. Erase uses this, not a position
+    // captured before evictMu_ was taken.
+    std::unordered_map<size_t, EvictKey> evictByIndex_;
+    std::unordered_set<size_t> evictFreeMembers_;
 
     static constexpr size_t kPinSpinFast{64};
 
@@ -402,9 +408,8 @@ private:
         auto iNode = Lookup(layout, iBucket, blockId, offset);
         if (iNode != kInvalid) {
             auto* meta = &layout.SlotMetaArr()[iNode];
-            const auto oldPos = meta->position.load(std::memory_order_relaxed);
             RememberPrefix(*meta, prefixPosition, true);
-            MarkAccessedHot(*meta, iNode, oldPos);
+            MarkAccessedHot(*meta, iNode);
             targetLock->Unlock();
             return true;
         }
@@ -474,9 +479,8 @@ private:
             if (owner && state == State::Failed) {
                 meta->state.store(State::Loading, std::memory_order_release);
             }
-            const auto oldPos = meta->position.load(std::memory_order_relaxed);
             RememberPrefix(*meta, prefixPosition, true);
-            MarkAccessedHot(*meta, iNode, oldPos);
+            MarkAccessedHot(*meta, iNode);
             return true;
         }
         return false;
@@ -547,12 +551,11 @@ private:
                 StoreKey(*meta, blockId, offset);
                 meta->state.store(State::Loading, std::memory_order_relaxed);
             }
-            const auto oldPos = meta->position.load(std::memory_order_relaxed);
             RememberPrefix(*meta, prefixPosition, sameKey);
             meta->accessed.store(1, std::memory_order_relaxed);
             meta->reference.store(initialReference, std::memory_order_release);
             NoteDramInstall(oldBucket == kInvalid, oldBucket != kInvalid && !sameKey);
-            NoteEvictInstalled(iNode, oldBucket == kInvalid, oldPos);
+            NoteEvictInstalled(iNode);
             return iNode;
         }
         return kInvalid;
@@ -589,6 +592,8 @@ private:
         evictCold_.clear();
         evictFree_.clear();
         evictFreeReserved_.clear();
+        evictByIndex_.clear();
+        evictFreeMembers_.clear();
         evictReady_ = false;
         if (myRank_ == kInvalid || slotsPerRank_ == 0) { return; }
         auto& layout = ctrl_.Layout();
@@ -602,6 +607,7 @@ private:
                 auto& meta = layout.SlotMetaArr()[index];
                 if (meta.hash.load(std::memory_order_relaxed) != kInvalid) { continue; }
                 dest.push_back(index);
+                evictFreeMembers_.insert(index);
             }
         };
         pushFree(usable, evictFree_);
@@ -610,6 +616,7 @@ private:
             auto& meta = layout.SlotMetaArr()[index];
             if (meta.hash.load(std::memory_order_relaxed) == kInvalid) {
                 evictFreeReserved_.push_back(index);
+                evictFreeMembers_.insert(index);
             }
         }
         for (size_t local = 0; local < slotsPerRank_; ++local) {
@@ -622,6 +629,7 @@ private:
             } else {
                 evictCold_.insert(key);
             }
+            evictByIndex_.emplace(index, key);
         }
         evictRank_ = myRank_;
         evictSlotsPerRank_ = slotsPerRank_;
@@ -631,17 +639,20 @@ private:
 
     size_t TakeFreeLocked(bool allowReserved)
     {
-        if (!evictFree_.empty()) {
-            const auto index = evictFree_.back();
-            evictFree_.pop_back();
-            return index;
-        }
-        if (allowReserved && !evictFreeReserved_.empty()) {
-            const auto index = evictFreeReserved_.back();
-            evictFreeReserved_.pop_back();
-            return index;
-        }
-        return kInvalid;
+        auto take = [this](std::vector<size_t>& slots) -> size_t {
+            while (!slots.empty()) {
+                const auto index = slots.back();
+                slots.pop_back();
+                evictFreeMembers_.erase(index);
+                if (evictByIndex_.find(index) != evictByIndex_.end()) { continue; }
+                return index;
+            }
+            return kInvalid;
+        };
+        const auto index = take(evictFree_);
+        if (index != kInvalid) { return index; }
+        if (!allowReserved) { return kInvalid; }
+        return take(evictFreeReserved_);
     }
 
     EvictSet::iterator FindEvictSlot(EvictSet& from, EvictSet& other, CtrlLayout& layout,
@@ -675,15 +686,39 @@ private:
         return from.end();
     }
 
-    // Drop the victim from both sets before Alloc publishes it. Remove() clears
+    // One key per slot. The stored key may not match a position read before the lock.
+    void EraseEvictIndexLocked(size_t index)
+    {
+        auto it = evictByIndex_.find(index);
+        if (it == evictByIndex_.end()) { return; }
+        evictHot_.erase(it->second);
+        evictCold_.erase(it->second);
+        evictByIndex_.erase(it);
+    }
+
+    void PlaceEvictIndexLocked(size_t index, bool hot)
+    {
+        EraseEvictIndexLocked(index);
+        evictFreeMembers_.erase(index);
+        const auto pos =
+            ctrl_.Layout().SlotMetaArr()[index].position.load(std::memory_order_relaxed);
+        const EvictKey key{pos, index};
+        if (hot) {
+            evictHot_.insert(key);
+        } else {
+            evictCold_.insert(key);
+        }
+        evictByIndex_.emplace(index, key);
+    }
+
+    // Drop the victim from the index before Alloc publishes it. Remove() clears
     // hash outside evictMu_; a slot still indexed there is pushed onto the free
-    // list by the next FindEvictSlot and then inserted again by NoteEvictInstalled.
+    // list by the next FindEvictSlot.
     size_t DetachEvictIndex(EvictSet::iterator it)
     {
-        const EvictKey key = *it;
-        evictHot_.erase(key);
-        evictCold_.erase(key);
-        return key.index;
+        const auto index = it->index;
+        EraseEvictIndexLocked(index);
+        return index;
     }
 
     size_t SelectOccupiedLocked(CtrlLayout& layout, size_t begin, size_t end)
@@ -714,25 +749,18 @@ private:
         auto& meta = ctrl_.Layout().SlotMetaArr()[index];
         const auto hash = meta.hash.load(std::memory_order_acquire);
         const auto reference = meta.reference.load(std::memory_order_acquire);
-        const auto pos = meta.position.load(std::memory_order_relaxed);
         if (hash == kInvalid && reference == 0) {
-            evictHot_.erase(EvictKey{pos, index});
-            evictCold_.erase(EvictKey{pos, index});
             ReturnFreeLocked(index);
             return;
         }
         if (hash == kInvalid) { return; }
-        evictHot_.erase(EvictKey{pos, index});
-        evictCold_.erase(EvictKey{pos, index});
-        if (meta.accessed.load(std::memory_order_relaxed) != 0) {
-            evictHot_.insert(EvictKey{pos, index});
-        } else {
-            evictCold_.insert(EvictKey{pos, index});
-        }
+        PlaceEvictIndexLocked(index, meta.accessed.load(std::memory_order_relaxed) != 0);
     }
 
     void ReturnFreeLocked(size_t index)
     {
+        EraseEvictIndexLocked(index);
+        if (!evictFreeMembers_.insert(index).second) { return; }
         const auto base = myRank_ * slotsPerRank_;
         const auto reserved = reservedSlots_ < slotsPerRank_ ? reservedSlots_ : slotsPerRank_;
         const auto usable = slotsPerRank_ - reserved;
@@ -745,39 +773,22 @@ private:
 
     void MarkAccessedHot(SlotMeta& meta, size_t index)
     {
-        const auto oldPos = meta.position.load(std::memory_order_relaxed);
         meta.accessed.store(1, std::memory_order_relaxed);
-        NoteEvictHot(index, oldPos);
+        NoteEvictHot(index);
     }
 
-    void MarkAccessedHot(SlotMeta& meta, size_t index, uint32_t oldPos)
-    {
-        meta.accessed.store(1, std::memory_order_relaxed);
-        NoteEvictHot(index, oldPos);
-    }
-
-    void NoteEvictHot(size_t index, uint32_t oldPos)
+    void NoteEvictHot(size_t index)
     {
         std::lock_guard<std::mutex> lock(evictMu_);
         if (!evictReady_) { return; }
-        evictHot_.erase(EvictKey{oldPos, index});
-        evictCold_.erase(EvictKey{oldPos, index});
-        const auto pos =
-            ctrl_.Layout().SlotMetaArr()[index].position.load(std::memory_order_relaxed);
-        evictHot_.insert(EvictKey{pos, index});
+        PlaceEvictIndexLocked(index, true);
     }
 
-    void NoteEvictInstalled(size_t index, bool wasEmpty, uint32_t oldPos)
+    void NoteEvictInstalled(size_t index)
     {
         std::lock_guard<std::mutex> lock(evictMu_);
         if (!evictReady_) { return; }
-        if (!wasEmpty) {
-            evictHot_.erase(EvictKey{oldPos, index});
-            evictCold_.erase(EvictKey{oldPos, index});
-        }
-        const auto pos =
-            ctrl_.Layout().SlotMetaArr()[index].position.load(std::memory_order_relaxed);
-        evictHot_.insert(EvictKey{pos, index});
+        PlaceEvictIndexLocked(index, true);
     }
 
     static void MoveTo(CtrlLayout& layout, size_t iBucket, size_t iNode)
