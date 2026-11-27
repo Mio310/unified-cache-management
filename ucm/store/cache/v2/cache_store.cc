@@ -86,11 +86,15 @@ public:
     }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
+        // Prefix relations cannot be honored until the shared metadata and
+        // slot-claim protocols are connected. Never silently discard them.
+        if (!task.blockRelations.empty()) { return Status::Unsupported(); }
         if (!transEnable_) { return Status::Error("transfer is not enabled"); }
         return transMgr_.Submit({Task::Type::LOAD, std::move(task)});
     }
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
+        if (!task.blockRelations.empty()) { return Status::Unsupported(); }
         if (!transEnable_) { return Status::Error("transfer is not enabled"); }
         return transMgr_.Submit({Task::Type::DUMP, std::move(task)});
     }

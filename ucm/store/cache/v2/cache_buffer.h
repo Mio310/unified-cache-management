@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <functional>
@@ -201,6 +202,33 @@ public:
             bool owner = false;
             auto slot =
                 TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank);
+            if (slot != kInvalid) { return Handle{this, slot, owner}; }
+            std::this_thread::yield();
+        }
+    }
+
+    // Bounded/cancellable variant of Get. A cancellation observed before an
+    // acquisition attempt returns Retry; expiration returns Timeout. If either
+    // races with a successful attempt, the handle may still be returned and
+    // the caller remains responsible for handling cancellation and I/O safely.
+    // Attempts are intentionally small so cancellation can be observed between
+    // scans, but scheduling and an individual attempt do not have a hard bound.
+    Expected<Handle> GetUntil(const Detail::BlockId& blockId, size_t offset,
+                              std::chrono::steady_clock::time_point deadline,
+                              const std::atomic_bool& cancelled, bool allowReserved = false,
+                              size_t preferredRank = kInvalid)
+    {
+        assert(myRank_ < rankCount_);
+        assert(preferredRank == kInvalid || preferredRank < rankCount_);
+        assert(reservedSlots_ < slotsPerRank_);
+        const auto usable = slotsPerRank_ - (allowReserved ? 0 : reservedSlots_);
+        constexpr size_t kMaxAttemptsPerScan = 64;
+        const auto attempts = usable > kMaxAttemptsPerScan / 2 ? kMaxAttemptsPerScan : 2 * usable;
+        for (;;) {
+            if (cancelled.load(std::memory_order_acquire)) { return Status::Retry(); }
+            if (std::chrono::steady_clock::now() >= deadline) { return Status::Timeout(); }
+            bool owner = false;
+            auto slot = TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank);
             if (slot != kInvalid) { return Handle{this, slot, owner}; }
             std::this_thread::yield();
         }

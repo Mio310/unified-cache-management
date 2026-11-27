@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -254,6 +255,30 @@ TEST_F(UCCache2TransManagerTest, WaitTimesOutWhenQueueStalls)
     });
     EXPECT_EQ(mgr.Wait(handle.Value()), UC::Status::Timeout());
     completer.join();
+}
+
+TEST_F(UCCache2TransManagerTest, WaitTimeoutSignalsTaskCancellationBeforeDrain)
+{
+    TestedManager mgr;
+    UC::Cache2::Config config;
+    config.timeoutMs = 20;
+    config.shardSize = 4096;
+    ASSERT_TRUE(mgr.Setup(config, nullptr).Success());
+    std::thread worker;
+    std::atomic_bool observedCancellation{false};
+    FakeLoadQueue::action = [&](const TaskPtr& task, const WaiterPtr& waiter) {
+        waiter->Up();
+        worker = std::thread([&, task, waiter] {
+            while (!task->cancelled.load()) { std::this_thread::yield(); }
+            observedCancellation.store(true);
+            waiter->Done();
+        });
+    };
+    auto handle = mgr.Submit({Task::Type::LOAD, MakeDesc(1)});
+    ASSERT_TRUE(handle.HasValue());
+    EXPECT_EQ(mgr.Wait(handle.Value()), UC::Status::Timeout());
+    worker.join();
+    EXPECT_TRUE(observedCancellation.load());
 }
 
 }  // namespace

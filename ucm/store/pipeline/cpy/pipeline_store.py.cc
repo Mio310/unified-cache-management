@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include <list>
+#include <cstring>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <stdexcept>
@@ -156,6 +157,39 @@ class PipelineStore {
         return desc;
     }
 
+    static void SetBlockRelations(Detail::TaskDesc& desc, const py::object& relations)
+    {
+        if (relations.is_none()) { return; }
+        auto parseId = [](const py::handle& value) {
+            if (!py::isinstance<py::bytes>(value)) {
+                throw py::value_error("block relation IDs must be bytes");
+            }
+            auto raw = py::cast<std::string>(value);
+            Detail::BlockId result{};
+            if (raw.size() != result.size()) {
+                throw py::value_error("block relation IDs must be 16 bytes");
+            }
+            std::memcpy(result.data(), raw.data(), result.size());
+            return result;
+        };
+        for (const auto& item : py::cast<py::iterable>(relations)) {
+            auto pair = py::cast<py::sequence>(item);
+            if (py::len(pair) != 2) {
+                throw py::value_error("a block relation must contain child and parent");
+            }
+            Detail::BlockRelation relation;
+            py::object child = pair[0];
+            py::object parent = pair[1];
+            relation.child = parseId(child);
+            relation.isRoot = parent.is_none();
+            if (!relation.isRoot) { relation.parent = parseId(parent); }
+            desc.blockRelations.push_back(relation);
+        }
+        // The Cache Store is not connected to this metadata yet. Fail closed:
+        // an arbitrary StoreV1 implementation may otherwise ignore it silently.
+        throw std::runtime_error("block relations are not supported by this pipeline yet");
+    }
+
 public:
     PipelineStore() = default;
     ~PipelineStore()
@@ -240,22 +274,26 @@ public:
     }
     Detail::TaskHandle Load(const pybind11::buffer& ids, const pybind11::buffer& indexes,
                             const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0,
-                            bool distribute_backend_load = false)
+                            bool distribute_backend_load = false,
+                            const py::object& block_relations = py::none())
     {
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Load";
         desc.prerequisiteHandle = prerequisite_handle;
         desc.distributeBackendLoad = distribute_backend_load;
+        SetBlockRelations(desc, block_relations);
         auto res = StoreBack()->Load(std::move(desc));
         if (res) { return res.Value(); }
         ThrowError(res.Error());
     }
     Detail::TaskHandle Dump(const pybind11::buffer& ids, const pybind11::buffer& indexes,
-                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0)
+                            const pybind11::buffer& addrs, uintptr_t prerequisite_handle = 0,
+                            const py::object& block_relations = py::none())
     {
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Dump";
         desc.prerequisiteHandle = prerequisite_handle;
+        SetBlockRelations(desc, block_relations);
         auto res = StoreBack()->Dump(desc);
         if (res) { return res.Value(); }
         if (res.Error() == Status::StoreUnhealthy()) { return UNHEALTHY_DUMP_TASK; }
@@ -304,9 +342,10 @@ PYBIND11_MODULE(ucmpipelinestore, m)
     s.def("Prefetch", &PipelineStore::Prefetch, py::arg("ids").noconvert());
     s.def("Load", &PipelineStore::Load, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
           py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
-          py::arg("distribute_backend_load") = false);
+          py::arg("distribute_backend_load") = false, py::arg("block_relations") = py::none());
     s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
-          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
+          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0,
+          py::arg("block_relations") = py::none());
     s.def("Check", &PipelineStore::Check);
     s.def("Wait", &PipelineStore::Wait);
 }

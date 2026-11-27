@@ -160,6 +160,7 @@ class RankConsistencyManager:
         *,
         distribute_backend_load: bool = False,
         event_handle: int = 0,
+        block_relations: list[tuple[bytes, bytes | None]] | None = None,
     ) -> Any:
         """Retain request block IDs and classify immediate NotFound errors."""
         request_context = (
@@ -175,6 +176,8 @@ class RankConsistencyManager:
             load_options["distribute_backend_load"] = distribute_backend_load
         if event_handle:
             load_options["prerequisite_handle"] = event_handle
+        if block_relations is not None:
+            load_options["block_relations"] = block_relations
         try:
             task = store.load_data(
                 block_ids,
@@ -232,6 +235,8 @@ class RankConsistencyManager:
         shard_indices: list[int],
         ptrs: Any,
         event_handle: int,
+        *,
+        block_relations: list[tuple[bytes, bytes | None]] | None = None,
     ) -> Any:
         """Track submitted blocks and the Store used by each dump task."""
         request_context = (
@@ -247,7 +252,13 @@ class RankConsistencyManager:
                 request_block_ids
             )
         try:
-            task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            if block_relations is None:
+                task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            else:
+                task = store.dump_data(
+                    block_ids, shard_indices, ptrs, event_handle,
+                    block_relations=block_relations,
+                )
         except Exception:
             self._record_dump_failure(request_context)
             raise

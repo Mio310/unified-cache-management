@@ -165,6 +165,7 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         prerequisite_handle: int = 0,
         *,
         distribute_backend_load: bool = False,
+        block_relations: list[tuple[bytes, bytes | None]] | None = None,
     ) -> Task:
         ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         indexes = array.array("Q", shard_index)
@@ -172,9 +173,15 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
             addrs = dst_addr
         else:
             addrs = np.array(dst_addr, dtype=np.uint64)
-        task_id = self.store_.Load(
-            ids, indexes, addrs, prerequisite_handle, distribute_backend_load
-        )
+        if block_relations is None:
+            task_id = self.store_.Load(
+                ids, indexes, addrs, prerequisite_handle, distribute_backend_load
+            )
+        else:
+            task_id = self.store_.Load(
+                ids, indexes, addrs, prerequisite_handle, distribute_backend_load,
+                block_relations,
+            )
         return UcmPipelineStoreTransTask(task_id)
 
     def dump_data(
@@ -183,6 +190,8 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         shard_index: List[int],
         src_addr: List[List[int]] | np.ndarray,
         prerequisite_handle: int = 0,
+        *,
+        block_relations: list[tuple[bytes, bytes | None]] | None = None,
     ) -> Task:
         ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         indexes = array.array("Q", shard_index)
@@ -190,7 +199,12 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
             addrs = src_addr
         else:
             addrs = np.array(src_addr, dtype=np.uint64)
-        task_id = self.store_.Dump(ids, indexes, addrs, prerequisite_handle)
+        if block_relations is None:
+            task_id = self.store_.Dump(ids, indexes, addrs, prerequisite_handle)
+        else:
+            task_id = self.store_.Dump(
+                ids, indexes, addrs, prerequisite_handle, block_relations
+            )
         return UcmPipelineStoreTransTask(task_id)
 
     def wait(self, task: Task) -> None:

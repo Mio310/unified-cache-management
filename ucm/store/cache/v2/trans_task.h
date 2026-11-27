@@ -43,7 +43,8 @@ struct Task {
         : id{other.id},
           type{other.type},
           desc{std::move(other.desc)},
-          failureStatus{other.failureStatus.load()}
+          failureStatus{other.failureStatus.load()},
+          cancelled{other.cancelled.load()}
     {
     }
 
@@ -51,6 +52,7 @@ struct Task {
     Type type{Type::DUMP};
     Detail::TaskDesc desc;
     std::atomic<int32_t> failureStatus{Status::OK().Underlying()};
+    std::atomic_bool cancelled{false};
 
     void Fail(const Status& status)
     {

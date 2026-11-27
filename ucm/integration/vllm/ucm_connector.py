@@ -43,6 +43,12 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 import ucm.integration.vllm.request_hasher as request_hasher_module
+from ucm.integration.vllm.block_relations import (
+    BlockRelation,
+    map_relation_keys,
+    relations_for_slice,
+    select_relations,
+)
 from ucm.integration.vllm.cache_config import (
     cache_rank_count,
     configure_cache_capacity,
@@ -434,6 +440,8 @@ class RequestDispatchMeta:
     # Keep this keyword-only so adding the optional async flag does not change
     # positional constructor semantics for connector-specific subclasses.
     load_async: bool = field(default=False, kw_only=True)
+    load_relations: list[BlockRelation] | None = field(default=None, kw_only=True)
+    dump_relations: list[BlockRelation] | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1700,6 +1708,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self.launch_config = ucm_config.get_config()
+        # Internal only until the Store's strict eviction protocol is complete.
+        self._tail_relations_enabled = False
         _apply_cuda_indexer_io_config(
             self.launch_config,
             kv_cache_config,
@@ -2279,6 +2289,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         external_start = req_meta.hbm_hit_block_num
         num_external_blocks = math.ceil(num_external_tokens / self.block_size)
         external_end = external_start + num_external_blocks
+        if getattr(self, "_tail_relations_enabled", False):
+            self._validate_tail_scope()
         load_vllm_block_ids = list(vllm_block_ids[external_start:external_end])
         load_ucm_block_ids = list(
             req_meta.ucm_block_ids[
@@ -2302,6 +2314,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
             load_block_ids=(load_ucm_block_ids, load_vllm_block_ids),
             dump_block_ids=([], []),
             load_async=True,
+            load_relations=(
+                relations_for_slice(
+                    req_meta.ucm_block_ids, external_start, external_end
+                )
+                if getattr(self, "_tail_relations_enabled", False)
+                else None
+            ),
         )
         self._async_load_req_ids.add(request_id)
 
@@ -2325,6 +2344,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         """
 
         hbm_hit_block_num = req_meta.hbm_hit_block_num
+        if getattr(self, "_tail_relations_enabled", False):
+            self._validate_tail_scope()
         total_hit_block_num = req_meta.total_hit_block_num
         ucm_block_ids = req_meta.ucm_block_ids
         req_meta.vllm_block_ids.extend(vllm_block_ids)
@@ -2362,7 +2383,68 @@ class UCMDirectConnector(KVConnectorBase_V1):
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
             dump_block_start=dump_block_start,
+            load_relations=(
+                relations_for_slice(
+                    ucm_block_ids, hbm_hit_block_num, total_hit_block_num
+                )
+                if need_load
+                else []
+            )
+            if getattr(self, "_tail_relations_enabled", False)
+            else None,
+            dump_relations=(
+                relations_for_slice(
+                    ucm_block_ids,
+                    dump_block_start,
+                    dump_block_start + len(dump_ucm_block_ids),
+                )
+                if dump_ucm_block_ids
+                else []
+            )
+            if getattr(self, "_tail_relations_enabled", False)
+            else None,
         )
+
+    def _validate_tail_scope(self) -> None:
+        # Whitelist exact implementations: HLA, HMA, CP and other subclasses
+        # can override dispatch or submission and do not share this contract.
+        if type(self) not in (UCMDirectConnector, UCMLayerWiseConnector):
+            raise ValueError("tail relations do not support this connector")
+        if self.cp_world_size != 1:
+            raise ValueError("tail relations do not support context parallelism")
+        if self._vllm_config.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("tail relations do not support pipeline parallelism")
+
+    def _store_block_relations(
+        self, relations: list[BlockRelation] | None, block_ids: list[bytes]
+    ) -> list[BlockRelation] | None:
+        if not getattr(self, "_tail_relations_enabled", False):
+            return None
+        self._validate_tail_scope()
+        if relations is None:
+            raise ValueError("missing block relations in dispatch metadata")
+        selected = select_relations(relations, block_ids)
+        if self.tp_rank % self.tp_size != 0 and not self.is_mla:
+            selected = map_relation_keys(selected, self.request_hasher)
+        return selected
+
+    def _load_relation_options(self, request, block_ids: list[bytes]) -> dict:
+        if not getattr(self, "_tail_relations_enabled", False):
+            return {}
+        relations = self._store_block_relations(request.load_relations, block_ids)
+        return {} if relations is None else {"block_relations": relations}
+
+    def _dump_relation_options(self, metadata, request_ids, store_block_ids) -> dict:
+        if not getattr(self, "_tail_relations_enabled", False):
+            return {}
+        relations = []
+        for request_id in request_ids:
+            request = metadata.request_meta[request_id]
+            block_ids, _ = self._get_rank_dump_blocks(request)
+            relations.extend(
+                self._store_block_relations(request.dump_relations, block_ids)
+            )
+        return {"block_relations": select_relations(relations, store_block_ids)}
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -2503,6 +2585,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     shard_indexs,
                     total_ptrs,
                     distribute_backend_load=self.is_mla,
+                    **self._load_relation_options(request, ucm_block_ids),
                 )
                 if request.load_async:
                     self._pending_load_tasks[request_id] = PendingLoadTask(
@@ -2705,6 +2788,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     shard_indexs,
                     total_ptrs,
                     event_handle,
+                    **self._dump_relation_options(
+                        metadata, dump_request_ids, total_ucm_block_ids
+                    ),
                 )
             except Exception as e:
                 logger.error(f"dump kv cache failed. {type(e).__name__}: {e}")
@@ -3107,6 +3193,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 shard_indexs,
                 layer_ptrs,
                 event_handle,
+                **self._dump_relation_options(
+                    metadata, dump_request_ids, total_ucm_block_ids
+                ),
             )
             self._pending_dump_tasks.append(
                 PendingDumpTask(
@@ -3157,6 +3246,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     shard_indexs,
                     layer_ptrs,
                     distribute_backend_load=self.is_mla,
+                    **self._load_relation_options(
+                        metadata.request_meta[request_id], ucm_block_ids
+                    ),
                 )
                 self.load_tasks[layer_id][request_id] = task
                 submitted = True

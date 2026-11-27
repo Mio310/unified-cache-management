@@ -54,6 +54,13 @@ struct Shard {
     std::vector<void*> addrs; /* Device-side buffer addresses */
 };
 
+/** Direct prefix relation for a block. A root has no parent. */
+struct BlockRelation {
+    BlockId child{};
+    BlockId parent{};
+    bool isRoot{false};
+};
+
 /**
  * @brief Byte range inside one tensor buffer for LoadOnToken.
  */
@@ -87,6 +94,9 @@ struct TaskDesc : std::vector<Shard> {
     MemoryType memoryType{MemoryType::HBM};
     /** Shared keys requested by every rank may distribute backend fills. */
     bool distributeBackendLoad{false};
+    /** Optional prefix relationships; all store libraries must be rebuilt when
+     * the public TaskDesc layout changes. */
+    std::vector<BlockRelation> blockRelations{};
 };
 
 }  // namespace UC::Detail

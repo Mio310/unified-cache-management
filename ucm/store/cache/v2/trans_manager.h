@@ -52,6 +52,7 @@ public:
 
 protected:
     Status FailureStatus(const TaskPtr& task) const override { return task->FailureStatus(); }
+    void Cancel(TaskPtr task) override { task->cancelled.store(true, std::memory_order_release); }
     void Dispatch(TaskPtr t, WaiterPtr w) override
     {
         const auto isLoad = t->type == Task::Type::LOAD;

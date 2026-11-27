@@ -24,8 +24,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <thread>
@@ -74,6 +76,11 @@ class LoadQ {
     };
 
     alignas(64) std::atomic_bool stop_{false};
+    alignas(64) std::atomic_bool transferStop_{false};
+    std::mutex submitMutex_{};
+    std::mutex closeMutex_{};
+    std::mutex activeMutex_{};
+    TaskPtr activeTask_{};
     TaskIdSet* failureSet_{nullptr};
     BufferT* buffer_{nullptr};
     StoreV1* backend_{nullptr};
@@ -114,16 +121,30 @@ public:
         cpuAffinityCores_ = config.cpuAffinityCores;
         waiting_.Setup(config.waitingQueueDepth);
         running_.Setup(config.runningQueueDepth);
-        dispatcher_ = std::thread{&LoadQ::DispatchStage, this};
         std::promise<Status> started;
         auto fut = started.get_future();
         transfer_ = std::thread{&LoadQ::TransferStage, this, std::ref(started)};
-        return fut.get();
+        auto status = fut.get();
+        if (status.Failure()) { return status; }
+        dispatcher_ = std::thread{&LoadQ::DispatchStage, this};
+        return status;
     }
     void Submit(TaskPtr task, WaiterPtr waiter)
     {
         waiter->Up();
-        if (waiting_.TryPush({task, waiter})) { return; }
+        bool stopped = false;
+        {
+            // Serialize producers as well as the stop check and queue insertion.
+            std::lock_guard<std::mutex> lock(submitMutex_);
+            stopped = stop_.load(std::memory_order_acquire);
+            if (!stopped && waiting_.TryPush({task, waiter})) { return; }
+        }
+        if (stopped) {
+            task->Fail(Status::Error("load queue closed"));
+            failureSet_->Insert(task->id);
+            waiter->Done();
+            return;
+        }
         UC_ERROR("Waiting queue full, submit load task({}) failed.", task->id);
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_queue_full_total"), 1.0);
         RecordFailedShards(task->desc.size());
@@ -132,9 +153,20 @@ public:
     }
     void Close()
     {
-        if (stop_.exchange(true)) { return; }
+        std::lock_guard<std::mutex> closeLock(closeMutex_);
+        {
+            std::lock_guard<std::mutex> submitLock(submitMutex_);
+            if (stop_.exchange(true)) { return; }
+        }
+        {
+            std::lock_guard<std::mutex> activeLock(activeMutex_);
+            if (activeTask_) { activeTask_->cancelled.store(true, std::memory_order_release); }
+        }
         if (dispatcher_.joinable()) { dispatcher_.join(); }
         DrainWaiting();
+        // Keep the consumer running until the producer has stopped so a full
+        // running queue cannot strand the dispatch thread during shutdown.
+        transferStop_.store(true, std::memory_order_release);
         if (transfer_.joinable()) { transfer_.join(); }
         DrainRunning();
     }
@@ -158,7 +190,18 @@ private:
             waiter->Done();
             return;
         }
+        {
+            std::lock_guard<std::mutex> lock(activeMutex_);
+            activeTask_ = task;
+            if (stop_.load(std::memory_order_acquire)) {
+                task->cancelled.store(true, std::memory_order_release);
+            }
+        }
         DispatchShards(task, waiter);
+        {
+            std::lock_guard<std::mutex> lock(activeMutex_);
+            activeTask_.reset();
+        }
     }
     void DispatchShards(const TaskPtr& task, const WaiterPtr& waiter)
     {
@@ -176,10 +219,29 @@ private:
             const auto originalIndex = indexes[i];
             auto& shard = task->desc[originalIndex];
             ShardTask shardTask;
-            auto handle =
+            auto result =
                 task->desc.distributeBackendLoad
-                    ? buffer_->Get(shard.owner, shard.index, true, originalIndex % localRankSize_)
-                    : buffer_->Get(shard.owner, shard.index, true);
+                    ? buffer_->GetUntil(shard.owner, shard.index,
+                                        std::chrono::steady_clock::time_point::max(),
+                                        task->cancelled, true,
+                                        originalIndex % localRankSize_)
+                    : buffer_->GetUntil(shard.owner, shard.index,
+                                        std::chrono::steady_clock::time_point::max(),
+                                        task->cancelled, true);
+            if (!result) {
+                RecordLoadSourceShards(i, waitShardCount);
+                RecordFailedShards(nShard - i);
+                FailDispatchedTask(task, waiter, result.Error(), i);
+                return;
+            }
+            auto handle = std::move(result).Value();
+            if (task->cancelled.load(std::memory_order_acquire)) {
+                if (handle.Owner() && handle.GetState() != SlotState::Ready) { handle.MarkFailed(); }
+                RecordLoadSourceShards(i, waitShardCount);
+                RecordFailedShards(nShard - i);
+                FailDispatchedTask(task, waiter, Status::Retry(), i);
+                return;
+            }
             shardTask.fromCache = handle.GetState() == SlotState::Ready;
             if (!shardTask.fromCache) { ++waitShardCount; }
             if (handle.Owner() && !shardTask.fromCache) {
@@ -188,8 +250,7 @@ private:
                     handle.MarkFailed();
                     RecordLoadSourceShards(i + 1, waitShardCount);
                     RecordFailedShards(nShard - i);
-                    task->Fail(res.Error());
-                    FailTask(task, waiter);
+                    FailDispatchedTask(task, waiter, res.Error(), i);
                     return;
                 }
                 shardTask.backendTaskHandle = res.Value();
@@ -207,7 +268,9 @@ private:
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_shards_total"),
                              static_cast<double>(backendSubmitCount));
         RecordLoadSourceShards(nShard, waitShardCount);
-        PreallocNextShards(task, indexes);
+        if (!task->cancelled.load(std::memory_order_acquire)) {
+            PreallocNextShards(task, indexes);
+        }
     }
     Expected<Detail::TaskHandle> SubmitBackendLoad(const TaskPtr& task, const Detail::Shard& shard,
                                                    Handle& handle)
@@ -275,16 +338,27 @@ private:
         started.set_value(s);
         if (s.Failure()) [[unlikely]] { return; }
         BindCpuAffinity();
-        running_.ConsumerLoop(stop_, &LoadQ::TransferOneTask, this, stream);
+        running_.ConsumerLoop(transferStop_, &LoadQ::TransferOneTask, this, stream);
+        // Pending asynchronous copies retain their slot handles until drained.
+        ReleaseHolder(stream);
     }
     void TransferOneTask(StreamT& stream, ShardTask&& task)
     {
-        if (failureSet_->Contains(task.task->id)) {
+        // A failed dispatch appends a completion marker after all submitted shards.
+        if (!task.bufferHandle) {
+            FinishShard(stream, std::move(task), Status::Error());
+            return;
+        }
+        if (task.task->cancelled.load(std::memory_order_acquire) ||
+            failureSet_->Contains(task.task->id)) {
             DiscardFailedShard(task);
             FinishShard(stream, std::move(task), Status::Error());
             return;
         }
         auto s = WaitShardReady(task);
+        if (s.Success() && task.task->cancelled.load(std::memory_order_acquire)) {
+            s = Status::Retry();
+        }
         if (s.Success() && task.firstShard && task.task->desc.prerequisiteHandle != 0) {
             // CopyStream applies the dependency to every rotating copy stream.
             s = stream.WaitEvent(Trans::Event{task.task->desc.prerequisiteHandle});
@@ -310,6 +384,13 @@ private:
     }
     void DiscardFailedShard(ShardTask& task)
     {
+        // Backend I/O owns the address until Wait returns, even if another shard
+        // has already failed or the caller has timed out.
+        if (task.backendTaskHandle != 0) {
+            (void)WaitShardReady(task);
+            RecordFailedShards(1);
+            return;
+        }
         if (task.bufferHandle->GetState() != SlotState::Ready) { task.bufferHandle->MarkFailed(); }
         RecordFailedShards(1);
     }
@@ -335,7 +416,11 @@ private:
             auto state = task.bufferHandle->GetState();
             if (state == SlotState::Ready) { return Status::OK(); }
             if (state == SlotState::Failed) { return Status::Error(); }
-            if (failureSet_->Contains(task.task->id)) { return Status::Error(); }
+            if (stop_.load(std::memory_order_acquire) ||
+                task.task->cancelled.load(std::memory_order_acquire) ||
+                failureSet_->Contains(task.task->id)) {
+                return Status::Error();
+            }
             std::this_thread::yield();
         }
     }
@@ -414,10 +499,20 @@ private:
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_failed_shards_total"),
                              static_cast<double>(count));
     }
-    void FailTask(const TaskPtr& task, const WaiterPtr& waiter)
+    void FailDispatchedTask(const TaskPtr& task, const WaiterPtr& waiter, const Status& error,
+                            size_t submitted)
     {
+        task->Fail(error);
         failureSet_->Insert(task->id);
-        waiter->Done();
+        // Earlier shards may still have backend reads or device copies in flight.
+        if (submitted == 0) {
+            waiter->Done();
+        } else {
+            ShardTask end;
+            end.task = task;
+            end.waiter = waiter;
+            running_.Push(std::move(end));
+        }
     }
     void DrainWaiting()
     {
@@ -440,6 +535,7 @@ private:
         while (running_.TryPop(shardTask)) {
             UC_WARN("Cache2 load task({}) shard discarded on close.", shardTask.task->id);
             failureSet_->Insert(shardTask.task->id);
+            if (shardTask.bufferHandle) { DiscardFailedShard(shardTask); }
             if (shardTask.waiter) { shardTask.waiter->Done(); }
         }
     }

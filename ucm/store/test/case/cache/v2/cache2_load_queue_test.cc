@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <map>
@@ -150,6 +151,18 @@ public:
         slots_.emplace(key, slotIdx);
         return Handle{this, slotIdx, true, HostAccessibleOf(key)};
     }
+    UC::Expected<Handle> GetUntil(const UC::Detail::BlockId& blockId, size_t offset,
+                                  std::chrono::steady_clock::time_point,
+                                  const std::atomic_bool& cancelled, bool allowReserved = false,
+                                  size_t preferredRank = UC::Cache2::kInvalid)
+    {
+        if (onGetUntil) {
+            auto status = onGetUntil(offset, cancelled);
+            if (status.Failure()) { return status; }
+        }
+        if (cancelled.load()) { return UC::Status::Retry(); }
+        return Get(blockId, offset, allowReserved, preferredRank);
+    }
     void Prealloc(const UC::Detail::BlockId& blockId, size_t offset, bool allowReserved = false,
                   size_t preferredRank = UC::Cache2::kInvalid)
     {
@@ -180,6 +193,7 @@ public:
     const std::vector<GetCall>& GetCalls() const { return getCalls_; }
     const std::vector<PreallocCall>& PreallocCalls() const { return preallocCalls_; }
     std::function<void(size_t)> onGetState;
+    std::function<UC::Status(size_t, const std::atomic_bool&)> onGetUntil;
 
 private:
     SlotState SlotStateOf(size_t slotIdx)
@@ -612,6 +626,39 @@ TEST_F(UCCache2LoadQueueTest, LoadFailsWhenBackendSubmitFails)
     EXPECT_EQ(counters.at("cache_load_failed_shards_total"), 1);
 }
 
+TEST_F(UCCache2LoadQueueTest, LaterSubmitFailureWaitsForEarlierBackendRead)
+{
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    const auto backendHandle = NextBackendHandle();
+    std::promise<void> releaseRead;
+    auto released = releaseRead.get_future().share();
+    std::atomic_bool waitStarted{false};
+    std::atomic_bool secondSubmitFailed{false};
+    EXPECT_CALL(backend_, Load)
+        .WillOnce(testing::Return(
+            UC::Expected<UC::Detail::TaskHandle>(UC::Detail::TaskHandle{backendHandle})))
+        .WillOnce(testing::Invoke([&](UC::Detail::TaskDesc) {
+            secondSubmitFailed.store(true);
+            return UC::Expected<UC::Detail::TaskHandle>(UC::Status::Error("submit failure"));
+        }));
+    EXPECT_CALL(backend_, Wait(backendHandle)).WillOnce(testing::Invoke([&](auto) {
+        waitStarted.store(true);
+        released.wait();
+        return UC::Status::OK();
+    }));
+    auto desc = MakeDesc(block);
+    desc.push_back({block, 1, {reinterpret_cast<void*>(0x2000)}});
+    auto [task, waiter] = SubmitOne(std::move(desc));
+    const bool started = AwaitTrue([&] { return waitStarted.load() && secondSubmitFailed.load(); });
+    EXPECT_TRUE(started);
+    EXPECT_FALSE(waiter->WaitFor(50));
+    EXPECT_GE(buffer_.LiveHandles(), 1);
+    releaseRead.set_value();
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
+}
+
 TEST_F(UCCache2LoadQueueTest, LoadFailsWhenBackendWaitFails)
 {
     const auto block = TypesHelper::MakeBlockIdRandomly();
@@ -932,6 +979,121 @@ TEST_F(UCCache2LoadQueueTest, CloseFailsPendingTasksWhenStreamSetupFailed)
         EXPECT_TRUE(waiter->WaitFor(kWaitMs));
         EXPECT_TRUE(failureSet_.Contains(task->id));
     }
+}
+
+TEST_F(UCCache2LoadQueueTest, CloseDrainsRunningQueueWhileDispatcherIsActive)
+{
+    TestedQueue loadQ;
+    auto config = config_;
+    config.runningQueueDepth = 2;
+    ASSERT_TRUE(loadQ.Setup(config, &failureSet_, &buffer_).Success());
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    buffer_.SetExisting(block, SlotState::Loading, 0);
+    for (size_t i = 1; i < 5; ++i) { buffer_.SetExisting(block, SlotState::Ready, i); }
+    std::atomic_bool polling{false};
+    buffer_.onGetState = [&](size_t slot) {
+        if (slot == 0) { polling.store(true); }
+    };
+    auto desc = MakeDesc(block);
+    for (size_t i = 1; i < 5; ++i) {
+        desc.push_back({block, i, {reinterpret_cast<void*>(0x1000 + i * kShardSize)}});
+    }
+    auto task = std::make_shared<Task>(Task::Type::LOAD, std::move(desc));
+    auto waiter = std::make_shared<UC::Latch>();
+    loadQ.Submit(task, waiter);
+    EXPECT_TRUE(AwaitTrue([&] { return polling.load(); }));
+    loadQ.Close();
+    EXPECT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
+    buffer_.onGetState = nullptr;
+}
+
+TEST_F(UCCache2LoadQueueTest, CloseCancelsSlotAcquisition)
+{
+    TestedQueue loadQ;
+    ASSERT_TRUE(loadQ.Setup(config_, &failureSet_, &buffer_).Success());
+    std::atomic_bool acquiring{false};
+    buffer_.onGetUntil = [&](size_t, const std::atomic_bool& cancelled) {
+        acquiring.store(true);
+        while (!cancelled.load()) { std::this_thread::yield(); }
+        return UC::Status::Retry();
+    };
+    auto task = std::make_shared<Task>(Task::Type::LOAD,
+                                       MakeDesc(TypesHelper::MakeBlockIdRandomly()));
+    auto waiter = std::make_shared<UC::Latch>();
+    loadQ.Submit(task, waiter);
+    EXPECT_TRUE(AwaitTrue([&] { return acquiring.load(); }));
+    loadQ.Close();
+    EXPECT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    buffer_.onGetUntil = nullptr;
+}
+
+TEST_F(UCCache2LoadQueueTest, TaskCancellationDrainsEarlierBackendRead)
+{
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    const auto backendHandle = NextBackendHandle();
+    std::promise<void> releaseRead;
+    auto released = releaseRead.get_future().share();
+    std::atomic_bool readStarted{false};
+    std::atomic_bool acquiringSecond{false};
+    buffer_.onGetUntil = [&](size_t offset, const std::atomic_bool& cancelled) {
+        if (offset == 1) {
+            acquiringSecond.store(true);
+            while (!cancelled.load()) { std::this_thread::yield(); }
+            return UC::Status::Retry();
+        }
+        return UC::Status::OK();
+    };
+    EXPECT_CALL(backend_, Load).WillOnce(testing::Invoke([&](UC::Detail::TaskDesc) {
+        return UC::Expected<UC::Detail::TaskHandle>(UC::Detail::TaskHandle{backendHandle});
+    }));
+    EXPECT_CALL(backend_, Wait(backendHandle)).WillOnce(testing::Invoke([&](auto) {
+        readStarted.store(true);
+        released.wait();
+        return UC::Status::OK();
+    }));
+    auto desc = MakeDesc(block);
+    desc.push_back({block, 1, {reinterpret_cast<void*>(0x2000)}});
+    auto [task, waiter] = SubmitOne(std::move(desc));
+    EXPECT_TRUE(AwaitTrue([&] { return acquiringSecond.load() && readStarted.load(); }));
+    task->cancelled.store(true);
+    EXPECT_FALSE(waiter->WaitFor(50));
+    EXPECT_GE(buffer_.LiveHandles(), 1);
+    releaseRead.set_value();
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
+    buffer_.onGetUntil = nullptr;
+}
+
+TEST_F(UCCache2LoadQueueTest, ConcurrentSubmitAndCloseCompleteEveryWaiter)
+{
+    TestedQueue loadQ;
+    ASSERT_TRUE(loadQ.Setup(config_, &failureSet_, &buffer_).Success());
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    buffer_.SetExisting(block);
+    std::atomic_bool started{false};
+    std::vector<std::pair<TaskPtr, WaiterPtr>> tasks;
+    std::thread producer([&] {
+        started.store(true);
+        for (size_t i = 0; i < 100; ++i) {
+            auto task = std::make_shared<Task>(Task::Type::LOAD, MakeDesc(block));
+            auto waiter = std::make_shared<UC::Latch>();
+            loadQ.Submit(task, waiter);
+            tasks.emplace_back(std::move(task), std::move(waiter));
+        }
+    });
+    EXPECT_TRUE(AwaitTrue([&] { return started.load(); }));
+    loadQ.Close();
+    producer.join();
+    for (auto& [task, waiter] : tasks) { EXPECT_TRUE(waiter->WaitFor(kWaitMs)); }
+    auto afterClose = std::make_shared<Task>(Task::Type::LOAD, MakeDesc(block));
+    auto waiter = std::make_shared<UC::Latch>();
+    loadQ.Submit(afterClose, waiter);
+    EXPECT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(afterClose->id));
 }
 
 TEST_F(UCCache2LoadQueueTest, LoadWithoutBackendCacheHit)

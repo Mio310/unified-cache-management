@@ -135,6 +135,73 @@ protected:
     void TearDown() override { ::operator delete(memory_, std::align_val_t{64}); }
 };
 
+TEST_F(Cache2BufferTest, GetUntilReturnsPinnedHandleOnSuccess)
+{
+    std::atomic_bool cancelled{false};
+    const auto block = MakeBlockId(10000);
+    auto result = buffer_.GetUntil(block, 0, std::chrono::steady_clock::now() +
+                                               std::chrono::seconds(1), cancelled);
+    ASSERT_TRUE(result.HasValue());
+    auto handle = std::move(result).Value();
+    EXPECT_TRUE(handle.Owner());
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 1u);
+    handle.MarkReady();
+    auto hit = buffer_.GetUntil(block, 0, std::chrono::steady_clock::now() +
+                                            std::chrono::seconds(1), cancelled);
+    ASSERT_TRUE(hit.HasValue());
+    EXPECT_FALSE(hit.Value().Owner());
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 2u);
+}
+
+TEST_F(Cache2BufferTest, GetUntilRejectsPrecancelAndExpiredDeadlineWithoutPinning)
+{
+    const auto block = MakeBlockId(10001);
+    auto handle = buffer_.Get(block, 0);
+    handle.MarkReady();
+    std::atomic_bool cancelled{true};
+    auto cancelledResult = buffer_.GetUntil(block, 0, std::chrono::steady_clock::time_point::max(),
+                                            cancelled);
+    ASSERT_FALSE(cancelledResult.HasValue());
+    EXPECT_EQ(cancelledResult.Error(), Status::Retry());
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 1u);
+    cancelled.store(false);
+    auto timeoutResult = buffer_.GetUntil(block, 0, std::chrono::steady_clock::now(), cancelled);
+    ASSERT_FALSE(timeoutResult.HasValue());
+    EXPECT_EQ(timeoutResult.Error(), Status::Timeout());
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 1u);
+}
+
+TEST_F(Cache2BufferTest, GetUntilCanCancelOrTimeoutWhileAllSlotsArePinned)
+{
+    std::vector<Buffer::Handle> held;
+    held.reserve(kSlotsPerRank);
+    for (size_t i = 0; i < kSlotsPerRank; ++i) {
+        held.push_back(buffer_.Get(MakeBlockId(static_cast<uint32_t>(11000 + i)), 0));
+        held.back().MarkReady();
+    }
+    std::atomic_bool cancelled{false};
+    const auto missing = MakeBlockId(12000);
+    auto timeout = buffer_.GetUntil(missing, 0, std::chrono::steady_clock::now() +
+                                                   std::chrono::milliseconds(5), cancelled);
+    ASSERT_FALSE(timeout.HasValue());
+    EXPECT_EQ(timeout.Error(), Status::Timeout());
+
+    std::promise<void> started;
+    auto startedFuture = started.get_future();
+    auto pending = std::async(std::launch::async, [&] {
+        started.set_value();
+        return buffer_.GetUntil(missing, 0, std::chrono::steady_clock::now() +
+                                                 std::chrono::seconds(2), cancelled);
+    });
+    startedFuture.wait();
+    cancelled.store(true, std::memory_order_release);
+    auto result = pending.get();
+    ASSERT_FALSE(result.HasValue());
+    EXPECT_EQ(result.Error(), Status::Retry());
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, MakeBlockId(11000), 0), 1u);
+    EXPECT_FALSE(buffer_.Exist(missing, 0));
+}
+
 TEST_F(Cache2BufferTest, LayerOffsetsUseDevelopHashMixAndSeparateBuckets)
 {
     constexpr size_t kLayers{78};
