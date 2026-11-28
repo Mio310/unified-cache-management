@@ -26,10 +26,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include "cache_buffer.h"
@@ -235,6 +239,7 @@ private:
                     UC_ERROR("Failed({}) to drain D2H after dump task({}) failed.", syncStatus,
                              task->id);
                     QuarantineHandles(ctx);
+                    FailStopOnUndrainedDma();
                 } else {
                     FailOwnedHandles(ctx);
                 }
@@ -270,8 +275,27 @@ private:
             std::chrono::steady_clock::time_point::max() - now).count();
         const auto timeout = std::min(allocationTimeout, static_cast<size_t>(maxWait));
         const auto deadline = now + std::chrono::milliseconds(timeout);
-        if (backend_ != nullptr) { backendDesc.reserve(task->desc.size()); }
-        for (auto& shard : task->desc) {
+        std::vector<Detail::Shard*> uniqueShards;
+        try {
+            if (backend_ != nullptr) { backendDesc.reserve(task->desc.size()); }
+            if (waitForBackend_) {
+                std::unordered_map<Detail::BlockId, std::unordered_set<size_t>, Detail::BlockIdHasher>
+                    seenShards;
+                uniqueShards.reserve(task->desc.size());
+                for (auto& shard : task->desc) {
+                    if (seenShards[shard.owner].insert(shard.index).second) {
+                        uniqueShards.push_back(&shard);
+                    }
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            return Status::OutOfMemory();
+        }
+        const auto shardCount = waitForBackend_ ? uniqueShards.size() : task->desc.size();
+        for (size_t i = 0; i < shardCount; ++i) {
+            // Deduplicate before starting any device copy: waiting on our own
+            // in-flight copy would otherwise deadlock until the deadline.
+            auto& shard = waitForBackend_ ? *uniqueShards[i] : task->desc[i];
             auto result = buffer_->GetUntil(shard.owner, shard.index, deadline, task->cancelled);
             if (!result) { return result.Error(); }
             auto handle = std::move(result).Value();
@@ -279,7 +303,27 @@ private:
                 if (handle.Owner() && handle.GetState() != SlotState::Ready) { handle.MarkFailed(); }
                 return Status::Retry();
             }
-            if (!handle.Owner()) { continue; }
+            if (!handle.Owner()) {
+                if (!waitForBackend_) { continue; }
+                // Another task owns this slot. Its device copy and backend
+                // dump may still fail, so a duplicate cannot report success
+                // merely because the key exists. Keep the slot pinned, wait
+                // for valid contents, and persist them as part of this task.
+                ctx.bufferHandles.push_back(std::move(handle));
+                auto& existing = ctx.bufferHandles.back();
+                for (;;) {
+                    const auto state = existing.GetState();
+                    if (state == SlotState::Ready) { break; }
+                    if (state == SlotState::Failed) { return Status::Error("concurrent dump failed"); }
+                    if (task->cancelled.load(std::memory_order_acquire)) { return Status::Retry(); }
+                    if (std::chrono::steady_clock::now() >= deadline) { return Status::Timeout(); }
+                    std::this_thread::yield();
+                }
+                if (backend_ != nullptr && existing.HostAccessible()) {
+                    backendDesc.push_back(Detail::Shard{shard.owner, shard.index, {existing.Data()}});
+                }
+                continue;
+            }
             ctx.bufferHandles.push_back(std::move(handle));
             auto& pinned = ctx.bufferHandles.back();
             const auto hostAccessible = pinned.HostAccessible();
@@ -318,6 +362,7 @@ private:
                 // A failed synchronization does not prove the device stopped
                 // writing. Keep every affected slot pinned for this domain.
                 QuarantineHandles(ctx);
+                FailStopOnUndrainedDma();
                 return s;
             }
             Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_duration_ms"),
@@ -363,6 +408,16 @@ private:
     void QuarantineHandles(DumpCtx& ctx)
     {
         for (auto& handle : ctx.bufferHandles) { handle.Quarantine(); }
+    }
+    void FailStopOnUndrainedDma() const
+    {
+        if (!waitForBackend_) { return; }
+        // A failed synchronization leaves the caller's device buffers as well
+        // as the DRAM slots potentially in use. Returning the task would let
+        // vLLM recycle those buffers, so stop this worker rather than claim
+        // that the failed transfer is complete.
+        UC_ERROR("cache2 cannot establish DMA completion; terminating worker");
+        std::terminate();
     }
     void BackendWaitStage()
     {

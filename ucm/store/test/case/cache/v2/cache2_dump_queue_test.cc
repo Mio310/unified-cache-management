@@ -743,6 +743,54 @@ TEST_F(UCCache2DumpQueueTest, TailModeReportsBackendWaitFailureBeforeCompleting)
     EXPECT_EQ(buffer_.LiveHandles(), 0u);
 }
 
+TEST_F(UCCache2DumpQueueTest, TailModePersistsExistingShardBeforeReportingSuccess)
+{
+    TestedQueue queue;
+    auto config = config_;
+    config.enableDramTailEviction = true;
+    ASSERT_TRUE(queue.Setup(config, &failureSet_, &buffer_).Success());
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    buffer_.SetExisting({block});
+    EXPECT_CALL(backend_, Dump).WillOnce(testing::Invoke([&](UC::Detail::TaskDesc desc) {
+        EXPECT_EQ(desc.size(), 1u);
+        if (!desc.empty()) { EXPECT_EQ(desc[0].owner, block); }
+        return UC::Expected<UC::Detail::TaskHandle>(NextBackendHandle());
+    }));
+    EXPECT_CALL(backend_, Wait).WillOnce(testing::Return(UC::Status::Error("backend failed")));
+    auto task = std::make_shared<Task>(Task::Type::DUMP, MakeDesc(block));
+    auto waiter = std::make_shared<UC::Latch>();
+    queue.Submit(task, waiter);
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_EQ(task->FailureStatus(), UC::Status::Error());
+    queue.Close();
+}
+
+TEST_F(UCCache2DumpQueueTest, TailModeDeduplicatesShardsBeforeStartingCopies)
+{
+    TestedQueue queue;
+    auto config = config_;
+    config.enableDramTailEviction = true;
+    ASSERT_TRUE(queue.Setup(config, &failureSet_, &buffer_).Success());
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    EXPECT_CALL(backend_, Dump).WillOnce(testing::Invoke([&](UC::Detail::TaskDesc desc) {
+        EXPECT_EQ(desc.size(), 1u);
+        if (!desc.empty()) { EXPECT_EQ(desc[0].owner, block); }
+        return UC::Expected<UC::Detail::TaskHandle>(NextBackendHandle());
+    }));
+    EXPECT_CALL(backend_, Wait).WillOnce(testing::Return(UC::Status::OK()));
+    auto desc = MakeDesc(block);
+    desc.push_back(desc.front());
+    auto task = std::make_shared<Task>(Task::Type::DUMP, std::move(desc));
+    auto waiter = std::make_shared<UC::Latch>();
+    queue.Submit(task, waiter);
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_FALSE(failureSet_.Contains(task->id));
+    EXPECT_EQ(FakeStream::gathers.size(), 1u);
+    EXPECT_EQ(buffer_.MarkedReady(), 1u);
+    queue.Close();
+}
+
 TEST_F(UCCache2DumpQueueTest, SubmitFailsWhenWaitingQueueFull)
 {
     TestedQueue dumpQ;

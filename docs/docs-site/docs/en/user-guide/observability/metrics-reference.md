@@ -91,7 +91,8 @@ When loads slow down, compare queuing, backend-ready waits and H2D synchronizati
 | --------------------------------------------- | -------------------------------------------------------------------------- |
 | `ucm:cache_dram_hit_shards_total` | Successfully loaded shards found Ready at the first state check after slot acquisition |
 | `ucm:cache_dram_load_shards_total` | All successfully loaded shards, including shared-wait and backend loads |
-| `ucm:cache_dram_evicted_bytes_total` | Bytes of Ready slots replaced by Clock; shard-granular, not complete-block evictions |
+| `ucm:cache_dram_evicted_bytes_total` | Bytes of Ready slots evicted by tail policy or replaced by Clock; shard-granular, not complete-block evictions |
+| `ucm:cache_dram_tail_metadata_gc_total` | Tail metadata block records reclaimed across shared domains |
 | `ucm:cache_lookup_hit_blocks_total`         | Blocks served directly by Cache Lookup without descending to the backend   |
 | `ucm:cache_lookup_miss_blocks_total`        | Blocks missed by Cache Lookup and passed to the backend                    |
 | `ucm:cache_load_shards_total`               | Total shards whose Cache buffer state was inspected during Load            |
@@ -112,6 +113,8 @@ For a Cache | Posix pipeline, the Cache load share is `(total shards - wait shar
 | --- | --- |
 | `ucm:cache_dram_capacity_bytes` | Capacity of the shared DRAM slot data area |
 | `ucm:cache_dram_used_bytes` | Capacity of assigned slots, including Loading, Ready, Failed and preallocated slots |
+| `ucm:cache_dram_tail_metadata_capacity_bytes` | Allocated tail metadata region bytes, reported once per shared domain |
+| `ucm:cache_dram_tail_metadata_used_bytes` | Logical occupancy including fixed tables and used entries; GC does not reduce the preallocated physical region |
 
 Capacity sampling runs on rank 0 every 10 seconds. In each process, shared domains are deduplicated by unique ID and their values are summed into one pair of gauges. Prometheus multiprocess mode uses `livesum` only across processes with identical labels; different `worker_id` or `worker_rank` values remain separate series. A series is not necessarily one shared domain. If the same domain is incorrectly reported by rank 0 in multiple processes, it will be counted multiple times. Values are slot capacities, not process RSS. Clock normally replaces assigned slots instead of freeing them, so used capacity may stay high after evictions.
 

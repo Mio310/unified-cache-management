@@ -7,10 +7,14 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <pthread.h>
+#include <thread>
 #include <vector>
 
 namespace UC::Cache2 {
@@ -18,6 +22,7 @@ namespace UC::Cache2 {
 // A bounded, relocatable metadata prototype. The caller owns and shares the
 // memory region; View itself is process-local and must never be stored there.
 class TailMetadata {
+    friend struct TailMetadataTestAccess;
 public:
     using Id = std::array<std::byte, 16>;
     static constexpr uint32_t kNil = std::numeric_limits<uint32_t>::max();
@@ -25,13 +30,24 @@ public:
     // ticket is nonzero only on a selection. It distinguishes successive
     // eviction attempts on the same live node from stale work after Abort.
     struct Ref { uint32_t index{kNil}; uint64_t generation{0}, ticket{0}; };
-    enum class Result { Ok, Full, Conflict, Invalid, Busy, NotFound };
+    enum class Result { Ok, Full, Conflict, Invalid, Busy, NotFound, Poisoned };
     struct Shard { uint64_t slot; uint32_t rank; };
-    struct Stats { uint32_t nodes; uint32_t shards; uint64_t gc; uint64_t failed; };
+    struct Stats {
+        uint32_t nodes;
+        uint32_t shards;
+        uint64_t gc;
+        uint64_t failed;
+        // Logical occupancy in a preallocated region. Physical memory remains
+        // reserved even after entries are collected.
+        size_t usedBytes;
+        size_t capacityBytes;
+        Result status{Result::Ok};
+    };
 
 private:
     struct Header {
-        std::atomic<uint32_t> lock{0};
+        pthread_mutex_t lock{};
+        std::atomic<uint32_t> poisoned{0};
         uint32_t nodes{0}, shards{0}, buckets{0};
         uint32_t freeNode{kNil}, freeShard{kNil}, cursor{0};
         uint32_t usedNodes{0}, usedShards{0};
@@ -60,14 +76,47 @@ private:
     }
     class Guard {
         Header* h_;
+        Result result_{Result::Busy};
+        bool owned_{false};
     public:
         explicit Guard(Header* h) : h_(h)
         {
-            uint32_t expected;
-            do { expected = 0; } while (!h_->lock.compare_exchange_weak(
-                expected, 1, std::memory_order_acquire, std::memory_order_relaxed));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            for (;;) {
+                if (h_->poisoned.load(std::memory_order_acquire)) {
+                    result_ = Result::Poisoned;
+                    return;
+                }
+                const int rc = pthread_mutex_trylock(&h_->lock);
+                if (rc == 0) {
+                    if (h_->poisoned.load(std::memory_order_acquire)) {
+                        pthread_mutex_unlock(&h_->lock);
+                        result_ = Result::Poisoned;
+                    } else {
+                        owned_ = true;
+                        result_ = Result::Ok;
+                    }
+                    return;
+                }
+                if (rc == EOWNERDEAD) {
+                    h_->poisoned.store(1, std::memory_order_release);
+                    (void)pthread_mutex_consistent(&h_->lock);
+                    (void)pthread_mutex_unlock(&h_->lock);
+                    result_ = Result::Poisoned;
+                    return;
+                }
+                if (rc != EBUSY) {
+                    h_->poisoned.store(1, std::memory_order_release);
+                    result_ = Result::Poisoned;
+                    return;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) { return; }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
         }
-        ~Guard() { h_->lock.store(0, std::memory_order_release); }
+        Result Error() const { return result_; }
+        bool Acquired() const { return owned_; }
+        ~Guard() { if (owned_) { (void)pthread_mutex_unlock(&h_->lock); } }
     };
     uint32_t Find(const Id& id) const
     {
@@ -153,6 +202,13 @@ public:
             reinterpret_cast<uintptr_t>(memory) % Alignment() ||
             bytes < Bytes(nodeCount, shardCount, buckets)) { return false; }
         auto* h = new (memory) Header();
+        pthread_mutexattr_t attr;
+        if (pthread_mutexattr_init(&attr) != 0) { return false; }
+        const bool ready = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) == 0 &&
+                           pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0 &&
+                           pthread_mutex_init(&h->lock, &attr) == 0;
+        (void)pthread_mutexattr_destroy(&attr);
+        if (!ready) { return false; }
         h->nodes = nodeCount; h->shards = shardCount; h->buckets = buckets;
         TailMetadata view(memory);
         for (uint32_t i = 0; i < nodeCount; ++i) {
@@ -184,10 +240,12 @@ public:
     Result Register(const Id& id, const Id& parent, bool root, Ref& out)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         auto found = Find(id);
         if (found != kNil) {
             auto& n = nodes_[found];
             if (n.root != root || (!root && n.parent != parent)) { return Result::Conflict; }
+            if (n.evicting) { return Result::Busy; }
             if (n.refs == UINT32_MAX) { return Result::Full; }
             ++n.refs; out = MakeRef(found); return Result::Ok;
         }
@@ -222,6 +280,12 @@ public:
     Result Release(Ref r)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) {
+            // Losing a reference release would silently leak metadata. Stop
+            // the domain instead of continuing after a bounded lock timeout.
+            h_->poisoned.store(1, std::memory_order_release);
+            return Result::Poisoned;
+        }
         if (!Valid(r) || !nodes_[r.index].refs) { return Result::Invalid; }
         --nodes_[r.index].refs; Collect(r.index); return Result::Ok;
     }
@@ -230,6 +294,7 @@ public:
     Result Acquire(const Id& id, Ref& out)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         const auto i = Find(id);
         if (i == kNil) { return Result::NotFound; }
         auto& n = nodes_[i];
@@ -242,6 +307,7 @@ public:
     Result EvictionId(Ref r, Id& id)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (!ValidEviction(r)) { return Result::Invalid; }
         id = nodes_[r.index].id;
         return Result::Ok;
@@ -252,6 +318,7 @@ public:
     Result AddShard(Ref r, uint64_t slot, uint32_t rank)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (!Valid(r) || rank >= kMaxRanks) { return Result::Invalid; }
         auto& n = nodes_[r.index];
         if (n.evicting) { return Result::Busy; }
@@ -273,6 +340,7 @@ public:
     Result RemoveShard(Ref r, uint64_t slot)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (!Valid(r)) { return Result::Invalid; }
         auto& n = nodes_[r.index];
         if (n.evicting) { return Result::Busy; }
@@ -291,6 +359,7 @@ public:
     Result Touch(Ref r)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (!Valid(r)) { return Result::Invalid; }
         if (nodes_[r.index].evicting) { return Result::Busy; }
         nodes_[r.index].accessed = true; return Result::Ok;
@@ -300,15 +369,18 @@ public:
     // false first. This marks the result evicting: the caller must synchronize
     // with slot pins, then claim every real shard before unlinking any of them.
     // Cascade never jumps a missing (nonresident) direct parent.
-    Result Select(uint32_t rank, uint32_t budget, bool cascade, Ref& out)
+    Result Select(uint32_t rank, uint32_t budget, bool cascade, Ref& out,
+                  bool anyRank = false, bool requireUnreferenced = false)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (rank >= kMaxRanks) { return Result::Invalid; }
         for (uint32_t scan = 0; scan < budget; ++scan) {
             auto i = h_->cursor++ % h_->nodes;
             auto& n = nodes_[i];
-            if (!n.used || !n.shards || n.children || n.evicting) { continue; }
-            bool suitable = HasRank(i, rank);
+            if (!n.used || !n.shards || n.children || n.evicting ||
+                (requireUnreferenced && n.refs != 0)) { continue; }
+            bool suitable = anyRank || HasRank(i, rank);
             auto j = i;
             for (uint32_t depth = 0; !suitable && cascade && depth < h_->nodes; ++depth) {
                 if (nodes_[j].root) { break; }
@@ -331,6 +403,7 @@ public:
     Result GetShard(Ref r, uint32_t ordinal, Shard& out)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (!ValidEviction(r)) { return Result::Invalid; }
         auto s = nodes_[r.index].shardHead;
         while (s != kNil && ordinal) { s = shards_[s].next; --ordinal; }
@@ -345,12 +418,14 @@ public:
         uint32_t count = 0;
         {
             Guard guard(h_);
+            if (!guard.Acquired()) { return guard.Error(); }
             if (!ValidEviction(r)) { return Result::Invalid; }
             count = nodes_[r.index].shards;
         }
         out.clear();
         out.reserve(count);
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (!ValidEviction(r) || nodes_[r.index].shards != count) { return Result::Invalid; }
         for (auto s = nodes_[r.index].shardHead; s != kNil; s = shards_[s].next) {
             out.push_back({shards_[s].slot, shards_[s].rank});
@@ -360,6 +435,11 @@ public:
     Result AbortEvict(Ref r)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) {
+            // An eviction marker that cannot be cleared is not recoverable.
+            h_->poisoned.store(1, std::memory_order_release);
+            return Result::Poisoned;
+        }
         if (!ValidEviction(r)) { return Result::Invalid; }
         nodes_[r.index].evicting = false;
         nodes_[r.index].ticket = 0;
@@ -371,6 +451,7 @@ public:
     Result CommitEvict(Ref r)
     {
         Guard guard(h_);
+        if (!guard.Acquired()) { return guard.Error(); }
         if (!ValidEviction(r) || nodes_[r.index].children) { return Result::Invalid; }
         auto& n = nodes_[r.index];
         BecameAbsent(r.index);
@@ -382,7 +463,12 @@ public:
     }
     Stats GetStats()
     {
-        Guard guard(h_); return {h_->usedNodes, h_->usedShards, h_->gc, h_->failed};
+        Guard guard(h_);
+        if (!guard.Acquired()) { return {0, 0, 0, 0, 0, 0, guard.Error()}; }
+        const auto capacity = Bytes(h_->nodes, h_->shards, h_->buckets);
+        const auto used = capacity - size_t(h_->nodes - h_->usedNodes) * sizeof(Node) -
+                          size_t(h_->shards - h_->usedShards) * sizeof(ShardNode);
+        return {h_->usedNodes, h_->usedShards, h_->gc, h_->failed, used, capacity};
     }
 };
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "shared lock must be lock-free");

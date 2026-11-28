@@ -265,7 +265,7 @@ class RankConsistencyManager:
         self._dump_task_contexts[id(task)] = (store, request_context)
         return task
 
-    def wait_dump(self, task: Any) -> None:
+    def wait_dump(self, task: Any, *, propagate_unhealthy: bool = False) -> None:
         """Wait through the task's Store and record blocks affected by failure."""
         task_key = id(task)
         if task_key not in self._dump_task_contexts:
@@ -275,6 +275,8 @@ class RankConsistencyManager:
             store.wait(task)
         except StoreUnhealthyError:
             self._record_dump_failure(request_context)
+            if propagate_unhealthy:
+                raise
             return
         except Exception:
             self._record_dump_failure(request_context)

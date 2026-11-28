@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -126,6 +127,7 @@ class LoadQ {
     size_t localRankSize_{1};
     size_t nShardPerBlock_{0};
     size_t slotWaitTimeoutMs_{30000};
+    bool failStopOnDmaError_{false};
     std::vector<size_t> tensorSizes_{};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_{};
@@ -163,6 +165,7 @@ public:
         // cancel a task when capacity is exhausted. Keep slot acquisition
         // bounded even if the general task timeout is configured as unlimited.
         slotWaitTimeoutMs_ = config.timeoutMs == 0 ? 30000 : config.timeoutMs;
+        failStopOnDmaError_ = config.enableDramTailEviction;
         tensorSizes_ = config.tensorSizes;
         cpuAffinityCores_ = config.cpuAffinityCores;
         waiting_.Setup(config.waitingQueueDepth);
@@ -417,7 +420,7 @@ private:
         BindCpuAffinity();
         running_.ConsumerLoop(transferStop_, &LoadQ::TransferOneTask, this, stream);
         // Pending asynchronous copies retain their slot handles until drained.
-        ReleaseHolder(stream);
+        if (!ReleaseHolder(stream) && failStopOnDmaError_) { std::terminate(); }
     }
     void TransferOneTask(StreamT& stream, ShardTask&& task)
     {
@@ -539,8 +542,12 @@ private:
         if (s.Failure()) [[unlikely]] {
             task.task->Fail(s);
             failureSet_->Insert(task.task->id);
-            if (!ReleaseHolder(stream, task.bufferHandle.has_value()) && task.bufferHandle) {
-                task.bufferHandle->Quarantine();
+            if (!ReleaseHolder(stream, task.bufferHandle.has_value())) {
+                if (task.bufferHandle) { task.bufferHandle->Quarantine(); }
+                if (failStopOnDmaError_) {
+                    UC_ERROR("cache2 cannot establish DMA completion; terminating worker");
+                    std::terminate();
+                }
             }
         }
         if (task.waiter) { task.waiter->Done(); }

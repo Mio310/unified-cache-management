@@ -68,7 +68,11 @@ _COUNTER_METRICS = [
     ),
     (
         "cache_dram_evicted_bytes_total",
-        "Ready Cache DRAM slot bytes replaced by another key",
+        "Ready Cache DRAM slot bytes evicted or replaced (shard-granular)",
+    ),
+    (
+        "cache_dram_tail_metadata_gc_total",
+        "Tail metadata block records collected in shared Cache domains",
     ),
     (
         "cache_load_shards_total",
@@ -605,6 +609,16 @@ _COUNTER_METRICS = [
     ),
 ]
 _GAUGE_METRICS = [
+    (
+        "cache_dram_tail_metadata_capacity_bytes",
+        "Allocated tail metadata region bytes in shared Cache domains",
+        {"multiprocess_mode": "livesum"},
+    ),
+    (
+        "cache_dram_tail_metadata_used_bytes",
+        "Logical bytes occupied in preallocated tail metadata regions",
+        {"multiprocess_mode": "livesum"},
+    ),
     (
         "cache_dram_capacity_bytes",
         "Effective capacity in bytes of Cache DRAM data regions reported by this process",

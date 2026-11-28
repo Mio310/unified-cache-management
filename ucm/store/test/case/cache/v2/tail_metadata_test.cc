@@ -5,13 +5,25 @@
  */
 #include <atomic>
 #include <cstddef>
+#include <chrono>
 #include <memory>
+#include <poll.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 #include "cache/v2/tail_metadata.h"
 #include "gtest/gtest.h"
 
 namespace UC::Cache2 {
+struct TailMetadataTestAccess {
+    static pthread_mutex_t* Mutex(void* memory)
+    {
+        return &static_cast<TailMetadata::Header*>(memory)->lock;
+    }
+};
 namespace {
 using M = TailMetadata;
 M::Id Id(unsigned char c)
@@ -97,6 +109,31 @@ TEST(TailMetadataTest, BudgetConflictCycleAndSharedViews)
     EXPECT_EQ(second.GetStats().failed, 2u);
 }
 
+TEST(TailMetadataTest, LogicalUsageAndGcAreSharedAndReclaimed)
+{
+    Fixture f(2, 2);
+    M other(f.memory.data());
+    const auto empty = f.metadata.GetStats();
+    EXPECT_EQ(empty.capacityBytes, M::Bytes(2, 2, 8));
+    EXPECT_GT(empty.usedBytes, 0u); // Header and hash buckets remain occupied.
+    EXPECT_LT(empty.usedBytes, empty.capacityBytes);
+    M::Ref ref;
+    ASSERT_EQ(f.metadata.Register(Id(1), {}, true, ref), M::Result::Ok);
+    const auto registered = other.GetStats();
+    EXPECT_GT(registered.usedBytes, empty.usedBytes);
+    ASSERT_EQ(other.AddShard(ref, 1, 0), M::Result::Ok);
+    const auto resident = f.metadata.GetStats();
+    EXPECT_GT(resident.usedBytes, registered.usedBytes);
+    EXPECT_EQ(resident.capacityBytes, empty.capacityBytes);
+    ASSERT_EQ(other.RemoveShard(ref, 1), M::Result::Ok);
+    EXPECT_EQ(f.metadata.GetStats().usedBytes, registered.usedBytes);
+    ASSERT_EQ(f.metadata.Release(ref), M::Result::Ok);
+    const auto collected = other.GetStats();
+    EXPECT_EQ(collected.usedBytes, empty.usedBytes);
+    EXPECT_EQ(collected.gc, empty.gc + 1);
+    EXPECT_EQ(collected.capacityBytes, empty.capacityBytes);
+}
+
 TEST(TailMetadataTest, RemovingLastShardCreatesGapAndReleasesSpace)
 {
     Fixture f(3, 3);
@@ -155,6 +192,92 @@ TEST(TailMetadataTest, SnapshotCopiesAllShardsOnlyForCurrentEviction)
     EXPECT_EQ(shards[2].slot, 10u);
     EXPECT_EQ(f.metadata.AbortEvict(selected), M::Result::Ok);
     EXPECT_EQ(f.metadata.GetShards(selected, shards), M::Result::Invalid);
+}
+
+TEST(TailMetadataTest, MetadataReclamationRejectsRacingReferences)
+{
+    Fixture f(1, 1);
+    M::Ref node, selected, retry;
+    ASSERT_EQ(f.metadata.Register(Id(1), {}, true, node), M::Result::Ok);
+    ASSERT_EQ(f.metadata.AddShard(node, 10, 1), M::Result::Ok);
+    EXPECT_EQ(f.metadata.Select(0, 2, false, selected, true, true), M::Result::NotFound);
+    ASSERT_EQ(f.metadata.Release(node), M::Result::Ok);
+    ASSERT_EQ(f.metadata.Select(0, 2, false, selected, true, true), M::Result::Ok);
+    EXPECT_EQ(f.metadata.Register(Id(1), {}, true, retry), M::Result::Busy);
+    ASSERT_EQ(f.metadata.CommitEvict(selected), M::Result::Ok);
+    EXPECT_EQ(f.metadata.GetStats().nodes, 0u);
+    EXPECT_EQ(f.metadata.Register(Id(1), {}, true, retry), M::Result::Ok);
+}
+
+TEST(TailMetadataTest, LockContentionHasBoundedWait)
+{
+    Fixture f;
+    auto* mutex = TailMetadataTestAccess::Mutex(f.memory.data());
+    std::atomic_bool locked{false}, release{false};
+    std::thread holder([&] {
+        if (pthread_mutex_lock(mutex) != 0) { return; }
+        locked.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+        (void)pthread_mutex_unlock(mutex);
+    });
+    const auto start = std::chrono::steady_clock::now();
+    while (!locked.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+        std::this_thread::yield();
+    }
+    M::Ref ref;
+    const auto result = locked.load() ? f.metadata.Register(Id(1), {}, true, ref)
+                                      : M::Result::Invalid;
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    release.store(true, std::memory_order_release);
+    holder.join();
+    EXPECT_EQ(result, M::Result::Busy);
+    EXPECT_LT(elapsed, std::chrono::seconds(6));
+    EXPECT_EQ(f.metadata.Register(Id(1), {}, true, ref), M::Result::Ok);
+}
+
+TEST(TailMetadataTest, DeadOwnerPoisonsSharedDomain)
+{
+    const auto bytes = M::Bytes(2, 2, 2);
+    void* memory = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(memory, MAP_FAILED);
+    ASSERT_TRUE(M::Initialize(memory, bytes, 2, 2, 2));
+    int ready[2]{};
+    ASSERT_EQ(::pipe(ready), 0);
+    const auto child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(ready[0]);
+        if (pthread_mutex_lock(TailMetadataTestAccess::Mutex(memory)) != 0) { ::_exit(2); }
+        const char marker = 'x';
+        if (::write(ready[1], &marker, 1) != 1) { ::_exit(3); }
+        ::_exit(0);  // Deliberately die while holding the process-shared mutex.
+    }
+    ::close(ready[1]);
+    pollfd pfd{ready[0], POLLIN, 0};
+    const bool readable = ::poll(&pfd, 1, 5000) > 0;
+    char marker{};
+    const bool signalled = readable && ::read(ready[0], &marker, 1) == 1;
+    ::close(ready[0]);
+    int status = 0;
+    bool exited = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (::waitpid(child, &status, WNOHANG) == child) { exited = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!exited) { ::kill(child, SIGKILL); }
+    EXPECT_TRUE(signalled);
+    EXPECT_TRUE(exited);
+    if (signalled && exited) {
+        M metadata(memory);
+        M::Ref ref;
+        EXPECT_EQ(metadata.Register(Id(1), {}, true, ref), M::Result::Poisoned);
+        EXPECT_EQ(metadata.Register(Id(1), {}, true, ref), M::Result::Poisoned);
+        EXPECT_EQ(metadata.GetStats().status, M::Result::Poisoned);
+    }
+    EXPECT_EQ(::munmap(memory, bytes), 0);
 }
 
 TEST(TailMetadataTest, ConcurrentChildAdmissionAndParentSelectionAreExclusive)

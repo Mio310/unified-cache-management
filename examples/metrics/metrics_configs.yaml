@@ -117,7 +117,9 @@ counter:
   - name: "cache_dram_load_shards_total"
     documentation: "Total shards successfully delivered to the device through the Cache DRAM buffer"
   - name: "cache_dram_evicted_bytes_total"
-    documentation: "Ready Cache DRAM slot bytes replaced by another key"
+    documentation: "Ready Cache DRAM slot bytes evicted or replaced (shard-granular)"
+  - name: "cache_dram_tail_metadata_gc_total"
+    documentation: "Tail metadata block records collected in shared Cache domains"
   - name: "cache_load_shards_total"
     documentation: "Total shards whose Cache buffer state was inspected during load"
   - name: "cache_load_wait_shards_total"
@@ -391,6 +393,12 @@ counter:
 
 # Gauge metrics configuration
 gauge:
+  - name: "cache_dram_tail_metadata_capacity_bytes"
+    documentation: "Allocated tail metadata region bytes in shared Cache domains"
+    multiprocess_mode: "livesum"
+  - name: "cache_dram_tail_metadata_used_bytes"
+    documentation: "Logical bytes occupied in preallocated tail metadata regions"
+    multiprocess_mode: "livesum"
   - name: "cache_dram_capacity_bytes"
     documentation: "Effective capacity in bytes of Cache DRAM data regions reported by this process"
     multiprocess_mode: "livesum"

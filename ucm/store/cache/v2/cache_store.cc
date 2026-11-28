@@ -104,9 +104,9 @@ private:
     Expected<Detail::TaskHandle> Submit(Task::Type type, Detail::TaskDesc desc)
     {
         if (!transEnable_) { return Status::Error("transfer is not enabled"); }
-        auto relationToken = bufferMgr_.GetTransBuffer()->RegisterRelations(desc);
-        if (!relationToken) { return relationToken.Error(); }
         try {
+            auto relationToken = bufferMgr_.GetTransBuffer()->RegisterRelations(desc);
+            if (!relationToken) { return relationToken.Error(); }
             auto lease = std::make_shared<Buffer::RelationToken>(std::move(relationToken).Value());
             Task task{type, std::move(desc)};
             task.relationLease = std::move(lease);

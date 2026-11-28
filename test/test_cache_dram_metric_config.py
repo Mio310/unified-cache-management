@@ -1,6 +1,7 @@
 """Ensure DRAM metric names and types agree across default and example configs."""
 
 import importlib.util
+import json
 from pathlib import Path
 import re
 import unittest
@@ -20,8 +21,11 @@ class CacheDramMetricConfigTest(unittest.TestCase):
             "cache_dram_hit_shards_total": "counter",
             "cache_dram_load_shards_total": "counter",
             "cache_dram_evicted_bytes_total": "counter",
+            "cache_dram_tail_metadata_gc_total": "counter",
             "cache_dram_capacity_bytes": "gauge",
             "cache_dram_used_bytes": "gauge",
+            "cache_dram_tail_metadata_capacity_bytes": "gauge",
+            "cache_dram_tail_metadata_used_bytes": "gauge",
         }
         config = defaults.get_default_metrics_config()
         example = (ROOT / "examples/metrics/metrics_configs.yaml").read_text(
@@ -40,6 +44,22 @@ class CacheDramMetricConfigTest(unittest.TestCase):
                 self.assertIn(f'- name: "{name}"', section.group(1))
                 if kind == "gauge":
                     self.assertEqual(matches[0]["multiprocess_mode"], "livesum")
+
+    def test_grafana_contains_tail_metadata_panels(self):
+        dashboard = json.loads(
+            (ROOT / "examples/metrics/grafana_store.json").read_text(encoding="utf-8")
+        )
+        expressions = "\n".join(
+            target.get("expr", "")
+            for panel in dashboard["panels"]
+            for target in panel.get("targets", [])
+        )
+        for name in (
+            "cache_dram_tail_metadata_used_bytes",
+            "cache_dram_tail_metadata_capacity_bytes",
+            "cache_dram_tail_metadata_gc_total",
+        ):
+            self.assertIn("ucm:" + name, expressions)
 
 
 if __name__ == "__main__":

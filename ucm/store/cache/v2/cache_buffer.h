@@ -69,6 +69,7 @@ class Buffer {
     bool metricsRegistered_{false};
     std::string metricsDomainId_;
     std::unique_ptr<TailMetadata> tail_;
+    size_t relationWaitTimeoutMs_{30000};
 
     static constexpr size_t kPinSpinFast{64};
 
@@ -119,15 +120,35 @@ public:
                 return Status::InvalidParam("missing cache2 block relation");
             }
         }
+        // A single batch cannot be registered atomically if its distinct IDs
+        // exceed the entire node table, even after evicting every resident.
+        if (related.size() > tail_->NodeCapacity()) { return Status::NoSpace(); }
+        const auto now = std::chrono::steady_clock::now();
+        const auto maxWait = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now).count();
+        const auto timeout = std::min(relationWaitTimeoutMs_, static_cast<size_t>(maxWait));
+        const auto deadline = now + std::chrono::milliseconds(timeout);
         RelationToken token(this);
         token.refs_.reserve(desc.blockRelations.size());
         for (const auto& rel : desc.blockRelations) {
             TailMetadata::Ref ref;
-            const auto result = tail_->Register(rel.child, rel.parent, rel.isRoot, ref);
-            if (result != TailMetadata::Result::Ok) {
-                return result == TailMetadata::Result::Full ? Status::NoSpace()
-                     : result == TailMetadata::Result::Busy ? Status::Retry()
-                                                           : Status::InvalidParam();
+            for (;;) {
+                const auto result = tail_->Register(rel.child, rel.parent, rel.isRoot, ref);
+                if (result == TailMetadata::Result::Ok) { break; }
+                if (result == TailMetadata::Result::Poisoned) {
+                    return Status::Error("cache2 tail metadata is poisoned");
+                }
+                if (result != TailMetadata::Result::Full && result != TailMetadata::Result::Busy) {
+                    return Status::InvalidParam();
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return result == TailMetadata::Result::Full ? Status::NoSpace()
+                                                                : Status::Timeout();
+                }
+                // A task lease prevents collecting its node; never evict such
+                // a block merely to make room for this registration batch.
+                const bool progressed = result == TailMetadata::Result::Full && EvictTail(true);
+                if (!progressed) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
             }
             token.refs_.push_back(ref);
         }
@@ -320,6 +341,7 @@ public:
 
     Status Setup(const Config& cfg)
     {
+        relationWaitTimeoutMs_ = cfg.timeoutMs == 0 ? 30000 : cfg.timeoutMs;
         if (cfg.localRankSize == 0 || cfg.localRankSize > kMaxRanks) {
             return Status::InvalidParam("invalid cache2 local rank size({})", cfg.localRankSize);
         }
@@ -429,14 +451,22 @@ public:
         const auto usable = slotsPerRank_ - (allowReserved ? 0 : reservedSlots_);
         constexpr size_t kMaxAttemptsPerScan = 64;
         const auto attempts = usable > kMaxAttemptsPerScan / 2 ? kMaxAttemptsPerScan : 2 * usable;
+        bool metadataFull = false;
         for (;;) {
             if (cancelled.load(std::memory_order_acquire)) { return Status::Retry(); }
-            if (std::chrono::steady_clock::now() >= deadline) { return Status::Timeout(); }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return metadataFull ? Status::NoSpace() : Status::Timeout();
+            }
             bool owner = false;
             Status error = Status::OK();
             auto slot = TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank,
                                        &error);
             if (slot != kInvalid) { return Handle{this, slot, owner}; }
+            if (tail_ && error == Status::NoSpace()) {
+                metadataFull = true;
+                if (!EvictTail(true)) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+                continue;
+            }
             if (error.Failure()) { return error; }
             std::this_thread::yield();
         }
@@ -480,7 +510,8 @@ public:
             auto result = tail_->Acquire(blockId, ref);
             if (result == TailMetadata::Result::Ok) {
                 result = tail_->Touch(ref);
-                (void)tail_->Release(ref);
+                const auto released = tail_->Release(ref);
+                if (released != TailMetadata::Result::Ok) { result = released; }
             }
             found = result == TailMetadata::Result::Ok;
         }
@@ -530,30 +561,34 @@ private:
         auto result = tail_->Acquire(id, ref);
         if (result == TailMetadata::Result::Ok) {
             result = tail_->Touch(ref);
-            (void)tail_->Release(ref);
+            const auto released = tail_->Release(ref);
+            if (released != TailMetadata::Result::Ok) { result = released; }
         }
         if (result == TailMetadata::Result::Ok) { return true; }
         if (owner && GetState(slot) == State::Loading) { MarkFailed(slot); }
         Release(slot);
         if (error && result != TailMetadata::Result::Busy) {
             *error = result == TailMetadata::Result::Full ? Status::NoSpace()
-                                                          : Status::InvalidParam();
+                     : result == TailMetadata::Result::Poisoned
+                         ? Status::Error("cache2 tail metadata is poisoned")
+                         : Status::InvalidParam();
         }
         return false;
     }
 
     // Attempt a direct leaf first; if its rank differs, the bounded cascade
     // picks a leaf whose resident ancestor can eventually free this rank.
-    void EvictTail()
+    bool EvictTail(bool reclaimMetadata = false)
     {
-        if (!tail_ || myRank_ >= rankCount_) { return; }
+        if (!tail_ || myRank_ >= rankCount_) { return false; }
         TailMetadata::Ref selection;
         const auto budget = std::min<uint32_t>(tail_->NodeCapacity(), 256);
-        auto result = tail_->Select(static_cast<uint32_t>(myRank_), budget, false, selection);
-        if (result == TailMetadata::Result::NotFound) {
+        auto result = tail_->Select(static_cast<uint32_t>(myRank_), budget, false, selection,
+                                    reclaimMetadata, reclaimMetadata);
+        if (!reclaimMetadata && result == TailMetadata::Result::NotFound) {
             result = tail_->Select(static_cast<uint32_t>(myRank_), budget, true, selection);
         }
-        if (result != TailMetadata::Result::Ok) { return; }
+        if (result != TailMetadata::Result::Ok) { return false; }
         bool committed = false;
         auto abort = [&](TailMetadata*) {
             if (!committed) { (void)tail_->AbortEvict(selection); }
@@ -561,28 +596,29 @@ private:
         std::unique_ptr<TailMetadata, decltype(abort)> guard(tail_.get(), abort);
         try {
             Detail::BlockId id{};
-            if (tail_->EvictionId(selection, id) != TailMetadata::Result::Ok) { return; }
+            if (tail_->EvictionId(selection, id) != TailMetadata::Result::Ok) { return false; }
             std::vector<TailMetadata::Shard> snapshot;
-            if (tail_->GetShards(selection, snapshot) != TailMetadata::Result::Ok) { return; }
+            if (tail_->GetShards(selection, snapshot) != TailMetadata::Result::Ok) { return false; }
             std::vector<EvictionSlot> slots;
             slots.reserve(snapshot.size());
             for (const auto& shard : snapshot) {
                 if (shard.slot >= ctrl_.Layout().SlotCount() ||
-                    shard.rank != shard.slot / slotsPerRank_) { return; }
+                    shard.rank != shard.slot / slotsPerRank_) { return false; }
                 const auto offset = ctrl_.Layout().SlotMetaArr()[shard.slot].key[2].load(
                     std::memory_order_acquire);
                 slots.push_back({static_cast<size_t>(shard.slot), offset});
             }
-            if (slots.empty()) { return; }
+            if (slots.empty()) { return false; }
             const auto status = TryEvictSlots(id, std::move(slots), [&] {
                 const auto commit = tail_->CommitEvict(selection);
                 if (commit != TailMetadata::Result::Ok) { return Status::Retry(); }
                 committed = true;
                 return Status::OK();
             });
-            (void)status;
+            return status.Success();
         } catch (...) {
             // The selection guard clears the evicting flag on allocation errors.
+            return false;
         }
     }
 
@@ -592,6 +628,8 @@ private:
         std::mutex mutex_;
         std::condition_variable wake_;
         std::unordered_map<std::string, std::unordered_set<Buffer*>> domains_;
+        std::unordered_map<std::string, uint64_t> lastTailGc_;
+        std::chrono::steady_clock::time_point lastTailLog_{std::chrono::steady_clock::now()};
         bool stopping_{false};
         bool dirty_{false};
         std::thread thread_;
@@ -628,6 +666,13 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = domains_.find(buffer->metricsDomainId_);
             if (it != domains_.end()) {
+                if (it->second.size() == 1 && it->second.count(buffer) && buffer->tail_) {
+                    const auto stats = buffer->tail_->GetStats();
+                    if (stats.status == TailMetadata::Result::Ok) {
+                        ObserveTailGcLocked(it->first, stats.gc);
+                    }
+                    lastTailGc_.erase(it->first);
+                }
                 it->second.erase(buffer);
                 if (it->second.empty()) { domains_.erase(it); }
             }
@@ -641,6 +686,48 @@ private:
         }
 
     private:
+        void ObserveTailGcLocked(const std::string& domain, uint64_t count)
+        {
+            auto& previous = lastTailGc_[domain];
+            // A new shared region may reuse an id after the previous one exits.
+            if (count < previous) { previous = 0; }
+            if (count > previous) {
+                Metrics::UpdateStats("cache_dram_tail_metadata_gc_total",
+                                     static_cast<double>(count - previous));
+                previous = count;
+            }
+        }
+
+        void ReportTailStatsLocked(bool log)
+        {
+            double capacity = 0;
+            double used = 0;
+            bool complete = true;
+            for (const auto& [domain, buffers] : domains_) {
+                auto* buffer = *buffers.begin();
+                if (!buffer->tail_) { continue; }
+                const auto stats = buffer->tail_->GetStats();
+                if (stats.status != TailMetadata::Result::Ok) {
+                    complete = false;
+                    UC_WARN("cache2 tail metadata stats unavailable for domain={}", domain);
+                    continue;
+                }
+                capacity += static_cast<double>(stats.capacityBytes);
+                used += static_cast<double>(stats.usedBytes);
+                ObserveTailGcLocked(domain, stats.gc);
+                if (log) {
+                    UC_INFO_UNLIMITED("cache_dram_tail_metadata domain={} used_bytes={} "
+                                      "capacity_bytes={} nodes={} shards={} gc_total={} full_total={}",
+                                      domain, stats.usedBytes, stats.capacityBytes, stats.nodes,
+                                      stats.shards, stats.gc, stats.failed);
+                }
+            }
+            if (complete) {
+                Metrics::UpdateStats("cache_dram_tail_metadata_capacity_bytes", capacity);
+                Metrics::UpdateStats("cache_dram_tail_metadata_used_bytes", used);
+            }
+        }
+
         std::pair<double, double> SnapshotLocked()
         {
             double capacity = 0;
@@ -670,6 +757,10 @@ private:
                 // could precede the reporter's static destructor and join.
                 Metrics::UpdateStats("cache_dram_capacity_bytes", capacity);
                 Metrics::UpdateStats("cache_dram_used_bytes", used);
+                const auto now = std::chrono::steady_clock::now();
+                const bool log = now - lastTailLog_ >= std::chrono::seconds(60);
+                if (log) { lastTailLog_ = now; }
+                ReportTailStatsLocked(log);
             }
         }
     };
@@ -879,13 +970,23 @@ private:
                 auto registered = tail_->Acquire(blockId, ref);
                 if (registered == TailMetadata::Result::Ok) {
                     registered = tail_->AddShard(ref, iNode, static_cast<uint32_t>(myRank_));
-                    (void)tail_->Release(ref);
+                    const auto released = tail_->Release(ref);
+                    if (released != TailMetadata::Result::Ok) {
+                        // Metadata may already refer to this slot. Keep it
+                        // permanently unavailable when the domain is poisoned.
+                        meta->quarantined.store(1, std::memory_order_release);
+                        meta->reference.store(1, std::memory_order_release);
+                        if (error) { *error = Status::Error("cache2 tail metadata is poisoned"); }
+                        return kInvalid;
+                    }
                 }
                 if (registered != TailMetadata::Result::Ok) {
                     meta->reference.store(0, std::memory_order_release);
                     if (error && registered != TailMetadata::Result::Busy) {
                         *error = registered == TailMetadata::Result::Full ? Status::NoSpace()
-                                                                          : Status::InvalidParam();
+                                 : registered == TailMetadata::Result::Poisoned
+                                     ? Status::Error("cache2 tail metadata is poisoned")
+                                     : Status::InvalidParam();
                     }
                     return kInvalid;
                 }

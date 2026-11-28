@@ -118,6 +118,10 @@ struct BufferTestAccess {
     {
         buffer.tail_ = std::make_unique<TailMetadata>(memory);
     }
+    static void SetRelationTimeout(Buffer& buffer, size_t timeoutMs)
+    {
+        buffer.relationWaitTimeoutMs_ = timeoutMs;
+    }
 
     static size_t FindSlot(Buffer& buffer, const Detail::BlockId& blockId, size_t offset)
     {
@@ -328,8 +332,145 @@ TEST(Cache2TailBufferTest, RegistrationFailureRollsBackAndMissingRelationsAreRej
         auto full = buffer.RegisterRelations(desc);
         ASSERT_FALSE(full.HasValue());
         EXPECT_EQ(full.Error(), Status::NoSpace());
+        desc.blockRelations = {{a, {}, true}, {a, b, false}};
+        auto conflict = buffer.RegisterRelations(desc);
+        ASSERT_FALSE(conflict.HasValue());
+        EXPECT_EQ(conflict.Error(), Status::InvalidParam());
         TailMetadata view(tail);
         EXPECT_EQ(view.GetStats().nodes, 0u);
+    }
+    ::operator delete(tail, std::align_val_t{64});
+    ::operator delete(control, std::align_val_t{64});
+}
+
+TEST(Cache2TailBufferTest, FullMetadataReclaimsAnUnpinnedLeafOnAnotherRank)
+{
+    constexpr size_t ranks = 2, slotsPerRank = 1, buckets = 8, locks = 4;
+    const auto controlBytes = BufferTestAccess::TotalSize(buckets, locks, ranks * slotsPerRank);
+    auto* control = ::operator new(controlBytes, std::align_val_t{64});
+    const auto tailBytes = TailMetadata::Bytes(1, 2, 2);
+    auto* tail = ::operator new(tailBytes, std::align_val_t{64});
+    ASSERT_TRUE(TailMetadata::Initialize(tail, tailBytes, 1, 2, 2));
+    {
+        Buffer rank0, rank1;
+        BufferTestAccess::Init(rank0, control, ranks, slotsPerRank, buckets, locks);
+        BufferTestAccess::Attach(rank1, control, ranks, slotsPerRank, buckets, locks, 1);
+        BufferTestAccess::SetTail(rank0, tail);
+        BufferTestAccess::SetTail(rank1, tail);
+        BufferTestAccess::SetRelationTimeout(rank0, 1000);
+        const auto a = MakeBlockId(20), b = MakeBlockId(21);
+        Detail::TaskDesc first;
+        first.push_back({a, 0, {}});
+        first.blockRelations = {{a, {}, true}};
+        std::atomic_bool cancelled{false};
+        {
+            auto token = rank1.RegisterRelations(first);
+            ASSERT_TRUE(token.HasValue());
+            auto slot = rank1.GetUntil(a, 0, std::chrono::steady_clock::now() +
+                                                std::chrono::seconds(1), cancelled);
+            ASSERT_TRUE(slot.HasValue());
+            slot.Value().MarkReady();
+        }
+        EXPECT_TRUE(rank0.Exist(a, 0));
+        Detail::TaskDesc next;
+        next.push_back({b, 0, {}});
+        next.blockRelations = {{b, {}, true}};
+        auto token = rank0.RegisterRelations(next);
+        ASSERT_TRUE(token.HasValue());
+        EXPECT_FALSE(rank0.Exist(a, 0));
+        auto slot = rank0.GetUntil(b, 0, std::chrono::steady_clock::now() +
+                                            std::chrono::seconds(1), cancelled);
+        ASSERT_TRUE(slot.HasValue());
+        slot.Value().MarkReady();
+        EXPECT_TRUE(rank0.Exist(b, 0));
+    }
+    ::operator delete(tail, std::align_val_t{64});
+    ::operator delete(control, std::align_val_t{64});
+}
+
+TEST(Cache2TailBufferTest, FullMetadataWithPinnedLeafFailsWithinDeadline)
+{
+    constexpr size_t slots = 1, buckets = 8, locks = 4;
+    const auto controlBytes = BufferTestAccess::TotalSize(buckets, locks, slots);
+    auto* control = ::operator new(controlBytes, std::align_val_t{64});
+    const auto tailBytes = TailMetadata::Bytes(1, 1, 2);
+    auto* tail = ::operator new(tailBytes, std::align_val_t{64});
+    ASSERT_TRUE(TailMetadata::Initialize(tail, tailBytes, 1, 1, 2));
+    {
+        Buffer buffer;
+        BufferTestAccess::Init(buffer, control, 1, slots, buckets, locks);
+        BufferTestAccess::SetTail(buffer, tail);
+        BufferTestAccess::SetRelationTimeout(buffer, 20);
+        const auto a = MakeBlockId(30), b = MakeBlockId(31);
+        Detail::TaskDesc first;
+        first.push_back({a, 0, {}});
+        first.blockRelations = {{a, {}, true}};
+        std::optional<Buffer::Handle> pin;
+        std::atomic_bool cancelled{false};
+        {
+            auto token = buffer.RegisterRelations(first);
+            ASSERT_TRUE(token.HasValue());
+            auto slot = buffer.GetUntil(a, 0, std::chrono::steady_clock::now() +
+                                                 std::chrono::seconds(1), cancelled);
+            ASSERT_TRUE(slot.HasValue());
+            pin.emplace(std::move(slot).Value());
+            pin->MarkReady();
+        }
+        Detail::TaskDesc next;
+        next.push_back({b, 0, {}});
+        next.blockRelations = {{b, {}, true}};
+        const auto start = std::chrono::steady_clock::now();
+        auto result = buffer.RegisterRelations(next);
+        ASSERT_FALSE(result.HasValue());
+        EXPECT_EQ(result.Error(), Status::NoSpace());
+        EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+        EXPECT_TRUE(buffer.Exist(a, 0));
+        EXPECT_EQ(BufferTestAccess::UsedSlots(buffer), 1u);
+        pin.reset();
+        auto retry = buffer.RegisterRelations(next);
+        ASSERT_TRUE(retry.HasValue());
+        EXPECT_FALSE(buffer.Exist(a, 0));
+    }
+    ::operator delete(tail, std::align_val_t{64});
+    ::operator delete(control, std::align_val_t{64});
+}
+
+TEST(Cache2TailBufferTest, FullShardMetadataReclaimsBeforeBindingFreeSlot)
+{
+    constexpr size_t slots = 2, buckets = 8, locks = 4;
+    const auto controlBytes = BufferTestAccess::TotalSize(buckets, locks, slots);
+    auto* control = ::operator new(controlBytes, std::align_val_t{64});
+    const auto tailBytes = TailMetadata::Bytes(2, 1, 2);
+    auto* tail = ::operator new(tailBytes, std::align_val_t{64});
+    ASSERT_TRUE(TailMetadata::Initialize(tail, tailBytes, 2, 1, 2));
+    {
+        Buffer buffer;
+        BufferTestAccess::Init(buffer, control, 1, slots, buckets, locks);
+        BufferTestAccess::SetTail(buffer, tail);
+        const auto a = MakeBlockId(40), b = MakeBlockId(41);
+        std::atomic_bool cancelled{false};
+        Detail::TaskDesc first;
+        first.push_back({a, 0, {}});
+        first.blockRelations = {{a, {}, true}};
+        {
+            auto token = buffer.RegisterRelations(first);
+            ASSERT_TRUE(token.HasValue());
+            auto slot = buffer.GetUntil(a, 0, std::chrono::steady_clock::now() +
+                                                 std::chrono::seconds(1), cancelled);
+            ASSERT_TRUE(slot.HasValue());
+            slot.Value().MarkReady();
+        }
+        Detail::TaskDesc next;
+        next.push_back({b, 0, {}});
+        next.blockRelations = {{b, {}, true}};
+        auto token = buffer.RegisterRelations(next);
+        ASSERT_TRUE(token.HasValue());
+        auto slot = buffer.GetUntil(b, 0, std::chrono::steady_clock::now() +
+                                             std::chrono::seconds(1), cancelled);
+        ASSERT_TRUE(slot.HasValue());
+        slot.Value().MarkReady();
+        EXPECT_FALSE(buffer.Exist(a, 0));
+        EXPECT_TRUE(buffer.Exist(b, 0));
     }
     ::operator delete(tail, std::align_val_t{64});
     ::operator delete(control, std::align_val_t{64});

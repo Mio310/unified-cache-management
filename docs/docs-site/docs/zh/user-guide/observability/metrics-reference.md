@@ -91,7 +91,8 @@ Cache Store 利用主机缓冲衔接设备与下层存储，适合判断**加载
 | --------------------------------------------- | -------------------------------------------------------------------------- |
 | `ucm:cache_dram_hit_shards_total` | 获取 slot 后首次状态检查为 Ready、最终成功加载的分片数 |
 | `ucm:cache_dram_load_shards_total` | 成功加载的分片数，包括等待其他任务填充或从后端加载 |
-| `ucm:cache_dram_evicted_bytes_total` | Clock 替换 Ready slot 的累计字节数，按分片统计，并非完整 block 淘汰量 |
+| `ucm:cache_dram_evicted_bytes_total` | 尾部策略淘汰或 Clock 替换 Ready slot 的累计字节数，按分片统计，并非完整 block 淘汰量 |
+| `ucm:cache_dram_tail_metadata_gc_total` | 共享域中回收的尾部元数据 block 条目累计数 |
 | `ucm:cache_lookup_hit_blocks_total` | Cache Lookup 直接命中、未向后端查询的块数 |
 | `ucm:cache_lookup_miss_blocks_total` | Cache Lookup 未命中并继续查询后端的块数 |
 | `ucm:cache_load_shards_total` | Load 时检查过 Cache 缓冲状态的分片总数 |
@@ -112,6 +113,8 @@ Cache Store 利用主机缓冲衔接设备与下层存储，适合判断**加载
 | --- | --- |
 | `ucm:cache_dram_capacity_bytes` | 共享 DRAM slot 数据区总容量 |
 | `ucm:cache_dram_used_bytes` | 已分配 slot 的容量，包括 Loading、Ready、Failed 和预分配 slot |
+| `ucm:cache_dram_tail_metadata_capacity_bytes` | 尾部元数据预分配区域容量，每个共享域统计一次 |
+| `ucm:cache_dram_tail_metadata_used_bytes` | 元数据逻辑占用，包括固定表和已使用条目；GC 不会缩小预分配的物理区域 |
 
 rank 0 每 10 秒采集容量。同一进程内按 unique ID 对共享域去重，并将各域容量汇总为一组 Gauge；Prometheus 多进程模式的 `livesum` 只汇总标签完全相同的进程，`worker_id` 或 `worker_rank` 不同时仍是不同序列；一条序列不一定对应单个共享域。如果同一共享域异常地被多个进程的 rank 0 重复上报，会产生重复计数。这是 slot 容量而非进程 RSS；Clock 通常直接替换已分配 slot，因此淘汰后已用容量可能仍维持高位。
 

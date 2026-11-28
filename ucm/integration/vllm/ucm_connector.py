@@ -1762,6 +1762,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self._invalid_block_ids: set[int] = set()
         self._async_dump_req_ids: set[str] = set()
         self._pending_dump_tasks: list[PendingDumpTask] = []
+        self._tail_dump_failure: Optional[BaseException] = None
         request_async_configured = bool(
             self.launch_config.get("use_request_async_load", False)
         )
@@ -2664,7 +2665,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
     def _wait_pending_dump_task(self, pending_dump_task: PendingDumpTask) -> None:
         wait_start_ms = time.perf_counter() * 1000
         try:
-            self._rank_consistency.wait_dump(pending_dump_task.task)
+            if getattr(self, "_tail_relations_enabled", False):
+                self._rank_consistency.wait_dump(
+                    pending_dump_task.task, propagate_unhealthy=True
+                )
+            else:
+                self._rank_consistency.wait_dump(pending_dump_task.task)
             wait_end_ms = time.perf_counter() * 1000
             stats = {}
             if pending_dump_task.wait_for_save_start_ms > 0:
@@ -2688,6 +2694,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
             self.device.destroy_event_handle(pending_dump_task.event_handle)
             pending_dump_task.event_handle = 0
 
+    def _remember_tail_dump_failure(self, stage: str, error: BaseException) -> None:
+        if getattr(self, "_tail_relations_enabled", False) and getattr(
+            self, "_tail_dump_failure", None
+        ) is None:
+            failure = RuntimeError(f"DRAM tail eviction dump {stage} failed: {error}")
+            failure.__cause__ = error
+            self._tail_dump_failure = failure
+
+    def _raise_tail_dump_failure(self) -> None:
+        failure = getattr(self, "_tail_dump_failure", None)
+        if getattr(self, "_tail_relations_enabled", False) and failure is not None:
+            raise failure
+
     def _poll_pending_dump_tasks(self) -> None:
         remaining_tasks: list[PendingDumpTask] = []
         for pending_dump_task in self._pending_dump_tasks:
@@ -2697,7 +2716,18 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     continue
             except Exception as e:
                 logger.error(f"check dump kv cache failed. {type(e).__name__}: {e}")
-                remaining_tasks.append(pending_dump_task)
+                if getattr(self, "_tail_relations_enabled", False):
+                    # Drain the task before releasing its device event. The
+                    # Store's Wait owns cancellation and completion cleanup.
+                    try:
+                        self._wait_pending_dump_task(pending_dump_task)
+                    except Exception as wait_error:
+                        logger.error_limit(
+                            f"wait for dump kv cache failed. {type(wait_error).__name__}: {wait_error}"
+                        )
+                    self._remember_tail_dump_failure("check", e)
+                else:
+                    remaining_tasks.append(pending_dump_task)
                 continue
 
             try:
@@ -2708,8 +2738,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.error_limit(
                     f"wait for dump kv cache failed. {type(e).__name__}: {e}"
                 )
+                self._remember_tail_dump_failure("wait", e)
 
         self._pending_dump_tasks = remaining_tasks
+        self._raise_tail_dump_failure()
 
     def _flush_pending_dump_tasks(self, request_ids: Optional[set[str]] = None) -> None:
         pending_dump_tasks = self._pending_dump_tasks
@@ -2727,7 +2759,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.error_limit(
                     f"wait for dump kv cache failed. {type(e).__name__}: {e}"
                 )
+                self._remember_tail_dump_failure("wait", e)
         self._pending_dump_tasks = remaining_tasks
+        self._raise_tail_dump_failure()
 
     def handle_preemptions(
         self,
@@ -2803,6 +2837,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.error(f"dump kv cache failed. {type(e).__name__}: {e}")
                 if self.enable_event_sync and event_handle and self.device is not None:
                     self.device.destroy_event_handle(event_handle)
+                self._remember_tail_dump_failure("submit", e)
+                self._raise_tail_dump_failure()
                 return
 
             save_bytes = num_saved_block * self.block_data_size
@@ -2936,18 +2972,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         async_finished_req_ids = finished_req_ids & self._async_dump_req_ids
 
         if async_finished_req_ids:
-            remaining_tasks: list[PendingDumpTask] = []
-            for pending_dump_task in self._pending_dump_tasks:
-                if pending_dump_task.request_ids & async_finished_req_ids:
-                    try:
-                        self._wait_pending_dump_task(pending_dump_task)
-                    except Exception as e:
-                        logger.error_limit(
-                            f"wait for dump kv cache failed. {type(e).__name__}: {e}"
-                        )
-                else:
-                    remaining_tasks.append(pending_dump_task)
-            self._pending_dump_tasks = remaining_tasks
+            self._flush_pending_dump_tasks(async_finished_req_ids)
+        self._raise_tail_dump_failure()
 
         self._rank_consistency.finish_dump(async_finished_req_ids)
         self._async_dump_req_ids.difference_update(async_finished_req_ids)
@@ -3222,6 +3248,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             self._record_counter("connector_dump_submit_errors_total")
             if self.enable_event_sync and event_handle and self.device is not None:
                 self.device.destroy_event_handle(event_handle)
+            self._remember_tail_dump_failure("submit", e)
+            self._raise_tail_dump_failure()
             return False
 
     def _submit_request_load_tasks_for_layer(
