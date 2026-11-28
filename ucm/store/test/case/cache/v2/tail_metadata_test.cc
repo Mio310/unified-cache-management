@@ -3,8 +3,10 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
  * SPDX-License-Identifier: MIT
  */
+#include <atomic>
 #include <cstddef>
 #include <memory>
+#include <thread>
 #include <vector>
 #include "cache/v2/tail_metadata.h"
 #include "gtest/gtest.h"
@@ -134,6 +136,54 @@ TEST(TailMetadataTest, StaleEvictionAttemptCannotControlNextAttempt)
     EXPECT_EQ(f.metadata.GetShard(second, 0, shard), M::Result::Ok);
     EXPECT_EQ(f.metadata.CommitEvict(second), M::Result::Ok);
     EXPECT_EQ(f.metadata.GetStats().shards, 0u);
+}
+
+TEST(TailMetadataTest, ConcurrentChildAdmissionAndParentSelectionAreExclusive)
+{
+    for (int iteration = 0; iteration < 128; ++iteration) {
+        Fixture f(2, 2);
+        M::Ref parent, child, selected;
+        ASSERT_EQ(f.metadata.Register(Id(1), {}, true, parent), M::Result::Ok);
+        ASSERT_EQ(f.metadata.Register(Id(2), Id(1), false, child), M::Result::Ok);
+        ASSERT_EQ(f.metadata.AddShard(parent, 10, 0), M::Result::Ok);
+        // Clear the parent's CLOCK bit before racing admission with selection.
+        ASSERT_EQ(f.metadata.Select(0, 4, false, selected), M::Result::Ok);
+        ASSERT_EQ(f.metadata.AbortEvict(selected), M::Result::Ok);
+
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        M::Result admission = M::Result::Invalid;
+        M::Result selection = M::Result::Invalid;
+        std::thread admit([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+            admission = f.metadata.AddShard(child, 20, 0);
+        });
+        std::thread evict([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+            selection = f.metadata.Select(0, 4, false, selected);
+        });
+        while (ready.load(std::memory_order_acquire) != 2) { std::this_thread::yield(); }
+        go.store(true, std::memory_order_release);
+        admit.join();
+        evict.join();
+
+        if (selection == M::Result::Ok && selected.index == parent.index) {
+            EXPECT_EQ(admission, M::Result::Busy);
+            EXPECT_EQ(f.metadata.GetStats().shards, 1u);
+            ASSERT_EQ(f.metadata.AbortEvict(selected), M::Result::Ok);
+        } else {
+            EXPECT_EQ(admission, M::Result::Ok);
+            EXPECT_EQ(f.metadata.GetStats().shards, 2u);
+            if (selection == M::Result::Ok) {
+                EXPECT_EQ(selected.index, child.index);
+                ASSERT_EQ(f.metadata.AbortEvict(selected), M::Result::Ok);
+            } else {
+                EXPECT_EQ(selection, M::Result::NotFound);
+            }
+        }
+    }
 }
 } // namespace
 } // namespace UC::Cache2

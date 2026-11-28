@@ -23,9 +23,12 @@
  * */
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -67,6 +70,7 @@ class DumpQ {
     };
 
     alignas(64) std::atomic_bool stop_{false};
+    alignas(64) std::atomic_bool dumperStop_{false};
     TaskIdSet* failureSet_{nullptr};
     BufferT* buffer_{nullptr};
     StoreV1* backend_{nullptr};
@@ -77,6 +81,11 @@ class DumpQ {
     bool useGdr_{false};
     std::vector<size_t> tensorSizes_{};
     std::vector<ssize_t> cpuAffinityCores_{};
+    size_t timeoutMs_{0};
+    std::mutex submitMutex_{};
+    std::mutex closeMutex_{};
+    std::mutex activeMutex_{};
+    TaskPtr activeTask_{};
     SpscRingQueue<TaskPair> waiting_{};
     SpscRingQueue<DumpCtx> dumping_{};
     std::thread dispatcher_{};
@@ -100,6 +109,7 @@ public:
         useGdr_ = config.useGdr;
         tensorSizes_ = config.tensorSizes;
         cpuAffinityCores_ = config.cpuAffinityCores;
+        timeoutMs_ = config.timeoutMs;
         waiting_.Setup(config.waitingQueueDepth);
         if (backend_ != nullptr) {
             dumping_.Setup(config.runningQueueDepth);
@@ -113,17 +123,40 @@ public:
     void Submit(TaskPtr task, WaiterPtr waiter)
     {
         waiter->Up();
-        if (waiting_.TryPush({task, waiter})) { return; }
+        bool stopped = false;
+        {
+            std::lock_guard<std::mutex> lock(submitMutex_);
+            stopped = stop_.load(std::memory_order_acquire);
+            if (!stopped && waiting_.TryPush({task, waiter})) { return; }
+        }
+        if (stopped) {
+            task->Fail(Status::Error("dump queue closed"));
+            failureSet_->Insert(task->id);
+            waiter->Done();
+            return;
+        }
         UC_ERROR("Waiting queue full, submit dump task({}) failed.", task->id);
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_queue_full_total"), 1.0);
+        task->Fail(Status::Retry());
         failureSet_->Insert(task->id);
         waiter->Done();
     }
     void Close()
     {
-        if (stop_.exchange(true)) { return; }
+        std::lock_guard<std::mutex> closeLock(closeMutex_);
+        {
+            std::lock_guard<std::mutex> submitLock(submitMutex_);
+            if (stop_.exchange(true)) { return; }
+        }
+        {
+            std::lock_guard<std::mutex> lock(activeMutex_);
+            if (activeTask_) { activeTask_->cancelled.store(true, std::memory_order_release); }
+        }
         if (dispatcher_.joinable()) { dispatcher_.join(); }
         DrainWaiting();
+        // Keep the backend consumer alive while the dispatcher may be blocked
+        // pushing a completed write into the bounded queue.
+        dumperStop_.store(true, std::memory_order_release);
         if (dumper_.joinable()) { dumper_.join(); }
         DrainDumping();
     }
@@ -155,7 +188,18 @@ private:
         auto queueWaitMs = (NowTime::Now() - waiter->startTp) * 1e3;
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_queue_wait_duration_ms"), queueWaitMs);
         if (!failureSet_->Contains(task->id)) {
+            {
+                std::lock_guard<std::mutex> lock(activeMutex_);
+                activeTask_ = task;
+                if (stop_.load(std::memory_order_acquire)) {
+                    task->cancelled.store(true, std::memory_order_release);
+                }
+            }
             auto s = DumpOneTask(stream, task);
+            {
+                std::lock_guard<std::mutex> lock(activeMutex_);
+                activeTask_.reset();
+            }
             if (s.Failure()) [[unlikely]] {
                 task->Fail(s);
                 failureSet_->Insert(task->id);
@@ -174,10 +218,24 @@ private:
         backendDesc.brief = "Cache2Backend";
         size_t copiedShards = 0;
         s = GatherShards(stream, task, ctx, backendDesc, copiedShards);
-        if (s.Failure()) [[unlikely]] { return s; }
+        if (s.Success() && task->cancelled.load(std::memory_order_acquire)) { s = Status::Retry(); }
+        if (s.Failure()) [[unlikely]] {
+            // A previous shard may still be the target of an asynchronous copy.
+            // Drain every copy stream before changing state or releasing handles.
+            if (!ctx.bufferHandles.empty()) {
+                auto syncStatus = stream.Synchronize();
+                if (syncStatus.Failure()) {
+                    UC_ERROR("Failed({}) to drain D2H after dump task({}) failed.", syncStatus,
+                             task->id);
+                }
+                FailOwnedHandles(ctx);
+            }
+            return s;
+        }
         if (ctx.bufferHandles.empty()) { return Status::OK(); }
         s = CompleteD2h(stream, task, ctx, copiedShards);
         if (s.Failure()) [[unlikely]] { return s; }
+        if (task->cancelled.load(std::memory_order_acquire)) { return Status::Retry(); }
         if (backend_ == nullptr || backendDesc.empty()) { return Status::OK(); }
         return SubmitBackendDump(task, ctx, std::move(backendDesc));
     }
@@ -195,9 +253,23 @@ private:
                         Detail::TaskDesc& backendDesc, size_t& copiedShards)
     {
         const auto startTp = NowTime::Now();
+        // Always bound the allocation wait, including fire-and-forget callers.
+        constexpr size_t kDefaultAllocationTimeoutMs = 30000;
+        const auto allocationTimeout = timeoutMs_ == 0 ? kDefaultAllocationTimeoutMs : timeoutMs_;
+        const auto now = std::chrono::steady_clock::now();
+        const auto maxWait = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now).count();
+        const auto timeout = std::min(allocationTimeout, static_cast<size_t>(maxWait));
+        const auto deadline = now + std::chrono::milliseconds(timeout);
         if (backend_ != nullptr) { backendDesc.reserve(task->desc.size()); }
         for (auto& shard : task->desc) {
-            auto handle = buffer_->Get(shard.owner, shard.index);
+            auto result = buffer_->GetUntil(shard.owner, shard.index, deadline, task->cancelled);
+            if (!result) { return result.Error(); }
+            auto handle = std::move(result).Value();
+            if (task->cancelled.load(std::memory_order_acquire)) {
+                if (handle.Owner() && handle.GetState() != SlotState::Ready) { handle.MarkFailed(); }
+                return Status::Retry();
+            }
             if (!handle.Owner()) { continue; }
             ctx.bufferHandles.push_back(std::move(handle));
             auto& pinned = ctx.bufferHandles.back();
@@ -214,7 +286,6 @@ private:
                 if (s.Failure()) [[unlikely]] {
                     UC_ERROR("Failed({}) to copy shard for dump task({}).", s, task->id);
                     Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_errors_total"), 1.0);
-                    FailOwnedHandles(ctx);
                     return s;
                 }
                 ++copiedShards;
@@ -277,7 +348,7 @@ private:
             UC_WARN("Failed({}) to set dump wait thread name.", nameStatus);
         }
         BindCpuAffinity();
-        dumping_.ConsumerLoop(stop_, [this](DumpCtx&& ctx) {
+        dumping_.ConsumerLoop(dumperStop_, [this](DumpCtx&& ctx) {
             if (ctx.backendTaskHandle == 0) { return; }
             const auto startTp = NowTime::Now();
             auto s = backend_->Wait(ctx.backendTaskHandle);
@@ -299,6 +370,7 @@ private:
         TaskPair pair;
         while (waiting_.TryPop(pair)) {
             UC_WARN("Cache2 dump task({}) discarded on close.", pair.first->id);
+            pair.first->Fail(Status::Error("dump queue closed"));
             failureSet_->Insert(pair.first->id);
             pair.second->Done();
         }

@@ -34,6 +34,7 @@
 #include <thread>
 #include "mutex/shared_mutex.h"
 #include "status/status.h"
+#include "tail_metadata.h"
 
 namespace UC::Cache2 {
 
@@ -43,7 +44,7 @@ inline constexpr size_t kMaxRanks{128};
 inline constexpr size_t kMaxLockStripes{1ULL << 16};
 inline constexpr size_t kMinBuckets{1ULL << 10};
 inline constexpr size_t kMaxBuckets{1ULL << 24};
-inline constexpr uint32_t kCtrlMagic{0x55433202U};  // "UC2" + layout version 2.
+inline constexpr uint32_t kCtrlMagic{0x55433203U};  // "UC2" + layout version 3.
 
 class CtrlLayout {
 public:
@@ -109,6 +110,8 @@ private:
         size_t slotSize{0};
         size_t bucketCount{0};
         size_t lockStripeCount{0};
+        size_t tailBytes{0};
+        uint32_t tailNodes{0}, tailShards{0}, tailBuckets{0};
         // Counts slots bound to a key, including Loading, Failed and preallocated slots.
         // Clock replaces bindings in place; a future path that permanently unbinds
         // a slot must decrement this counter exactly once while holding its claim.
@@ -160,6 +163,12 @@ private:
     static size_t TotalSize(size_t bucketCount, size_t lockStripeCount, size_t slotCount)
     {
         return SlotMetaOffset(bucketCount, lockStripeCount) + sizeof(SlotMeta) * slotCount;
+    }
+
+    static size_t TailOffset(size_t bucketCount, size_t lockStripeCount, size_t slotCount)
+    {
+        return AlignUp(TotalSize(bucketCount, lockStripeCount, slotCount),
+                       TailMetadata::Alignment());
     }
 
     void Bind(void* base, size_t rankCount, size_t slotsPerRank, size_t bucketCount,
@@ -280,6 +289,15 @@ public:
 
     size_t BucketCount() const { return bucketCount_; }
     size_t SlotCount() const { return slotCount_; }
+
+    // The metadata view is process-local; only the pointed-to storage is shared.
+    // Null means this control region was created without tail metadata.
+    void* TailMemory() const
+    {
+        if (base_ == nullptr || Hdr()->tailBytes == 0) { return nullptr; }
+        return static_cast<std::byte*>(base_) + TailOffset(bucketCount_, lockStripeCount_, slotCount_);
+    }
+    size_t TailBytes() const { return base_ == nullptr ? 0 : Hdr()->tailBytes; }
 
 private:
     std::atomic<size_t>* ClockHand(size_t rank) const

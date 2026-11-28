@@ -23,6 +23,7 @@
  * */
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -105,6 +106,7 @@ class LoadQ {
         WaiterPtr waiter;
         bool fromCache{false};
         bool firstShard{false};
+        std::chrono::steady_clock::time_point deadline{};
     };
 
     alignas(64) std::atomic_bool stop_{false};
@@ -123,6 +125,7 @@ class LoadQ {
     bool useGdr_{false};
     size_t localRankSize_{1};
     size_t nShardPerBlock_{0};
+    size_t slotWaitTimeoutMs_{30000};
     std::vector<size_t> tensorSizes_{};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_{};
@@ -156,6 +159,10 @@ public:
         useGdr_ = config.useGdr;
         localRankSize_ = config.localRankSize;
         nShardPerBlock_ = config.blockSize / config.shardSize;
+        // Unlike an explicit Wait(), asynchronous Check()-only callers do not
+        // cancel a task when capacity is exhausted. Keep slot acquisition
+        // bounded even if the general task timeout is configured as unlimited.
+        slotWaitTimeoutMs_ = config.timeoutMs == 0 ? 30000 : config.timeoutMs;
         tensorSizes_ = config.tensorSizes;
         cpuAffinityCores_ = config.cpuAffinityCores;
         waiting_.Setup(config.waitingQueueDepth);
@@ -261,6 +268,15 @@ private:
     {
         const auto startTp = NowTime::Now();
         const auto nShard = task->desc.size();
+        if (nShard == 0) {
+            waiter->Done();
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto maxWait = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now).count();
+        const auto timeout = std::min(slotWaitTimeoutMs_, static_cast<size_t>(maxWait));
+        const auto deadline = now + std::chrono::milliseconds(timeout);
         std::vector<size_t> indexes(nShard);
         if (task->desc.distributeBackendLoad) {
             indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
@@ -276,11 +292,11 @@ private:
             auto result =
                 task->desc.distributeBackendLoad
                     ? buffer_->GetUntil(shard.owner, shard.index,
-                                        std::chrono::steady_clock::time_point::max(),
+                                        deadline,
                                         task->cancelled, true,
                                         originalIndex % localRankSize_)
                     : buffer_->GetUntil(shard.owner, shard.index,
-                                        std::chrono::steady_clock::time_point::max(),
+                                        deadline,
                                         task->cancelled, true);
             if (!result) {
                 RecordLoadSourceShards(i, waitShardCount);
@@ -312,6 +328,7 @@ private:
             }
             shardTask.task = task;
             shardTask.shard = &shard;
+            shardTask.deadline = deadline;
             shardTask.bufferHandle = std::move(handle);
             shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
             shardTask.firstShard = i == 0;
@@ -475,6 +492,7 @@ private:
                 failureSet_->Contains(task.task->id)) {
                 return Status::Error();
             }
+            if (std::chrono::steady_clock::now() >= task.deadline) { return Status::Timeout(); }
             std::this_thread::yield();
         }
     }

@@ -46,6 +46,10 @@ public:
     Status Setup(const Detail::Dictionary& inConfig) override
     {
         auto config = Config::From(inConfig);
+        if (config.enableDramTailEviction) {
+            UC_ERROR("DRAM tail eviction is not yet connected to cache slots.");
+            return Status::Unsupported();
+        }
         auto s = config.Validate();
         if (s.Failure()) {
             UC_ERROR("Failed to check config: {}.", s);

@@ -48,6 +48,7 @@ from ucm.integration.vllm.block_relations import (
     map_relation_keys,
     relations_for_slice,
     select_relations,
+    validate_tail_eviction_config,
 )
 from ucm.integration.vllm.cache_config import (
     cache_rank_count,
@@ -1708,6 +1709,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self.launch_config = ucm_config.get_config()
+        validate_tail_eviction_config(self.launch_config)
         # Internal only until the Store's strict eviction protocol is complete.
         self._tail_relations_enabled = False
         _apply_cuda_indexer_io_config(
@@ -3845,6 +3847,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id.rsplit("_dp", 1)[0]
         self.launch_config = ucm_config.get_config()
+        validate_tail_eviction_config(self.launch_config)
         _apply_cuda_indexer_io_config(
             self.launch_config,
             kv_cache_config,

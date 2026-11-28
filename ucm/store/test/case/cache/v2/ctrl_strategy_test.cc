@@ -14,7 +14,10 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iostream>
+#include <limits>
 #include <new>
+#include <poll.h>
+#include <signal.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -26,6 +29,12 @@
 namespace UC::Cache2 {
 
 struct CtrlStrategyTestAccess {
+    static std::array<size_t, 4> TailSizing(size_t slots)
+    {
+        CtrlStrategy::Dimensions dims;
+        CtrlStrategy::ResolveTailDimensions(slots, dims);
+        return {dims.tailNodes, dims.tailShards, dims.tailBuckets, dims.tailBytes};
+    }
     static const void* HeaderAddress(const CtrlLayout& layout) { return layout.Hdr(); }
     static size_t RankCount(const CtrlLayout& layout) { return layout.RankCount(); }
     static size_t SlotsPerRank(const CtrlLayout& layout) { return layout.SlotsPerRank(); }
@@ -161,6 +170,8 @@ TEST(Cache2CtrlStrategyTest, SchedulerWithoutShardSizeStartsAfterWorker)
     ASSERT_TRUE(scheduler.Setup(schedulerConfig).Success());
     EXPECT_EQ(schedulerConfig.shardSize, 0);
     auto& layout = scheduler.Layout();
+    EXPECT_EQ(layout.TailMemory(), nullptr);
+    EXPECT_EQ(layout.TailBytes(), 0u);
     EXPECT_EQ(CtrlStrategyTestAccess::SlotSize(layout), workerConfig.shardSize);
     EXPECT_EQ(CtrlStrategyTestAccess::RankCount(layout), workerConfig.localRankSize);
     EXPECT_EQ(CtrlStrategyTestAccess::SlotsPerRank(layout), 8);
@@ -170,6 +181,115 @@ TEST(Cache2CtrlStrategyTest, SchedulerWithoutShardSizeStartsAfterWorker)
     auto observed = layout.GetRankDesc(0);
     ASSERT_TRUE(observed);
     EXPECT_EQ(observed.Value().handle.load(std::memory_order_relaxed), 123);
+}
+
+TEST(Cache2CtrlStrategyTest, TailSizingStaysWithinBudget)
+{
+    const auto small = CtrlStrategyTestAccess::TailSizing(64);
+    EXPECT_EQ(small[0], 64u);
+    EXPECT_EQ(small[1], 64u);
+    EXPECT_EQ(small[3], TailMetadata::Bytes(64, 64, static_cast<uint32_t>(small[2])));
+    const auto large = CtrlStrategyTestAccess::TailSizing(std::numeric_limits<size_t>::max());
+    EXPECT_GT(large[0], 0u);
+    EXPECT_EQ(large[0], large[1]);
+    EXPECT_LE(large[3], 256ULL << 20);
+    const auto next = static_cast<uint32_t>(large[0] + 1);
+    EXPECT_GT(TailMetadata::Bytes(next, next, next / 2 + 1), 256ULL << 20);
+}
+
+TEST(Cache2CtrlStrategyTest, TailParticipantsRequireMatchingPolicy)
+{
+    auto id = ControlTestId("tail_policy");
+    auto enabled = MakeControlConfig(id, 0);
+    enabled.enableDramTailEviction = true;
+    CtrlStrategy creator;
+    ASSERT_TRUE(creator.Setup(enabled).Success());
+    ASSERT_NE(creator.Layout().TailMemory(), nullptr);
+    EXPECT_LE(creator.Layout().TailBytes(), 256ULL << 20);
+
+    auto disabled = MakeControlConfig(id, 1);
+    CtrlStrategy mismatch;
+    EXPECT_EQ(mismatch.Setup(disabled), Status::InvalidParam());
+
+    auto matching = MakeControlConfig(id, -1);
+    matching.enableDramTailEviction = true;
+    CtrlStrategy joiner;
+    ASSERT_TRUE(joiner.Setup(matching).Success());
+    EXPECT_EQ(joiner.Layout().TailBytes(), creator.Layout().TailBytes());
+    TailMetadata creatorView(creator.Layout().TailMemory());
+    TailMetadata joinerView(joiner.Layout().TailMemory());
+    TailMetadata::Id block{};
+    block[0] = std::byte{1};
+    TailMetadata::Ref ref;
+    ASSERT_EQ(creatorView.Register(block, {}, true, ref), TailMetadata::Result::Ok);
+    ASSERT_EQ(creatorView.AddShard(ref, 0, 0), TailMetadata::Result::Ok);
+    EXPECT_EQ(joinerView.GetStats().nodes, 1u);
+    EXPECT_EQ(joinerView.GetStats().shards, 1u);
+}
+
+TEST(Cache2CtrlStrategyProcessTest, TailMetadataIsVisibleAcrossProcesses)
+{
+    int start[2]{}, result[2]{};
+    ASSERT_EQ(::pipe(start), 0);
+    ASSERT_EQ(::pipe(result), 0);
+    const auto id = ControlTestId("tail_shared");
+    const auto child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(start[1]);
+        ::close(result[0]);
+        if (!ReadByte(start[0])) { ::_exit(2); }
+        auto cfg = MakeControlConfig(id, 1);
+        cfg.enableDramTailEviction = true;
+        CtrlStrategy joiner;
+        if (joiner.Setup(cfg).Failure() || joiner.Layout().TailMemory() == nullptr) { ::_exit(3); }
+        TailMetadata view(joiner.Layout().TailMemory());
+        TailMetadata::Id id{};
+        id[0] = std::byte{42};
+        TailMetadata::Ref ref;
+        if (view.Register(id, {}, true, ref) != TailMetadata::Result::Ok ||
+            view.AddShard(ref, 0, 0) != TailMetadata::Result::Ok ||
+            view.Release(ref) != TailMetadata::Result::Ok) {
+            ::_exit(4);
+        }
+        if (!WriteBytes(result[1], "x", 1)) { ::_exit(5); }
+        ::_exit(0);
+    }
+    ::close(start[0]);
+    ::close(result[1]);
+    auto cfg = MakeControlConfig(id, 0);
+    cfg.enableDramTailEviction = true;
+    CtrlStrategy creator;
+    const auto setup = creator.Setup(cfg);
+    const bool started = setup.Success() && WriteBytes(start[1], "x", 1);
+    ::close(start[1]);
+    pollfd pfd{result[0], POLLIN, 0};
+    const bool readable = started && ::poll(&pfd, 1, 15000) > 0;
+    const bool received = readable && ReadByte(result[0]);
+    ::close(result[0]);
+    int status = 0;
+    bool exited = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (::waitpid(child, &status, WNOHANG) == child) { exited = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!exited) {
+        ::kill(child, SIGKILL);
+        const auto reapDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < reapDeadline) {
+            if (::waitpid(child, &status, WNOHANG) == child) { break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(received);
+    ASSERT_TRUE(exited);
+    TailMetadata view(creator.Layout().TailMemory());
+    EXPECT_EQ(view.GetStats().nodes, 1u);
+    EXPECT_EQ(view.GetStats().shards, 1u);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(Cache2CtrlStrategyTest, SchedulerStillRejectsMismatchedCapacityAndRanks)

@@ -23,8 +23,11 @@
  * */
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <thread>
 #include "ctrl_layout.h"
@@ -36,11 +39,16 @@
 namespace UC::Cache2 {
 
 class CtrlStrategy {
+    friend struct CtrlStrategyTestAccess;
     struct Dimensions {
         size_t rankCount{0};
         size_t slotsPerRank{0};
         size_t slotSize{0};
         size_t bucketCount{0};
+        uint32_t tailNodes{0};
+        uint32_t tailShards{0};
+        uint32_t tailBuckets{0};
+        size_t tailBytes{0};
     };
 
     MemFd ctrlMem_;
@@ -79,6 +87,31 @@ public:
     const CtrlLayout& Layout() const { return layout_; }
 
 private:
+    // Worst case, every resident shard has a distinct block ID. Give nodes and
+    // shard entries equal capacity, then cap both to the shared 256 MiB budget.
+    // Exhausting this cap must eventually fail closed, not leave slots untracked.
+    static void ResolveTailDimensions(size_t slotCount, Dimensions& dims)
+    {
+        constexpr size_t kTailBudget = 256ULL << 20;
+        const auto upper = static_cast<uint32_t>(std::min(
+            slotCount, static_cast<size_t>(std::numeric_limits<uint32_t>::max() - 1)));
+        uint32_t low = 1, high = upper, best = 0;
+        while (low <= high) {
+            const auto mid = low + (high - low) / 2;
+            const auto buckets = mid / 2 + 1;
+            if (TailMetadata::Bytes(mid, mid, buckets) <= kTailBudget) {
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if (best == 0) { return; }
+        dims.tailNodes = dims.tailShards = best;
+        dims.tailBuckets = best / 2 + 1;
+        dims.tailBytes = TailMetadata::Bytes(best, best, dims.tailBuckets);
+    }
+
     static Status ResolveDimensions(const Config& cfg, Dimensions& dims)
     {
         /* A5 has one data partition per local worker. The public configuration
@@ -95,6 +128,12 @@ private:
         dims.slotSize = cfg.shardSize;
         slotCount = dims.rankCount * dims.slotsPerRank;
         dims.bucketCount = CtrlLayout::RecommendBucketCount(slotCount);
+        if (cfg.enableDramTailEviction) {
+            ResolveTailDimensions(slotCount, dims);
+            if (dims.tailBytes == 0) {
+                return Status::InvalidParam("cache2 cannot allocate tail metadata within budget");
+            }
+        }
         return Status::OK();
     }
 
@@ -105,12 +144,27 @@ private:
         if (s.Failure()) { return s; }
         auto slotCount = dims.rankCount * dims.slotsPerRank;
         auto lockCount = CtrlLayout::LockStripeCount(dims.bucketCount);
-        auto totalSize = CtrlLayout::TotalSize(dims.bucketCount, lockCount, slotCount);
+        auto totalSize = dims.tailBytes == 0
+            ? CtrlLayout::TotalSize(dims.bucketCount, lockCount, slotCount)
+            : CtrlLayout::TailOffset(dims.bucketCount, lockCount, slotCount) + dims.tailBytes;
         s = ctrlMem_.Create("ucm_cache2_ctrl", totalSize);
         if (s.Failure()) { return s; }
         layout_.Bind(ctrlMem_.Addr(), dims.rankCount, dims.slotsPerRank, dims.bucketCount,
                      lockCount);
         layout_.InitHeader(dims.slotSize);
+        auto* header = layout_.Hdr();
+        header->tailBytes = dims.tailBytes;
+        header->tailNodes = dims.tailNodes;
+        header->tailShards = dims.tailShards;
+        header->tailBuckets = dims.tailBuckets;
+        if (dims.tailBytes != 0) {
+            if (!TailMetadata::Initialize(layout_.TailMemory(), dims.tailBytes, dims.tailNodes,
+                                          dims.tailShards, dims.tailBuckets)) {
+                return Status::Error("failed to initialize cache2 tail metadata");
+            }
+            UC_INFO("cache2 tail metadata domain={} bytes={} nodes={} shards={} slots={}",
+                    cfg.uniqueId, dims.tailBytes, dims.tailNodes, dims.tailShards, slotCount);
+        }
         layout_.MarkReady();
         acceptThread_ =
             std::thread([this, joinerCount = dims.rankCount] { AcceptLoop(joinerCount); });
@@ -159,12 +213,17 @@ private:
         auto lockCount = header->lockStripeCount;
         if (expected.rankCount != rankCount || expected.slotsPerRank != slotsPerRank ||
             expected.slotSize != header->slotSize || expected.bucketCount != bucketCount ||
-            lockCount != CtrlLayout::LockStripeCount(expected.bucketCount)) {
+            lockCount != CtrlLayout::LockStripeCount(expected.bucketCount) ||
+            expected.tailBytes != header->tailBytes || expected.tailNodes != header->tailNodes ||
+            expected.tailShards != header->tailShards || expected.tailBuckets != header->tailBuckets) {
             return Status::InvalidParam("cache2 participants disagree on control layout");
         }
 
         auto slotCount = rankCount * slotsPerRank;
-        s = ctrlMem_.Remap(CtrlLayout::TotalSize(bucketCount, lockCount, slotCount));
+        const auto totalSize = expected.tailBytes == 0
+            ? CtrlLayout::TotalSize(bucketCount, lockCount, slotCount)
+            : CtrlLayout::TailOffset(bucketCount, lockCount, slotCount) + expected.tailBytes;
+        s = ctrlMem_.Remap(totalSize);
         if (s.Failure()) { return s; }
         layout_.Bind(ctrlMem_.Addr(), rankCount, slotsPerRank, bucketCount, lockCount);
         return Status::OK();

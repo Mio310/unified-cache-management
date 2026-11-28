@@ -12,6 +12,26 @@ from collections.abc import Callable, Iterable, Sequence
 BlockRelation = tuple[bytes, bytes | None]
 
 
+def validate_tail_eviction_config(launch_config: dict) -> None:
+    """Reject attempts to enable the unfinished Store protocol at startup.
+
+    Keep the opt-in at the connector level so scheduler and workers observe the
+    same setting. In particular, never silently run CLOCK when it is requested.
+    """
+    key = "enable_dram_tail_eviction"
+    for connector in launch_config.get("ucm_connectors", []):
+        if key in connector.get("ucm_connector_config", {}):
+            raise ValueError(f"{key} must be set at the UCM config top level")
+    enabled = launch_config.get(key, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{key} must be a boolean")
+    if enabled:
+        raise RuntimeError(
+            "enable_dram_tail_eviction is not supported yet: the shared Store "
+            "metadata and slot eviction protocol are incomplete"
+        )
+
+
 def _deduplicate(relations: Iterable[BlockRelation]) -> dict[bytes, bytes | None]:
     result: dict[bytes, bytes | None] = {}
     for child, parent in relations:

@@ -23,6 +23,7 @@
  * */
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -32,12 +33,14 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 #include "ctrl_layout.h"
 #include "ctrl_strategy.h"
 #include "data_strategy.h"
@@ -69,6 +72,102 @@ class Buffer {
     static constexpr size_t kPinSpinFast{64};
 
 public:
+    struct EvictionSlot {
+        size_t index;
+        size_t offset;
+    };
+
+    // Caller must first mark the block evicting in shared tail metadata and
+    // pass its complete set of resident slots. Registering a new shard must
+    // honor that marker. commitMetadata must atomically commit that exact
+    // eviction and leave metadata unchanged on failure; it must not acquire
+    // bucket locks. This primitive is deliberately not called by CLOCK.
+    // No bucket lock or claim may be held by the caller on entry. Slots are
+    // claimed by index; unique bucket stripes are tried in address order.
+    // Failed claims/locks/validation
+    // or a failed metadata commit leave all bindings intact.
+    Status TryEvictSlots(const Detail::BlockId& blockId, std::vector<EvictionSlot> slots,
+                         const std::function<Status()>& commitMetadata)
+    {
+        if (slots.empty() || !commitMetadata || bucketCount_ == 0) {
+            return Status::InvalidParam("invalid cache2 eviction request");
+        }
+        auto& layout = ctrl_.Layout();
+        std::sort(slots.begin(), slots.end(), [](const auto& a, const auto& b) {
+            return a.index < b.index;
+        });
+        std::vector<CtrlLayout::BucketLock*> locks;
+        locks.reserve(slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].index >= layout.SlotCount() ||
+                (i != 0 && slots[i - 1].index == slots[i].index)) {
+                return Status::InvalidParam("invalid or duplicate cache2 eviction slot");
+            }
+            locks.push_back(layout.LockOf(HashKey(blockId, slots[i].offset)));
+        }
+        std::sort(locks.begin(), locks.end(), std::less<CtrlLayout::BucketLock*>{});
+        locks.erase(std::unique(locks.begin(), locks.end()), locks.end());
+
+        size_t claimed = 0;
+        size_t locked = 0;
+        auto rollback = [&] {
+            while (locked != 0) { locks[--locked]->Unlock(); }
+            while (claimed != 0) {
+                layout.SlotMetaArr()[slots[--claimed].index].reference.store(
+                    0, std::memory_order_release);
+            }
+        };
+        auto releaseGuard = [&](CtrlLayout*) { rollback(); };
+        std::unique_ptr<CtrlLayout, decltype(releaseGuard)> guard(&layout, releaseGuard);
+        size_t readySlots = 0;
+        for (const auto& slot : slots) {
+            auto& meta = layout.SlotMetaArr()[slot.index];
+            size_t expected = 0;
+            if (!meta.reference.compare_exchange_strong(expected, kSlotClaimed,
+                                                         std::memory_order_acq_rel)) {
+                rollback();
+                return Status::Retry();
+            }
+            ++claimed;
+        }
+        for (auto* lock : locks) {
+            if (!lock->TryLock()) { rollback(); return Status::Retry(); }
+            ++locked;
+        }
+        for (const auto& slot : slots) {
+            const auto bucket = HashKey(blockId, slot.offset);
+            const auto& meta = layout.SlotMetaArr()[slot.index];
+            if (!MatchKey(meta, bucket, blockId, slot.offset) ||
+                Lookup(layout, bucket, blockId, slot.offset) != slot.index) {
+                rollback();
+                return Status::Retry();
+            }
+            if (meta.state.load(std::memory_order_acquire) == State::Ready) { ++readySlots; }
+        }
+        Status result = Status::Error("cache2 eviction metadata commit threw");
+        for (const auto& slot : slots) {
+            Remove(layout, HashKey(blockId, slot.offset), slot.index);
+        }
+        try {
+            result = commitMetadata();
+        } catch (...) {
+            // The commit contract requires that an exception leaves metadata unchanged.
+        }
+        if (result.Failure()) {
+            for (const auto& slot : slots) {
+                MoveTo(layout, HashKey(blockId, slot.offset), slot.index);
+            }
+        } else {
+            layout.Hdr()->usedSlots.fetch_sub(slots.size(), std::memory_order_relaxed);
+        }
+        rollback();
+        if (result.Success() && readySlots != 0) {
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dram_evicted_bytes_total"),
+                                 static_cast<double>(readySlots) * slotSize_);
+        }
+        return result;
+    }
+
     class Handle {
         friend class Buffer;
         Buffer* buf_;

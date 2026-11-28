@@ -398,6 +398,38 @@ TEST(UCHealthBreakerStoreTest, HealthyOperationsPassThroughWithoutChangingWindow
     EXPECT_EQ(breaker.FailureCount(), 0);
 }
 
+TEST(UCHealthBreakerStoreTest, PreservesBlockRelationsAndAsyncErrors)
+{
+    StrictMock<Detail::MockStore> store;
+    HealthBreakerStore breaker;
+    auto config = TestConfig();
+    config.passiveEnabled = false;
+    ASSERT_TRUE(SetupBreaker(breaker, &store, "cache-0", config).Success());
+
+    Detail::BlockRelation relation;
+    relation.child[0] = std::byte{1};
+    relation.parent[0] = std::byte{2};
+    relation.isRoot = false;
+    Detail::TaskDesc task;
+    task.blockRelations.push_back(relation);
+
+    auto checkRelation = [&](Detail::TaskDesc received) -> Expected<Detail::TaskHandle> {
+        EXPECT_EQ(received.blockRelations.size(), 1);
+        if (received.blockRelations.size() == 1) {
+            EXPECT_EQ(received.blockRelations[0].child, relation.child);
+            EXPECT_EQ(received.blockRelations[0].parent, relation.parent);
+            EXPECT_FALSE(received.blockRelations[0].isRoot);
+        }
+        return Detail::TaskHandle{21};
+    };
+    EXPECT_CALL(store, Load(testing::_)).WillOnce(Invoke(checkRelation));
+    EXPECT_EQ(breaker.Load(task).Value(), 21);
+    EXPECT_CALL(store, Dump(testing::_)).WillOnce(Invoke(checkRelation));
+    EXPECT_EQ(breaker.Dump(task).Value(), 21);
+    EXPECT_CALL(store, Wait(21)).WillOnce(Return(Status::Error()));
+    EXPECT_EQ(breaker.Wait(21), Status::Error());
+}
+
 TEST(UCHealthBreakerStoreTest, LookupFailuresTripPassively)
 {
     StrictMock<Detail::MockStore> store;

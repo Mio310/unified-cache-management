@@ -11,9 +11,24 @@ _spec.loader.exec_module(_module)
 map_relation_keys = _module.map_relation_keys
 relations_for_slice = _module.relations_for_slice
 select_relations = _module.select_relations
+validate_tail_eviction_config = _module.validate_tail_eviction_config
 
 
 class BlockRelationsTest(unittest.TestCase):
+    def test_tail_eviction_opt_in_fails_closed_until_store_protocol_is_ready(self):
+        validate_tail_eviction_config({})
+        validate_tail_eviction_config({"enable_dram_tail_eviction": False})
+        with self.assertRaisesRegex(RuntimeError, "protocol are incomplete"):
+            validate_tail_eviction_config({"enable_dram_tail_eviction": True})
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            validate_tail_eviction_config({"enable_dram_tail_eviction": "false"})
+        with self.assertRaisesRegex(ValueError, "top level"):
+            validate_tail_eviction_config({
+                "ucm_connectors": [{"ucm_connector_config": {
+                    "enable_dram_tail_eviction": True,
+                }}],
+            })
+
     def test_slice_preserves_preceding_parent_and_explicit_root(self):
         chain = [b"a", b"b", b"c", b"d"]
         self.assertEqual(relations_for_slice(chain, 0, 2), [(b"a", None), (b"b", b"a")])

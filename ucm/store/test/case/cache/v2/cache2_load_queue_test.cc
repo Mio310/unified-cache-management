@@ -152,10 +152,14 @@ public:
         return Handle{this, slotIdx, true, HostAccessibleOf(key)};
     }
     UC::Expected<Handle> GetUntil(const UC::Detail::BlockId& blockId, size_t offset,
-                                  std::chrono::steady_clock::time_point,
+                                  std::chrono::steady_clock::time_point deadline,
                                   const std::atomic_bool& cancelled, bool allowReserved = false,
                                   size_t preferredRank = UC::Cache2::kInvalid)
     {
+        if (onGetDeadline) {
+            auto status = onGetDeadline(offset, deadline, cancelled);
+            if (status.Failure()) { return status; }
+        }
         if (onGetUntil) {
             auto status = onGetUntil(offset, cancelled);
             if (status.Failure()) { return status; }
@@ -194,6 +198,8 @@ public:
     const std::vector<PreallocCall>& PreallocCalls() const { return preallocCalls_; }
     std::function<void(size_t)> onGetState;
     std::function<UC::Status(size_t, const std::atomic_bool&)> onGetUntil;
+    std::function<UC::Status(size_t, std::chrono::steady_clock::time_point,
+                             const std::atomic_bool&)> onGetDeadline;
 
 private:
     SlotState SlotStateOf(size_t slotIdx)
@@ -1114,6 +1120,79 @@ TEST_F(UCCache2LoadQueueTest, TaskCancellationDrainsEarlierBackendRead)
     EXPECT_TRUE(failureSet_.Contains(task->id));
     EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
     buffer_.onGetUntil = nullptr;
+}
+
+TEST_F(UCCache2LoadQueueTest, SlotTimeoutDrainsPendingCopiesBeforeReleasingHandles)
+{
+    TestedQueue queue;
+    config_.timeoutMs = 500;
+    ASSERT_TRUE(queue.Setup(config_, &failureSet_, &buffer_).Success());
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    buffer_.SetExisting(block);
+    std::atomic_bool scattered{false};
+    std::atomic_bool syncStarted{false};
+    std::atomic_bool bounded{false};
+    std::promise<void> releaseSync;
+    auto released = releaseSync.get_future().share();
+    FakeStream::onScatter = [&](const FakeStream::ScatterCall&) {
+        scattered.store(true);
+        return UC::Status::OK();
+    };
+    FakeStream::onSync = [&] {
+        syncStarted.store(true);
+        released.wait();
+        return UC::Status::OK();
+    };
+    buffer_.onGetDeadline = [&](size_t offset, auto deadline, const std::atomic_bool&) {
+        if (offset == 0) { return UC::Status::OK(); }
+        const auto now = std::chrono::steady_clock::now();
+        bounded.store(deadline <= now + std::chrono::seconds(2));
+        if (!bounded.load()) { return UC::Status::Error(); }
+        while (std::chrono::steady_clock::now() < deadline) { std::this_thread::yield(); }
+        return UC::Status::Timeout();
+    };
+    auto desc = MakeDesc(block);
+    desc.push_back({block, 1, {reinterpret_cast<void*>(0x2000)}});
+    auto task = std::make_shared<Task>(Task::Type::LOAD, std::move(desc));
+    auto waiter = std::make_shared<UC::Latch>();
+    queue.Submit(task, waiter);
+    EXPECT_TRUE(AwaitTrue([&] { return scattered.load() && syncStarted.load(); }));
+    EXPECT_TRUE(bounded.load());
+    EXPECT_FALSE(waiter->WaitFor(20));
+    EXPECT_GE(buffer_.LiveHandles(), 1);
+    releaseSync.set_value();
+    EXPECT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_EQ(task->FailureStatus(), UC::Status::Timeout());
+    EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
+    queue.Close();
+    buffer_.onGetDeadline = nullptr;
+    FakeStream::onScatter = nullptr;
+    FakeStream::onSync = nullptr;
+}
+
+TEST_F(UCCache2LoadQueueTest, EmptyLoadCompletesWithoutWaitingForAShard)
+{
+    auto [task, waiter] = SubmitOne(UC::Detail::TaskDesc{});
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_FALSE(failureSet_.Contains(task->id));
+    EXPECT_EQ(buffer_.LiveHandles(), 0u);
+}
+
+TEST_F(UCCache2LoadQueueTest, UnfinishedForeignSlotTimesOutWithoutExplicitWaitCancellation)
+{
+    TestedQueue queue;
+    config_.timeoutMs = 50;
+    ASSERT_TRUE(queue.Setup(config_, &failureSet_, &buffer_).Success());
+    const auto block = TypesHelper::MakeBlockIdRandomly();
+    buffer_.SetExisting(block, SlotState::Loading);
+    auto task = std::make_shared<Task>(Task::Type::LOAD, MakeDesc(block));
+    auto waiter = std::make_shared<UC::Latch>();
+    queue.Submit(task, waiter);
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_EQ(task->FailureStatus(), UC::Status::Timeout());
+    EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
 }
 
 TEST_F(UCCache2LoadQueueTest, ConcurrentSubmitAndCloseCompleteEveryWaiter)

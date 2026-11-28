@@ -22,8 +22,11 @@
  * SOFTWARE.
  * */
 #include <gtest/gtest.h>
+#include <memory>
 #include <string>
 #include "cache/v2/global_config.h"
+
+extern "C" UC::StoreV1* MakeCacheStore();
 
 namespace {
 
@@ -46,6 +49,17 @@ TEST(UCCache2CopyConfigTest, DefaultsFollowRuntime)
     EXPECT_FALSE(config.ioAggregation);
     EXPECT_EQ(config.sdmaDirect, bool(UCM_RUNTIME_ASCEND_SDMA_DIRECT));
     EXPECT_TRUE(config.Validate().Success());
+}
+
+TEST(UCCache2CopyConfigTest, TailEvictionRequestFailsClosed)
+{
+    auto dict = MakeWorkerConfig();
+    EXPECT_FALSE(UC::Cache2::Config::From(dict).enableDramTailEviction);
+    dict.Set("enable_dram_tail_eviction", true);
+    EXPECT_TRUE(UC::Cache2::Config::From(dict).enableDramTailEviction);
+    std::unique_ptr<UC::StoreV1> store(MakeCacheStore());
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->Setup(dict), UC::Status::Unsupported());
 }
 
 TEST(UCCache2CopyConfigTest, HmaFaAggregationDefaultRespectsRuntime)

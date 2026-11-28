@@ -28,6 +28,7 @@
 #include <functional>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -142,6 +143,15 @@ public:
         slots_.emplace(key, slotIdx);
         return Handle{this, slotIdx, true, ownerState_, HostAccessibleOf(blockId, offset)};
     }
+    UC::Expected<Handle> GetUntil(const UC::Detail::BlockId& blockId, size_t offset,
+                                  std::chrono::steady_clock::time_point,
+                                  const std::atomic_bool& cancelled, bool allowReserved = false)
+    {
+        if (cancelled.load(std::memory_order_acquire)) { return UC::Status::Retry(); }
+        if (failGetAfter_ == getCalls_.size()) { return UC::Status::Timeout(); }
+        return Get(blockId, offset, allowReserved);
+    }
+    void FailGetAfter(size_t calls) { failGetAfter_ = calls; }
     void SetOwnerState(SlotState state) { ownerState_ = state; }
     void SetHostAccessible(bool accessible) { defaultHostAccessible_ = accessible; }
     void SetHostAccessible(const UC::Detail::BlockId& block, bool accessible, size_t offset = 0)
@@ -170,6 +180,7 @@ private:
     bool defaultHostAccessible_{true};
     SlotState ownerState_{SlotState::Loading};
     size_t nextSlotIdx_{0};
+    size_t failGetAfter_{std::numeric_limits<size_t>::max()};
     std::atomic<size_t> liveHandles_{0};
     std::atomic<size_t> markedReady_{0};
     std::atomic<size_t> markedFailed_{0};
@@ -421,12 +432,88 @@ TEST_F(UCCache2DumpQueueTest, DumpFailsWhenGatherFails)
     ASSERT_TRUE(waiter->WaitFor(kWaitMs));
     EXPECT_TRUE(failureSet_.Contains(task->id));
     EXPECT_EQ(FakeStream::gathers.size(), 1);
-    EXPECT_EQ(FakeStream::syncs.load(), 0);
+    EXPECT_EQ(FakeStream::syncs.load(), 1);
     EXPECT_EQ(buffer_.MarkedFailed(), 1);
     EXPECT_EQ(buffer_.MarkedReady(), 0);
     EXPECT_EQ(buffer_.LiveHandles(), 0);
     auto stats = UC::Metrics::GetAllStatsAndClear();
     EXPECT_EQ(std::get<0>(stats).at("cache_d2h_errors_total"), 1);
+}
+
+TEST_F(UCCache2DumpQueueTest, AllocationFailureDrainsPriorCopiesBeforeUnpinning)
+{
+    buffer_.FailGetAfter(1);
+    std::atomic<bool> pinnedDuringSync{false};
+    FakeStream::onSync = [this, &pinnedDuringSync] {
+        pinnedDuringSync.store(buffer_.LiveHandles() == 1 && buffer_.MarkedFailed() == 0);
+        return UC::Status::OK();
+    };
+    EXPECT_CALL(backend_, Dump).Times(0);
+    auto desc = MakeDesc(TypesHelper::MakeBlockIdRandomly());
+    desc.push_back({TypesHelper::MakeBlockIdRandomly(), 0, {reinterpret_cast<void*>(0x2000)}});
+    auto [task, waiter] = SubmitOne(std::move(desc));
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_EQ(task->FailureStatus(), UC::Status::Timeout());
+    EXPECT_TRUE(pinnedDuringSync.load());
+    EXPECT_EQ(FakeStream::syncs.load(), 1u);
+    EXPECT_EQ(buffer_.MarkedFailed(), 1u);
+    EXPECT_EQ(buffer_.LiveHandles(), 0u);
+}
+
+TEST_F(UCCache2DumpQueueTest, GatherFailureDrainsAllEarlierCopiesBeforeUnpinning)
+{
+    std::atomic<size_t> calls{0};
+    std::atomic<bool> pinnedDuringSync{false};
+    FakeStream::onGather = [&calls](const FakeStream::GatherCall&) {
+        return calls.fetch_add(1) == 0 ? UC::Status::OK() : UC::Status::Error("copy failed");
+    };
+    FakeStream::onSync = [this, &pinnedDuringSync] {
+        pinnedDuringSync.store(buffer_.LiveHandles() == 2 && buffer_.MarkedFailed() == 0);
+        return UC::Status::OK();
+    };
+    EXPECT_CALL(backend_, Dump).Times(0);
+    auto desc = MakeDesc(TypesHelper::MakeBlockIdRandomly());
+    desc.push_back({TypesHelper::MakeBlockIdRandomly(), 0, {reinterpret_cast<void*>(0x2000)}});
+    auto [task, waiter] = SubmitOne(std::move(desc));
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_TRUE(pinnedDuringSync.load());
+    EXPECT_EQ(FakeStream::syncs.load(), 1u);
+    EXPECT_EQ(buffer_.MarkedFailed(), 2u);
+    EXPECT_EQ(buffer_.LiveHandles(), 0u);
+}
+
+TEST_F(UCCache2DumpQueueTest, CancellationAfterLastCopyDrainsBeforeFinishing)
+{
+    auto task = std::make_shared<Task>(Task::Type::DUMP,
+        MakeDesc(TypesHelper::MakeBlockIdRandomly()));
+    FakeStream::onGather = [&task](const FakeStream::GatherCall&) {
+        task->cancelled.store(true, std::memory_order_release);
+        return UC::Status::OK();
+    };
+    std::atomic<bool> pinnedDuringSync{false};
+    FakeStream::onSync = [this, &pinnedDuringSync] {
+        pinnedDuringSync.store(buffer_.LiveHandles() == 1 && buffer_.MarkedFailed() == 0);
+        return UC::Status::OK();
+    };
+    EXPECT_CALL(backend_, Dump).Times(0);
+    auto waiter = std::make_shared<UC::Latch>();
+    dumpQ_.Submit(task, waiter);
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_EQ(task->FailureStatus(), UC::Status::Retry());
+    EXPECT_TRUE(pinnedDuringSync.load());
+    EXPECT_EQ(buffer_.MarkedFailed(), 1u);
+}
+
+TEST_F(UCCache2DumpQueueTest, SubmitAfterCloseCompletesWithFailure)
+{
+    dumpQ_.Close();
+    auto [task, waiter] = SubmitOne(MakeDesc(TypesHelper::MakeBlockIdRandomly()));
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_EQ(buffer_.LiveHandles(), 0u);
 }
 
 TEST_F(UCCache2DumpQueueTest, DumpFailsWhenSyncFails)
