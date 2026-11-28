@@ -122,7 +122,14 @@ public:
         }
         // A single batch cannot be registered atomically if its distinct IDs
         // exceed the entire node table, even after evicting every resident.
-        if (related.size() > tail_->NodeCapacity()) { return Status::NoSpace(); }
+        const auto nodeCapacity = tail_->NodeCapacity();
+        if (related.size() > nodeCapacity) {
+            return Status{
+                Status::NoSpace().Underlying(),
+                fmt::format("cache2 tail relation batch exceeds node capacity: "
+                            "requested_unique_blocks={} node_capacity={}",
+                            related.size(), nodeCapacity)};
+        }
         const auto now = std::chrono::steady_clock::now();
         const auto maxWait = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::time_point::max() - now).count();
@@ -130,6 +137,7 @@ public:
         const auto deadline = now + std::chrono::milliseconds(timeout);
         RelationToken token(this);
         token.refs_.reserve(desc.blockRelations.size());
+        size_t reclaimedNodes = 0;
         for (const auto& rel : desc.blockRelations) {
             TailMetadata::Ref ref;
             for (;;) {
@@ -141,13 +149,24 @@ public:
                 if (result != TailMetadata::Result::Full && result != TailMetadata::Result::Busy) {
                     return Status::InvalidParam();
                 }
-                if (std::chrono::steady_clock::now() >= deadline) {
-                    return result == TailMetadata::Result::Full ? Status::NoSpace()
-                                                                : Status::Timeout();
+                const auto current = std::chrono::steady_clock::now();
+                if (current >= deadline) {
+                    const bool full = result == TailMetadata::Result::Full;
+                    const auto status = full ? Status::NoSpace() : Status::Timeout();
+                    const auto elapsedMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(current - now).count();
+                    return Status{
+                        status.Underlying(),
+                        fmt::format("cache2 tail relation registration deadline exceeded: "
+                                    "last_result={} requested_unique_blocks={} node_capacity={} "
+                                    "registered_relations={} elapsed_ms={} reclaimed_nodes={}",
+                                    full ? "full" : "busy", related.size(), nodeCapacity,
+                                    token.refs_.size(), elapsedMs, reclaimedNodes)};
                 }
                 // A task lease prevents collecting its node; never evict such
                 // a block merely to make room for this registration batch.
                 const bool progressed = result == TailMetadata::Result::Full && EvictTail(true);
+                reclaimedNodes += static_cast<size_t>(progressed);
                 if (!progressed) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
             }
             token.refs_.push_back(ref);

@@ -332,6 +332,9 @@ TEST(Cache2TailBufferTest, RegistrationFailureRollsBackAndMissingRelationsAreRej
         auto full = buffer.RegisterRelations(desc);
         ASSERT_FALSE(full.HasValue());
         EXPECT_EQ(full.Error(), Status::NoSpace());
+        EXPECT_NE(full.Error().ToString().find("batch exceeds node capacity"), std::string::npos);
+        EXPECT_NE(full.Error().ToString().find("requested_unique_blocks=2 node_capacity=1"),
+                  std::string::npos);
         desc.blockRelations = {{a, {}, true}, {a, b, false}};
         auto conflict = buffer.RegisterRelations(desc);
         ASSERT_FALSE(conflict.HasValue());
@@ -423,6 +426,12 @@ TEST(Cache2TailBufferTest, FullMetadataWithPinnedLeafFailsWithinDeadline)
         auto result = buffer.RegisterRelations(next);
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.Error(), Status::NoSpace());
+        const auto message = result.Error().ToString();
+        EXPECT_NE(message.find("registration deadline exceeded"), std::string::npos);
+        EXPECT_NE(message.find("last_result=full requested_unique_blocks=1 node_capacity=1"),
+                  std::string::npos);
+        EXPECT_NE(message.find("registered_relations=0 elapsed_ms="), std::string::npos);
+        EXPECT_NE(message.find("reclaimed_nodes=0"), std::string::npos);
         EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
         EXPECT_TRUE(buffer.Exist(a, 0));
         EXPECT_EQ(BufferTestAccess::UsedSlots(buffer), 1u);
