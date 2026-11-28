@@ -44,7 +44,7 @@ inline constexpr size_t kMaxRanks{128};
 inline constexpr size_t kMaxLockStripes{1ULL << 16};
 inline constexpr size_t kMinBuckets{1ULL << 10};
 inline constexpr size_t kMaxBuckets{1ULL << 24};
-inline constexpr uint32_t kCtrlMagic{0x55433205U};  // "UC2" + layout version 5.
+inline constexpr uint32_t kCtrlMagic{0x55433206U};  // "UC2" + layout version 6.
 
 class CtrlLayout {
 public:
@@ -116,6 +116,8 @@ private:
         size_t lockStripeCount{0};
         size_t tailBytes{0};
         uint32_t tailNodes{0}, tailShards{0}, tailBuckets{0};
+        size_t tailMaxBatchBlocks{0}, tailMaxInflightBatches{0};
+        std::atomic<size_t> tailInflightBatches{0};
         // Counts slots bound to a key, including Loading, Failed and preallocated slots.
         // Clock replaces bindings in place; a future path that permanently unbinds
         // a slot must decrement this counter exactly once while holding its claim.

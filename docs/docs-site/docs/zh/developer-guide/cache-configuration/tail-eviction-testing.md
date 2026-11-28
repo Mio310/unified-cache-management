@@ -24,6 +24,15 @@ ucm_connectors:
 
 `cache_buffer_capacity_gb: 4` 只是压测起点，不保证满足所有模型的最小 shard 容量；初始化提示容量不足时按提示增大，并确认宿主机内存及 `/dev/shm` 足够。不要用生产缓存目录。按[快速开始](../../user-guide/quick_start/index.md)通过 `kv_connector_extra_config.UCM_CONFIG_FILE` 指定该文件，并将 vLLM 的 pipeline、prefill context 和 decode context 并行度都设为 1。`enable_dram_tail_eviction` 必须位于 YAML 根级，不放在 `ucm_connector_config` 内。
 
+尾部元数据按共享域定容。若域内共有 `D` 个 DRAM 槽，则 shard 表容量为 `D`，关系节点表容量为 `D + cache_tail_max_batch_blocks × cache_tail_max_inflight_batches`。两项可在 `ucm_connector_config` 配置：
+
+| 配置项 | 含义 | vLLM 默认值 |
+| --- | --- | --- |
+| `cache_tail_max_batch_blocks` | 单次 Load 或 Dump 的去重关系键上限。配置值需覆盖最长 Load，如果 Dump 会合批，也需覆盖合批后的峰值。 | 8192 和最长序列所需 Store 块数中较大者 |
+| `cache_tail_max_inflight_batches` | 域内所有 rank 共用的 Load 和 Dump 在途批次上限，引用释放后归还名额。 | 16 和本地 rank 数两倍中较大者 |
+
+启动日志会打印两项上限和实际分配字节数。元数据需求超过 256 MiB 时初始化失败。批次超过块数上限时返回 `NoSpace`。没有空闲批次名额时，提交会在 `timeout_ms` 期限内等待。
+
 ## 最小验证流程
 
 1. **对照组**：用 `enable_dram_tail_eviction: false` 启动服务，记录模型、并行度、DRAM 容量和配置；先发送一批固定的长前缀请求，再重复相同请求。记录输出、日志、命中和内存指标。

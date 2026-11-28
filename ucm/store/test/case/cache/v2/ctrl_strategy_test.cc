@@ -29,11 +29,12 @@
 namespace UC::Cache2 {
 
 struct CtrlStrategyTestAccess {
-    static std::array<size_t, 4> TailSizing(size_t slots)
+    static Status TailSizing(size_t slots, const Config& cfg, std::array<size_t, 4>& sizing)
     {
         CtrlStrategy::Dimensions dims;
-        CtrlStrategy::ResolveTailDimensions(slots, dims);
-        return {dims.tailNodes, dims.tailShards, dims.tailBuckets, dims.tailBytes};
+        auto status = CtrlStrategy::ResolveTailDimensions(slots, cfg, dims);
+        sizing = {dims.tailNodes, dims.tailShards, dims.tailBuckets, dims.tailBytes};
+        return status;
     }
     static const void* HeaderAddress(const CtrlLayout& layout) { return layout.Hdr(); }
     static size_t RankCount(const CtrlLayout& layout) { return layout.RankCount(); }
@@ -185,16 +186,20 @@ TEST(Cache2CtrlStrategyTest, SchedulerWithoutShardSizeStartsAfterWorker)
 
 TEST(Cache2CtrlStrategyTest, TailSizingStaysWithinBudget)
 {
-    const auto small = CtrlStrategyTestAccess::TailSizing(64);
-    EXPECT_EQ(small[0], 64u);
-    EXPECT_EQ(small[1], 64u);
-    EXPECT_EQ(small[3], TailMetadata::Bytes(64, 64, static_cast<uint32_t>(small[2])));
-    const auto large = CtrlStrategyTestAccess::TailSizing(std::numeric_limits<size_t>::max());
-    EXPECT_GT(large[0], 0u);
-    EXPECT_EQ(large[0], large[1]);
-    EXPECT_LE(large[3], 256ULL << 20);
-    const auto next = static_cast<uint32_t>(large[0] + 1);
-    EXPECT_GT(TailMetadata::Bytes(next, next, next / 2 + 1), 256ULL << 20);
+    Config cfg;
+    cfg.tailMaxBatchBlocks = 4427;
+    cfg.tailMaxInflightBatches = 4;
+    std::array<size_t, 4> sizing{};
+    ASSERT_TRUE(CtrlStrategyTestAccess::TailSizing(163840, cfg, sizing).Success());
+    EXPECT_EQ(sizing[0], 181548u);
+    EXPECT_EQ(sizing[1], 163840u);
+    EXPECT_EQ(sizing[2], 90775u);
+    EXPECT_EQ(sizing[3], TailMetadata::Bytes(181548, 163840, 90775));
+    const auto overBudget = CtrlStrategyTestAccess::TailSizing(1ULL << 22, cfg, sizing);
+    EXPECT_EQ(overBudget, Status::InvalidParam());
+    EXPECT_NE(overBudget.ToString().find("exceeds budget"), std::string::npos);
+    EXPECT_EQ(CtrlStrategyTestAccess::TailSizing(std::numeric_limits<size_t>::max(), cfg, sizing),
+              Status::InvalidParam());
 }
 
 TEST(Cache2CtrlStrategyTest, TailParticipantsRequireMatchingPolicy)

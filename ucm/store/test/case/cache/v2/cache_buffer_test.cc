@@ -122,6 +122,12 @@ struct BufferTestAccess {
     {
         buffer.relationWaitTimeoutMs_ = timeoutMs;
     }
+    static void SetRelationLimits(Buffer& buffer, size_t blocks, size_t batches)
+    {
+        auto* header = buffer.ctrl_.Layout().Hdr();
+        header->tailMaxBatchBlocks = blocks;
+        header->tailMaxInflightBatches = batches;
+    }
 
     static size_t FindSlot(Buffer& buffer, const Detail::BlockId& blockId, size_t offset)
     {
@@ -341,6 +347,41 @@ TEST(Cache2TailBufferTest, RegistrationFailureRollsBackAndMissingRelationsAreRej
         EXPECT_EQ(conflict.Error(), Status::InvalidParam());
         TailMetadata view(tail);
         EXPECT_EQ(view.GetStats().nodes, 0u);
+    }
+    ::operator delete(tail, std::align_val_t{64});
+    ::operator delete(control, std::align_val_t{64});
+}
+
+TEST(Cache2TailBufferTest, RelationAdmissionReleasesBatchQuota)
+{
+    constexpr size_t slots = 2, buckets = 8, locks = 4;
+    const auto controlBytes = BufferTestAccess::TotalSize(buckets, locks, slots);
+    auto* control = ::operator new(controlBytes, std::align_val_t{64});
+    const auto tailBytes = TailMetadata::Bytes(3, 2, 2);
+    auto* tail = ::operator new(tailBytes, std::align_val_t{64});
+    ASSERT_TRUE(TailMetadata::Initialize(tail, tailBytes, 3, 2, 2));
+    {
+        Buffer buffer;
+        BufferTestAccess::Init(buffer, control, 1, slots, buckets, locks);
+        BufferTestAccess::SetTail(buffer, tail);
+        BufferTestAccess::SetRelationLimits(buffer, 1, 1);
+        BufferTestAccess::SetRelationTimeout(buffer, 20);
+        const auto a = MakeBlockId(10), b = MakeBlockId(11);
+        Detail::TaskDesc desc;
+        desc.push_back({a, 0, {}});
+        desc.blockRelations = {{a, {}, true}, {b, a, false}};
+        auto oversized = buffer.RegisterRelations(desc);
+        ASSERT_FALSE(oversized.HasValue());
+        EXPECT_EQ(oversized.Error(), Status::NoSpace());
+        desc.blockRelations.pop_back();
+        {
+            auto first = buffer.RegisterRelations(desc);
+            ASSERT_TRUE(first.HasValue());
+            auto blocked = buffer.RegisterRelations(desc);
+            ASSERT_FALSE(blocked.HasValue());
+            EXPECT_EQ(blocked.Error(), Status::Timeout());
+        }
+        EXPECT_TRUE(buffer.RegisterRelations(desc).HasValue());
     }
     ::operator delete(tail, std::align_val_t{64});
     ::operator delete(control, std::align_val_t{64});

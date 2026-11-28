@@ -83,6 +83,10 @@ public:
         {
             if (buffer_ && buffer_->tail_) {
                 for (auto ref : refs_) { (void)buffer_->tail_->Release(ref); }
+                auto* header = buffer_->ctrl_.Layout().Hdr();
+                if (header->tailMaxInflightBatches != 0) {
+                    header->tailInflightBatches.fetch_sub(1, std::memory_order_release);
+                }
             }
             refs_.clear();
             buffer_ = nullptr;
@@ -120,6 +124,7 @@ public:
                 return Status::InvalidParam("missing cache2 block relation");
             }
         }
+        if (related.empty()) { return RelationToken{}; }
         // A single batch cannot be registered atomically if its distinct IDs
         // exceed the entire node table, even after evicting every resident.
         const auto nodeCapacity = tail_->NodeCapacity();
@@ -135,6 +140,34 @@ public:
             std::chrono::steady_clock::time_point::max() - now).count();
         const auto timeout = std::min(relationWaitTimeoutMs_, static_cast<size_t>(maxWait));
         const auto deadline = now + std::chrono::milliseconds(timeout);
+        auto* header = ctrl_.Layout().Hdr();
+        if (header->tailMaxBatchBlocks != 0 && related.size() > header->tailMaxBatchBlocks) {
+            return Status{
+                Status::NoSpace().Underlying(),
+                fmt::format("cache2 tail relation batch exceeds configured limit: "
+                            "requested_unique_blocks={} max_batch_blocks={}",
+                            related.size(), header->tailMaxBatchBlocks)};
+        }
+        const auto batchLimit = header->tailMaxInflightBatches;
+        if (batchLimit != 0) {
+            auto& inflight = header->tailInflightBatches;
+            for (;;) {
+                auto active = inflight.load(std::memory_order_relaxed);
+                if (active < batchLimit &&
+                    inflight.compare_exchange_weak(active, active + 1, std::memory_order_acquire,
+                                                   std::memory_order_relaxed)) { break; }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return Status{
+                        Status::Timeout().Underlying(),
+                        fmt::format("cache2 tail relation admission deadline exceeded: "
+                                    "requested_unique_blocks={} max_inflight_batches={}",
+                                    related.size(), batchLimit)};
+                }
+                if (active >= batchLimit) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+        }
         RelationToken token(this);
         token.refs_.reserve(desc.blockRelations.size());
         size_t reclaimedNodes = 0;

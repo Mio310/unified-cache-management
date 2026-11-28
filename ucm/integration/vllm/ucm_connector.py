@@ -1902,6 +1902,20 @@ class UCMDirectConnector(KVConnectorBase_V1):
         apply_tail_eviction_store_config(self.launch_config, config)
         config.setdefault("share_buffer_enable", self.is_mla)
         config["local_rank_size"] = self._get_world_size()
+        if config.get("enable_dram_tail_eviction"):
+            max_model_len = self._vllm_config.model_config.max_model_len
+            max_load_blocks = (max_model_len + self.chunk_size - 1) // self.chunk_size
+            max_batch_blocks = config.setdefault(
+                "cache_tail_max_batch_blocks", max(8192, max_load_blocks)
+            )
+            if max_batch_blocks < max_load_blocks:
+                raise ValueError(
+                    "cache_tail_max_batch_blocks must cover the longest Load: "
+                    f"configured={max_batch_blocks}, required={max_load_blocks}"
+                )
+            config.setdefault(
+                "cache_tail_max_inflight_batches", max(16, 2 * config["local_rank_size"])
+            )
         self._configure_numa_placement(config)
         self._set_default_shm_buffer_capacity(config)
         if "storage_backends" in config:

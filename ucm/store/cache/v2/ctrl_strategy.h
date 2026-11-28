@@ -87,29 +87,30 @@ public:
     const CtrlLayout& Layout() const { return layout_; }
 
 private:
-    // Worst case, every resident shard has a distinct block ID. Give nodes and
-    // shard entries equal capacity, then cap both to the shared 256 MiB budget.
-    // Exhausting this cap must eventually fail closed, not leave slots untracked.
-    static void ResolveTailDimensions(size_t slotCount, Dimensions& dims)
+    static Status ResolveTailDimensions(size_t slotCount, const Config& cfg, Dimensions& dims)
     {
         constexpr size_t kTailBudget = 256ULL << 20;
-        const auto upper = static_cast<uint32_t>(std::min(
-            slotCount, static_cast<size_t>(std::numeric_limits<uint32_t>::max() - 1)));
-        uint32_t low = 1, high = upper, best = 0;
-        while (low <= high) {
-            const auto mid = low + (high - low) / 2;
-            const auto buckets = mid / 2 + 1;
-            if (TailMetadata::Bytes(mid, mid, buckets) <= kTailBudget) {
-                best = mid;
-                low = mid + 1;
-            } else {
-                high = mid - 1;
-            }
+        constexpr size_t kMaxEntries = TailMetadata::kNil - 1;
+        const auto batchBlocks = cfg.tailMaxBatchBlocks;
+        const auto inflightBatches = cfg.tailMaxInflightBatches;
+        if (batchBlocks == 0 || inflightBatches == 0 || slotCount > kMaxEntries ||
+            inflightBatches > (kMaxEntries - slotCount) / batchBlocks) {
+            return Status::InvalidParam(
+                "invalid cache2 tail dimensions: slots={} max_batch_blocks={} "
+                "max_inflight_batches={} max_entries={}",
+                slotCount, batchBlocks, inflightBatches, kMaxEntries);
         }
-        if (best == 0) { return; }
-        dims.tailNodes = dims.tailShards = best;
-        dims.tailBuckets = best / 2 + 1;
-        dims.tailBytes = TailMetadata::Bytes(best, best, dims.tailBuckets);
+        dims.tailNodes = static_cast<uint32_t>(slotCount + inflightBatches * batchBlocks);
+        dims.tailShards = static_cast<uint32_t>(slotCount);
+        dims.tailBuckets = dims.tailNodes / 2 + 1;
+        dims.tailBytes = TailMetadata::Bytes(dims.tailNodes, dims.tailShards, dims.tailBuckets);
+        if (dims.tailBytes > kTailBudget) {
+            return Status::InvalidParam(
+                "cache2 tail metadata exceeds budget: slots={} max_batch_blocks={} "
+                "max_inflight_batches={} required_bytes={} budget_bytes={}",
+                slotCount, batchBlocks, inflightBatches, dims.tailBytes, kTailBudget);
+        }
+        return Status::OK();
     }
 
     static Status ResolveDimensions(const Config& cfg, Dimensions& dims)
@@ -129,10 +130,7 @@ private:
         slotCount = dims.rankCount * dims.slotsPerRank;
         dims.bucketCount = CtrlLayout::RecommendBucketCount(slotCount);
         if (cfg.enableDramTailEviction) {
-            ResolveTailDimensions(slotCount, dims);
-            if (dims.tailBytes == 0) {
-                return Status::InvalidParam("cache2 cannot allocate tail metadata within budget");
-            }
+            return ResolveTailDimensions(slotCount, cfg, dims);
         }
         return Status::OK();
     }
@@ -158,12 +156,16 @@ private:
         header->tailShards = dims.tailShards;
         header->tailBuckets = dims.tailBuckets;
         if (dims.tailBytes != 0) {
+            header->tailMaxBatchBlocks = cfg.tailMaxBatchBlocks;
+            header->tailMaxInflightBatches = cfg.tailMaxInflightBatches;
             if (!TailMetadata::Initialize(layout_.TailMemory(), dims.tailBytes, dims.tailNodes,
                                           dims.tailShards, dims.tailBuckets)) {
                 return Status::Error("failed to initialize cache2 tail metadata");
             }
-            UC_INFO("cache2 tail metadata domain={} bytes={} nodes={} shards={} slots={}",
-                    cfg.uniqueId, dims.tailBytes, dims.tailNodes, dims.tailShards, slotCount);
+            UC_INFO("cache2 tail metadata domain={} bytes={} nodes={} shards={} slots={} "
+                    "max_batch_blocks={} max_inflight_batches={}",
+                    cfg.uniqueId, dims.tailBytes, dims.tailNodes, dims.tailShards, slotCount,
+                    cfg.tailMaxBatchBlocks, cfg.tailMaxInflightBatches);
         }
         layout_.MarkReady();
         acceptThread_ =
@@ -215,7 +217,10 @@ private:
             expected.slotSize != header->slotSize || expected.bucketCount != bucketCount ||
             lockCount != CtrlLayout::LockStripeCount(expected.bucketCount) ||
             expected.tailBytes != header->tailBytes || expected.tailNodes != header->tailNodes ||
-            expected.tailShards != header->tailShards || expected.tailBuckets != header->tailBuckets) {
+            expected.tailShards != header->tailShards || expected.tailBuckets != header->tailBuckets ||
+            (cfg.enableDramTailEviction &&
+             (cfg.tailMaxBatchBlocks != header->tailMaxBatchBlocks ||
+              cfg.tailMaxInflightBatches != header->tailMaxInflightBatches))) {
             return Status::InvalidParam("cache2 participants disagree on control layout");
         }
 

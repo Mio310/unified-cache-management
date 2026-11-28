@@ -76,9 +76,9 @@ struct Config {
     std::vector<ssize_t> cpuAffinityCores{};
     /* Aggregation uses one stream for its batched copies. */
     bool ioAggregation{false};
-    // Reserved for the tail-policy implementation. Store::Setup rejects true
-    // until the metadata and real-slot eviction protocols are connected.
     bool enableDramTailEviction{false};
+    size_t tailMaxBatchBlocks{8192};
+    size_t tailMaxInflightBatches{16};
     size_t localRankSize{8};
     /* Connector-derived hints, never user configuration. deviceNumaNode is the
      * accelerator's real NUMA affinity, absent when topology does not expose
@@ -130,6 +130,8 @@ struct Config {
         dict.Get("cpu_affinity_cores", config.cpuAffinityCores);
         dict.Get("cache_io_aggregation", config.ioAggregation);
         dict.Get("enable_dram_tail_eviction", config.enableDramTailEviction);
+        dict.GetNumber("cache_tail_max_batch_blocks", config.tailMaxBatchBlocks);
+        dict.GetNumber("cache_tail_max_inflight_batches", config.tailMaxInflightBatches);
         // HMA's FA default must respect the runtime's copy capabilities.
         config.ioAggregation = config.ioAggregation && UCM_RUNTIME_ASCEND_IO_AGGREGATION;
         dict.GetNumber("local_rank_size", config.localRankSize);
