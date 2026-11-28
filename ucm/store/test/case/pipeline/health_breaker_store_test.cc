@@ -65,6 +65,11 @@ StoreHealthConfig TestConfig()
     return config;
 }
 
+class RelationCapableMockStore : public Detail::MockStore {
+public:
+    bool SupportsBlockRelations() const override { return true; }
+};
+
 Status SetupBreaker(HealthBreakerStore& breaker, StoreV1* store, const std::string& storeId,
                     const StoreHealthConfig& config)
 {
@@ -428,6 +433,23 @@ TEST(UCHealthBreakerStoreTest, PreservesBlockRelationsAndAsyncErrors)
     EXPECT_EQ(breaker.Dump(task).Value(), 21);
     EXPECT_CALL(store, Wait(21)).WillOnce(Return(Status::Error()));
     EXPECT_EQ(breaker.Wait(21), Status::Error());
+}
+
+TEST(UCHealthBreakerStoreTest, ReportsBlockRelationCapabilityOfWrappedStore)
+{
+    HealthBreakerStore unconfigured;
+    EXPECT_FALSE(unconfigured.SupportsBlockRelations());
+
+    StrictMock<Detail::MockStore> unsupported;
+    HealthBreakerStore unsupportedBreaker;
+    ASSERT_TRUE(
+        SetupBreaker(unsupportedBreaker, &unsupported, "unsupported", TestConfig()).Success());
+    EXPECT_FALSE(unsupportedBreaker.SupportsBlockRelations());
+
+    StrictMock<RelationCapableMockStore> supported;
+    HealthBreakerStore supportedBreaker;
+    ASSERT_TRUE(SetupBreaker(supportedBreaker, &supported, "supported", TestConfig()).Success());
+    EXPECT_TRUE(supportedBreaker.SupportsBlockRelations());
 }
 
 TEST(UCHealthBreakerStoreTest, LookupFailuresTripPassively)

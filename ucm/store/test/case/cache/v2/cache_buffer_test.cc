@@ -114,6 +114,11 @@ struct BufferTestAccess {
 
     static void SetShardsPerBlock(Buffer& buffer, size_t count) { buffer.shardsPerBlock_ = count; }
 
+    static void SetTail(Buffer& buffer, void* memory)
+    {
+        buffer.tail_ = std::make_unique<TailMetadata>(memory);
+    }
+
     static size_t FindSlot(Buffer& buffer, const Detail::BlockId& blockId, size_t offset)
     {
         auto iBucket = buffer.HashKey(blockId, offset);
@@ -173,6 +178,161 @@ TEST_F(Cache2BufferTest, GetUntilReturnsPinnedHandleOnSuccess)
     ASSERT_TRUE(hit.HasValue());
     EXPECT_FALSE(hit.Value().Owner());
     EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 2u);
+}
+
+TEST_F(Cache2BufferTest, QuarantineKeepsPinAndRejectsSubsequentHits)
+{
+    const auto block = MakeBlockId(10002);
+    {
+        auto handle = buffer_.Get(block, 0);
+        EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 1u);
+        handle.Quarantine();
+        handle.Quarantine();
+    }
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 1u);
+    EXPECT_FALSE(buffer_.Exist(block, 0));
+    std::atomic_bool cancelled{false};
+    auto hit = buffer_.GetUntil(block, 0, std::chrono::steady_clock::now() +
+                                           std::chrono::milliseconds(10), cancelled);
+    EXPECT_FALSE(hit.HasValue());
+    EXPECT_EQ(hit.Error(), Status::Timeout());
+}
+
+TEST_F(Cache2BufferTest, WholeBlockClaimRollsBackPinsAndFailedCommit)
+{
+    Metrics::SetUp();
+    Metrics::CreateStats("cache_dram_evicted_bytes_total", "counter");
+    Metrics::GetAllStatsAndClear();
+    const auto block = MakeBlockId(10003);
+    auto& layout = BufferTestAccess::Layout(buffer_);
+    auto* firstLock = layout.LockOf(BufferTestAccess::BucketOf(buffer_, block, 0));
+    size_t otherOffset = 1;
+    while (otherOffset < 10000 &&
+           layout.LockOf(BufferTestAccess::BucketOf(buffer_, block, otherOffset)) != firstLock) {
+        ++otherOffset;
+    }
+    ASSERT_LT(otherOffset, 10000u);
+    size_t firstSlot;
+    {
+        auto first = buffer_.Get(block, 0);
+        firstSlot = first.SlotIndex();
+        first.MarkReady();
+    }
+    auto second = buffer_.Get(block, otherOffset);
+    const auto secondSlot = second.SlotIndex();
+    second.MarkReady();
+    std::optional<Buffer::Handle> pin(std::move(second));
+    const std::vector<Buffer::EvictionSlot> slots{{secondSlot, otherOffset}, {firstSlot, 0}};
+    bool called = false;
+    auto commit = [&] { called = true; return Status::OK(); };
+    EXPECT_EQ(buffer_.TryEvictSlots(block, slots, commit), Status::Retry());
+    EXPECT_FALSE(called);
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, 0), 0u);
+    EXPECT_EQ(BufferTestAccess::ReferenceCount(buffer_, block, otherOffset), 1u);
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer_), 2u);
+
+    pin.reset();
+    EXPECT_EQ(buffer_.TryEvictSlots(block, {{firstSlot, otherOffset}, {secondSlot, 0}}, commit),
+              Status::Retry());
+    EXPECT_FALSE(called);
+    EXPECT_EQ(buffer_.TryEvictSlots(block, slots, [] { return Status::NoSpace(); }),
+              Status::NoSpace());
+    EXPECT_TRUE(buffer_.Exist(block, 0));
+    EXPECT_TRUE(buffer_.Exist(block, otherOffset));
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer_), 2u);
+    auto before = Metrics::GetAllStatsAndClear();
+    EXPECT_EQ(std::get<0>(before).at("cache_dram_evicted_bytes_total"), 0);
+
+    EXPECT_TRUE(buffer_.TryEvictSlots(block, slots, commit).Success());
+    EXPECT_TRUE(called);
+    EXPECT_FALSE(buffer_.Exist(block, 0));
+    EXPECT_FALSE(buffer_.Exist(block, otherOffset));
+    EXPECT_EQ(BufferTestAccess::UsedSlots(buffer_), 0u);
+    auto after = Metrics::GetAllStatsAndClear();
+    EXPECT_EQ(std::get<0>(after).at("cache_dram_evicted_bytes_total"), 8192);
+}
+
+TEST(Cache2TailBufferTest, PinnedLeafBlocksEvictionUntilReleased)
+{
+    constexpr size_t slots = 2, buckets = 8, locks = 4;
+    const auto controlBytes = BufferTestAccess::TotalSize(buckets, locks, slots);
+    auto* control = ::operator new(controlBytes, std::align_val_t{64});
+    const auto tailBytes = TailMetadata::Bytes(8, 8, 8);
+    auto* tail = ::operator new(tailBytes, std::align_val_t{64});
+    ASSERT_TRUE(TailMetadata::Initialize(tail, tailBytes, 8, 8, 8));
+    {
+        Buffer buffer;
+        BufferTestAccess::Init(buffer, control, 1, slots, buckets, locks);
+        BufferTestAccess::SetTail(buffer, tail);
+        const auto a = MakeBlockId(1), b = MakeBlockId(2), c = MakeBlockId(3);
+        Detail::TaskDesc desc;
+        desc.push_back({a, 0, {}});
+        desc.push_back({b, 0, {}});
+        desc.push_back({c, 0, {}});
+        desc.blockRelations = {{a, {}, true}, {b, a, false}, {c, b, false}};
+        auto relations = buffer.RegisterRelations(desc);
+        ASSERT_TRUE(relations.HasValue());
+        auto token = std::move(relations).Value();
+        (void)token;
+        std::atomic_bool cancelled{false};
+        const auto get = [&](const Detail::BlockId& id, size_t ms) {
+            return buffer.GetUntil(id, 0, std::chrono::steady_clock::now() +
+                                            std::chrono::milliseconds(ms), cancelled);
+        };
+        {
+            auto first = get(a, 1000);
+            ASSERT_TRUE(first.HasValue());
+            first.Value().MarkReady();
+        }
+        auto second = get(b, 1000);
+        ASSERT_TRUE(second.HasValue());
+        std::optional<Buffer::Handle> pinned(std::move(second).Value());
+        pinned->MarkReady();
+        auto blocked = get(c, 20);
+        ASSERT_FALSE(blocked.HasValue());
+        EXPECT_EQ(blocked.Error(), Status::Timeout());
+        EXPECT_TRUE(buffer.Exist(a, 0));
+        EXPECT_TRUE(buffer.Exist(b, 0));
+        pinned.reset();
+        auto inserted = get(c, 1000);
+        ASSERT_TRUE(inserted.HasValue());
+        inserted.Value().MarkReady();
+        EXPECT_TRUE(buffer.Exist(a, 0));
+        EXPECT_FALSE(buffer.Exist(b, 0));
+        EXPECT_TRUE(buffer.Exist(c, 0));
+        EXPECT_EQ(BufferTestAccess::UsedSlots(buffer), 2u);
+    }
+    ::operator delete(tail, std::align_val_t{64});
+    ::operator delete(control, std::align_val_t{64});
+}
+
+TEST(Cache2TailBufferTest, RegistrationFailureRollsBackAndMissingRelationsAreRejected)
+{
+    constexpr size_t slots = 2, buckets = 8, locks = 4;
+    const auto controlBytes = BufferTestAccess::TotalSize(buckets, locks, slots);
+    auto* control = ::operator new(controlBytes, std::align_val_t{64});
+    const auto tailBytes = TailMetadata::Bytes(1, 2, 2);
+    auto* tail = ::operator new(tailBytes, std::align_val_t{64});
+    ASSERT_TRUE(TailMetadata::Initialize(tail, tailBytes, 1, 2, 2));
+    {
+        Buffer buffer;
+        BufferTestAccess::Init(buffer, control, 1, slots, buckets, locks);
+        BufferTestAccess::SetTail(buffer, tail);
+        const auto a = MakeBlockId(10), b = MakeBlockId(11);
+        Detail::TaskDesc desc;
+        desc.push_back({a, 0, {}});
+        auto missing = buffer.RegisterRelations(desc);
+        ASSERT_FALSE(missing.HasValue());
+        EXPECT_EQ(missing.Error(), Status::InvalidParam());
+        desc.blockRelations = {{a, {}, true}, {b, a, false}};
+        auto full = buffer.RegisterRelations(desc);
+        ASSERT_FALSE(full.HasValue());
+        EXPECT_EQ(full.Error(), Status::NoSpace());
+        TailMetadata view(tail);
+        EXPECT_EQ(view.GetStats().nodes, 0u);
+    }
+    ::operator delete(tail, std::align_val_t{64});
+    ::operator delete(control, std::align_val_t{64});
 }
 
 TEST_F(Cache2BufferTest, UsedSlotsCountsReservationsWithoutDoubleCountingHits)

@@ -44,7 +44,7 @@ inline constexpr size_t kMaxRanks{128};
 inline constexpr size_t kMaxLockStripes{1ULL << 16};
 inline constexpr size_t kMinBuckets{1ULL << 10};
 inline constexpr size_t kMaxBuckets{1ULL << 24};
-inline constexpr uint32_t kCtrlMagic{0x55433203U};  // "UC2" + layout version 3.
+inline constexpr uint32_t kCtrlMagic{0x55433204U};  // "UC2" + layout version 4.
 
 class CtrlLayout {
 public:
@@ -60,6 +60,9 @@ public:
         std::atomic<size_t> prev{kInvalid};
         std::atomic<size_t> next{kInvalid};
         alignas(64) std::atomic<State> state{State::Loading};
+        // A DMA synchronization failure can leave this slot in use by device.
+        // Quarantine permanently rejects new pins for the lifetime of a domain.
+        std::atomic<uint8_t> quarantined{0};
         /* Hot line: CLOCK second-chance bit. */
         alignas(64) std::atomic<uint8_t> accessed{0};
 
@@ -73,6 +76,7 @@ public:
             prev.store(kInvalid, std::memory_order_relaxed);
             next.store(kInvalid, std::memory_order_relaxed);
             state.store(State::Loading, std::memory_order_relaxed);
+            quarantined.store(0, std::memory_order_relaxed);
             accessed.store(0, std::memory_order_relaxed);
         }
     };

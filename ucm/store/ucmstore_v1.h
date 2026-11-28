@@ -195,6 +195,17 @@ public:
      */
     virtual Status Wait(Detail::TaskHandle taskId) = 0;
 
+    /**
+     * Whether Load and Dump accept and preserve blockRelations for the
+     * lifetime of each asynchronous task. Stores must opt in only after their
+     * configured implementation actually consumes those relations. Wrappers
+     * may opt in only if they forward them without modification.
+     *
+     * This changes the StoreV1 ABI: rebuild every Store shared library and the
+     * pipeline extension together.
+     */
+    virtual bool SupportsBlockRelations() const { return false; }
+
 protected:
     /**
      * @brief Protected default constructor.

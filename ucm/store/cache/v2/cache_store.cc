@@ -23,6 +23,8 @@
  * */
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <memory>
 #include <string>
 #include <sys/types.h>
 #include <vector>
@@ -41,15 +43,12 @@ class Store : public StoreV1 {
     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_;
     TransManager<> transMgr_;
     bool transEnable_{false};
+    bool tailEnabled_{false};
 
 public:
     Status Setup(const Detail::Dictionary& inConfig) override
     {
         auto config = Config::From(inConfig);
-        if (config.enableDramTailEviction) {
-            UC_ERROR("DRAM tail eviction is not yet connected to cache slots.");
-            return Status::Unsupported();
-        }
         auto s = config.Validate();
         if (s.Failure()) {
             UC_ERROR("Failed to check config: {}.", s);
@@ -69,9 +68,11 @@ public:
             if (s = transMgr_.Setup(config, bufferMgr_.GetTransBuffer()); s.Failure()) { return s; }
             transEnable_ = true;
         }
+        tailEnabled_ = config.enableDramTailEviction;
         return Status::OK();
     }
     std::string Readme() const override { return "CacheStore"; }
+    bool SupportsBlockRelations() const override { return tailEnabled_; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
         return bufferMgr_.Lookup(blocks, num);
@@ -90,20 +91,30 @@ public:
     }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
-        // Prefix relations cannot be honored until the shared metadata and
-        // slot-claim protocols are connected. Never silently discard them.
-        if (!task.blockRelations.empty()) { return Status::Unsupported(); }
-        if (!transEnable_) { return Status::Error("transfer is not enabled"); }
-        return transMgr_.Submit({Task::Type::LOAD, std::move(task)});
+        return Submit(Task::Type::LOAD, std::move(task));
     }
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
-        if (!task.blockRelations.empty()) { return Status::Unsupported(); }
-        if (!transEnable_) { return Status::Error("transfer is not enabled"); }
-        return transMgr_.Submit({Task::Type::DUMP, std::move(task)});
+        return Submit(Task::Type::DUMP, std::move(task));
     }
     Expected<bool> Check(Detail::TaskHandle taskId) override { return transMgr_.Check(taskId); }
     Status Wait(Detail::TaskHandle taskId) override { return transMgr_.Wait(taskId); }
+
+private:
+    Expected<Detail::TaskHandle> Submit(Task::Type type, Detail::TaskDesc desc)
+    {
+        if (!transEnable_) { return Status::Error("transfer is not enabled"); }
+        auto relationToken = bufferMgr_.GetTransBuffer()->RegisterRelations(desc);
+        if (!relationToken) { return relationToken.Error(); }
+        try {
+            auto lease = std::make_shared<Buffer::RelationToken>(std::move(relationToken).Value());
+            Task task{type, std::move(desc)};
+            task.relationLease = std::move(lease);
+            return transMgr_.Submit(std::move(task));
+        } catch (const std::exception& e) {
+            return Status::Error(e.what());
+        }
+    }
 };
 
 }  // namespace UC::Cache2

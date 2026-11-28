@@ -67,6 +67,8 @@ class DumpQ {
         Detail::TaskHandle taskHandle{};
         Detail::TaskHandle backendTaskHandle{};
         std::vector<Handle> bufferHandles{};
+        TaskPtr task{};
+        WaiterPtr waiter{};
     };
 
     alignas(64) std::atomic_bool stop_{false};
@@ -79,6 +81,7 @@ class DumpQ {
     bool sdmaDirect_{false};
     bool ioAggregation_{false};
     bool useGdr_{false};
+    bool waitForBackend_{false};
     std::vector<size_t> tensorSizes_{};
     std::vector<ssize_t> cpuAffinityCores_{};
     size_t timeoutMs_{0};
@@ -107,6 +110,7 @@ public:
         sdmaDirect_ = config.sdmaDirect;
         ioAggregation_ = config.ioAggregation;
         useGdr_ = config.useGdr;
+        waitForBackend_ = config.enableDramTailEviction;
         tensorSizes_ = config.tensorSizes;
         cpuAffinityCores_ = config.cpuAffinityCores;
         timeoutMs_ = config.timeoutMs;
@@ -131,6 +135,7 @@ public:
         }
         if (stopped) {
             task->Fail(Status::Error("dump queue closed"));
+            task->relationLease.reset();
             failureSet_->Insert(task->id);
             waiter->Done();
             return;
@@ -138,6 +143,7 @@ public:
         UC_ERROR("Waiting queue full, submit dump task({}) failed.", task->id);
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_queue_full_total"), 1.0);
         task->Fail(Status::Retry());
+        task->relationLease.reset();
         failureSet_->Insert(task->id);
         waiter->Done();
     }
@@ -195,7 +201,7 @@ private:
                     task->cancelled.store(true, std::memory_order_release);
                 }
             }
-            auto s = DumpOneTask(stream, task);
+            auto s = DumpOneTask(stream, task, waiter);
             {
                 std::lock_guard<std::mutex> lock(activeMutex_);
                 activeTask_.reset();
@@ -205,9 +211,10 @@ private:
                 failureSet_->Insert(task->id);
             }
         }
+        task->relationLease.reset();
         waiter->Done();
     }
-    Status DumpOneTask(StreamT& stream, const TaskPtr& task)
+    Status DumpOneTask(StreamT& stream, const TaskPtr& task, const WaiterPtr& waiter)
     {
         auto s = WaitPrerequisite(stream, task);
         if (s.Failure()) [[unlikely]] { return s; }
@@ -227,8 +234,10 @@ private:
                 if (syncStatus.Failure()) {
                     UC_ERROR("Failed({}) to drain D2H after dump task({}) failed.", syncStatus,
                              task->id);
+                    QuarantineHandles(ctx);
+                } else {
+                    FailOwnedHandles(ctx);
                 }
-                FailOwnedHandles(ctx);
             }
             return s;
         }
@@ -237,7 +246,7 @@ private:
         if (s.Failure()) [[unlikely]] { return s; }
         if (task->cancelled.load(std::memory_order_acquire)) { return Status::Retry(); }
         if (backend_ == nullptr || backendDesc.empty()) { return Status::OK(); }
-        return SubmitBackendDump(task, ctx, std::move(backendDesc));
+        return SubmitBackendDump(task, ctx, std::move(backendDesc), waiter);
     }
     Status WaitPrerequisite(StreamT& stream, const TaskPtr& task)
     {
@@ -306,7 +315,9 @@ private:
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to sync stream for dump task({}).", s, task->id);
                 Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_errors_total"), 1.0);
-                FailOwnedHandles(ctx);
+                // A failed synchronization does not prove the device stopped
+                // writing. Keep every affected slot pinned for this domain.
+                QuarantineHandles(ctx);
                 return s;
             }
             Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_duration_ms"),
@@ -315,7 +326,8 @@ private:
         for (auto& handle : ctx.bufferHandles) { handle.MarkReady(); }
         return Status::OK();
     }
-    Status SubmitBackendDump(const TaskPtr& task, DumpCtx& ctx, Detail::TaskDesc&& backendDesc)
+    Status SubmitBackendDump(const TaskPtr& task, DumpCtx& ctx, Detail::TaskDesc&& backendDesc,
+                             const WaiterPtr& waiter)
     {
         const auto startTp = NowTime::Now();
         const auto nBackendShards = backendDesc.size();
@@ -332,6 +344,13 @@ private:
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_shards_total"),
                              static_cast<double>(nBackendShards));
         ctx.backendTaskHandle = res.Value();
+        if (waitForBackend_) {
+            // The caller must not observe success until the backend has
+            // finished: in tail mode it may be the only copy after eviction.
+            ctx.task = task;
+            ctx.waiter = waiter;
+            waiter->Up();
+        }
         dumping_.Push(std::move(ctx));
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_submit_duration_ms"),
                              (NowTime::Now() - startTp) * 1e3);
@@ -341,6 +360,10 @@ private:
     {
         for (auto& handle : ctx.bufferHandles) { handle.MarkFailed(); }
     }
+    void QuarantineHandles(DumpCtx& ctx)
+    {
+        for (auto& handle : ctx.bufferHandles) { handle.Quarantine(); }
+    }
     void BackendWaitStage()
     {
         auto nameStatus = CpuAffinity::SetCurrentThreadName("ucm_dump_wait");
@@ -349,7 +372,10 @@ private:
         }
         BindCpuAffinity();
         dumping_.ConsumerLoop(dumperStop_, [this](DumpCtx&& ctx) {
-            if (ctx.backendTaskHandle == 0) { return; }
+            if (ctx.backendTaskHandle == 0) {
+                CompleteBackend(ctx, Status::OK());
+                return;
+            }
             const auto startTp = NowTime::Now();
             auto s = backend_->Wait(ctx.backendTaskHandle);
             Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_backend_wait_duration_ms"),
@@ -361,9 +387,20 @@ private:
                 }
                 Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_backend_dump_wait_errors_total"),
                                      1.0);
-                return;
             }
+            CompleteBackend(ctx, s);
         });
+    }
+    void CompleteBackend(DumpCtx& ctx, const Status& status)
+    {
+        if (!ctx.waiter) { return; }
+        if (status.Failure()) {
+            ctx.task->Fail(status);
+            failureSet_->Insert(ctx.task->id);
+        }
+        ctx.waiter->Done();
+        ctx.waiter.reset();
+        ctx.task.reset();
     }
     void DrainWaiting()
     {
@@ -371,6 +408,7 @@ private:
         while (waiting_.TryPop(pair)) {
             UC_WARN("Cache2 dump task({}) discarded on close.", pair.first->id);
             pair.first->Fail(Status::Error("dump queue closed"));
+            pair.first->relationLease.reset();
             failureSet_->Insert(pair.first->id);
             pair.second->Done();
         }
@@ -386,12 +424,16 @@ private:
         if (backend_ == nullptr) { return; }
         DumpCtx ctx;
         while (dumping_.TryPop(ctx)) {
-            if (ctx.backendTaskHandle == 0) { continue; }
+            if (ctx.backendTaskHandle == 0) {
+                CompleteBackend(ctx, Status::OK());
+                continue;
+            }
             auto s = backend_->Wait(ctx.backendTaskHandle);
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to wait backend({}) for dump task({}).", s,
                          ctx.backendTaskHandle, ctx.taskHandle);
             }
+            CompleteBackend(ctx, s);
         }
     }
 };

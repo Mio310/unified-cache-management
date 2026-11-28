@@ -68,10 +68,72 @@ class Buffer {
     size_t reservedSlots_{0};
     bool metricsRegistered_{false};
     std::string metricsDomainId_;
+    std::unique_ptr<TailMetadata> tail_;
 
     static constexpr size_t kPinSpinFast{64};
 
 public:
+    class RelationToken {
+        friend class Buffer;
+        Buffer* buffer_{nullptr};
+        std::vector<TailMetadata::Ref> refs_;
+        explicit RelationToken(Buffer* buffer) : buffer_(buffer) {}
+        void Reset() noexcept
+        {
+            if (buffer_ && buffer_->tail_) {
+                for (auto ref : refs_) { (void)buffer_->tail_->Release(ref); }
+            }
+            refs_.clear();
+            buffer_ = nullptr;
+        }
+    public:
+        RelationToken() = default;
+        RelationToken(const RelationToken&) = delete;
+        RelationToken& operator=(const RelationToken&) = delete;
+        RelationToken(RelationToken&& other) noexcept
+            : buffer_(other.buffer_), refs_(std::move(other.refs_)) { other.buffer_ = nullptr; }
+        RelationToken& operator=(RelationToken&& other) noexcept
+        {
+            if (this != &other) {
+                Reset();
+                buffer_ = other.buffer_;
+                refs_ = std::move(other.refs_);
+                other.buffer_ = nullptr;
+            }
+            return *this;
+        }
+        ~RelationToken() { Reset(); }
+    };
+
+    Expected<RelationToken> RegisterRelations(const Detail::TaskDesc& desc)
+    {
+        if (!tail_) {
+            if (!desc.blockRelations.empty()) { return Status::Unsupported(); }
+            return RelationToken{};
+        }
+        std::unordered_set<Detail::BlockId, Detail::BlockIdHasher> related;
+        related.reserve(desc.blockRelations.size());
+        for (const auto& rel : desc.blockRelations) { related.insert(rel.child); }
+        for (const auto& shard : desc) {
+            if (related.find(shard.owner) == related.end()) {
+                return Status::InvalidParam("missing cache2 block relation");
+            }
+        }
+        RelationToken token(this);
+        token.refs_.reserve(desc.blockRelations.size());
+        for (const auto& rel : desc.blockRelations) {
+            TailMetadata::Ref ref;
+            const auto result = tail_->Register(rel.child, rel.parent, rel.isRoot, ref);
+            if (result != TailMetadata::Result::Ok) {
+                return result == TailMetadata::Result::Full ? Status::NoSpace()
+                     : result == TailMetadata::Result::Busy ? Status::Retry()
+                                                           : Status::InvalidParam();
+            }
+            token.refs_.push_back(ref);
+        }
+        return std::move(token);
+    }
+
     struct EvictionSlot {
         size_t index;
         size_t offset;
@@ -223,6 +285,21 @@ public:
         {
             if (Owner()) { buf_->MarkFailed(slotIdx_); }
         }
+        // A failed device synchronization does not prove DMA has stopped.
+        // Transfer this handle's existing pin into a permanent quarantine pin;
+        // repeated calls and destruction after quarantine are no-ops.
+        void Quarantine() noexcept
+        {
+            if (!buf_) { return; }
+            auto& meta = buf_->ctrl_.Layout().SlotMetaArr()[slotIdx_];
+            if (owner_ && meta.state.load(std::memory_order_acquire) != State::Ready) {
+                meta.state.store(State::Failed, std::memory_order_release);
+            }
+            meta.quarantined.store(1, std::memory_order_release);
+            buf_ = nullptr;
+            slotIdx_ = kInvalid;
+            owner_ = false;
+        }
 
     private:
         void Swap(Handle& o) noexcept
@@ -254,6 +331,10 @@ public:
         auto s = ctrl_.Setup(cfg);
         if (s.Failure()) { return s; }
         auto& layout = ctrl_.Layout();
+        if (cfg.enableDramTailEviction) {
+            if (layout.TailMemory() == nullptr) { return Status::Error("tail metadata missing"); }
+            tail_ = std::make_unique<TailMetadata>(layout.TailMemory());
+        }
         rankCount_ = layout.RankCount();
         slotsPerRank_ = layout.SlotsPerRank();
         slotSize_ = layout.SlotSize();
@@ -352,8 +433,11 @@ public:
             if (cancelled.load(std::memory_order_acquire)) { return Status::Retry(); }
             if (std::chrono::steady_clock::now() >= deadline) { return Status::Timeout(); }
             bool owner = false;
-            auto slot = TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank);
+            Status error = Status::OK();
+            auto slot = TryAcquireSlot(blockId, offset, allowReserved, attempts, owner, preferredRank,
+                                       &error);
             if (slot != kInvalid) { return Handle{this, slot, owner}; }
+            if (error.Failure()) { return error; }
             std::this_thread::yield();
         }
     }
@@ -381,6 +465,7 @@ public:
         if (iNode != kInvalid) {
             bool owner = false;
             if (PinHit(layout, iNode, iBucket, blockId, offset, kPinSpinFast, owner, false)) {
+                if (!TouchTail(blockId, iNode, owner, nullptr)) { return false; }
                 Release(iNode);
                 return true;
             }
@@ -388,7 +473,17 @@ public:
         auto* lock = layout.LockOf(iBucket);
         lock->Lock();
         iNode = Lookup(layout, iBucket, blockId, offset);
-        auto found = iNode != kInvalid;
+        auto found = iNode != kInvalid &&
+                     !layout.SlotMetaArr()[iNode].quarantined.load(std::memory_order_acquire);
+        if (found && tail_) {
+            TailMetadata::Ref ref;
+            auto result = tail_->Acquire(blockId, ref);
+            if (result == TailMetadata::Result::Ok) {
+                result = tail_->Touch(ref);
+                (void)tail_->Release(ref);
+            }
+            found = result == TailMetadata::Result::Ok;
+        }
         if (found) { layout.SlotMetaArr()[iNode].accessed.store(1, std::memory_order_relaxed); }
         lock->Unlock();
         return found;
@@ -399,12 +494,21 @@ public:
         if (blocks == nullptr || bucketCount_ == 0) { return; }
         auto& layout = ctrl_.Layout();
         for (size_t i = 0; i < num; ++i) {
+            bool found = false;
             // Shards of one block now live in separate hash buckets.
             for (size_t offset = 0; offset < shardsPerBlock_; ++offset) {
                 auto iBucket = HashKey(blocks[i], offset);
                 auto iNode = LookupOptimistic(layout, iBucket, blocks[i], offset);
                 if (iNode != kInvalid) {
                     layout.SlotMetaArr()[iNode].accessed.store(1, std::memory_order_relaxed);
+                    found = true;
+                }
+            }
+            if (found && tail_) {
+                TailMetadata::Ref ref;
+                if (tail_->Acquire(blocks[i], ref) == TailMetadata::Result::Ok) {
+                    (void)tail_->Touch(ref);
+                    (void)tail_->Release(ref);
                 }
             }
         }
@@ -416,6 +520,72 @@ public:
     size_t BucketCount() const { return bucketCount_; }
 
 private:
+    // The caller already pinned this slot. A concurrent selected eviction will
+    // either fail to claim it or make Touch return Busy; never return an
+    // untracked hit as a valid tail-mode handle.
+    bool TouchTail(const Detail::BlockId& id, size_t slot, bool owner, Status* error)
+    {
+        if (!tail_) { return true; }
+        TailMetadata::Ref ref;
+        auto result = tail_->Acquire(id, ref);
+        if (result == TailMetadata::Result::Ok) {
+            result = tail_->Touch(ref);
+            (void)tail_->Release(ref);
+        }
+        if (result == TailMetadata::Result::Ok) { return true; }
+        if (owner && GetState(slot) == State::Loading) { MarkFailed(slot); }
+        Release(slot);
+        if (error && result != TailMetadata::Result::Busy) {
+            *error = result == TailMetadata::Result::Full ? Status::NoSpace()
+                                                          : Status::InvalidParam();
+        }
+        return false;
+    }
+
+    // Attempt a direct leaf first; if its rank differs, the bounded cascade
+    // picks a leaf whose resident ancestor can eventually free this rank.
+    void EvictTail()
+    {
+        if (!tail_ || myRank_ >= rankCount_) { return; }
+        TailMetadata::Ref selection;
+        const auto budget = std::min<uint32_t>(tail_->NodeCapacity(), 256);
+        auto result = tail_->Select(static_cast<uint32_t>(myRank_), budget, false, selection);
+        if (result == TailMetadata::Result::NotFound) {
+            result = tail_->Select(static_cast<uint32_t>(myRank_), budget, true, selection);
+        }
+        if (result != TailMetadata::Result::Ok) { return; }
+        bool committed = false;
+        auto abort = [&](TailMetadata*) {
+            if (!committed) { (void)tail_->AbortEvict(selection); }
+        };
+        std::unique_ptr<TailMetadata, decltype(abort)> guard(tail_.get(), abort);
+        try {
+            Detail::BlockId id{};
+            if (tail_->EvictionId(selection, id) != TailMetadata::Result::Ok) { return; }
+            std::vector<TailMetadata::Shard> snapshot;
+            if (tail_->GetShards(selection, snapshot) != TailMetadata::Result::Ok) { return; }
+            std::vector<EvictionSlot> slots;
+            slots.reserve(snapshot.size());
+            for (const auto& shard : snapshot) {
+                if (shard.slot >= ctrl_.Layout().SlotCount() ||
+                    shard.rank != shard.slot / slotsPerRank_) { return; }
+                const auto offset = ctrl_.Layout().SlotMetaArr()[shard.slot].key[2].load(
+                    std::memory_order_acquire);
+                slots.push_back({static_cast<size_t>(shard.slot), offset});
+            }
+            if (slots.empty()) { return; }
+            const auto status = TryEvictSlots(id, std::move(slots), [&] {
+                const auto commit = tail_->CommitEvict(selection);
+                if (commit != TailMetadata::Result::Ok) { return Status::Retry(); }
+                committed = true;
+                return Status::OK();
+            });
+            (void)status;
+        } catch (...) {
+            // The selection guard clears the evicting flag on allocation errors.
+        }
+    }
+
     // Metrics aggregates process-local Gauge writes without domain labels. One
     // reporter thread must therefore sum all rank-zero domains in this process.
     class CapacityReporter {
@@ -567,7 +737,8 @@ private:
     // On success, the caller owns one reference and must transfer it into a Handle.
     // kInvalid means retry; owner is only meaningful on success.
     size_t TryAcquireSlot(const Detail::BlockId& blockId, size_t offset, bool allowReserved,
-                          size_t attempts, bool& owner, size_t preferredRank = kInvalid)
+                          size_t attempts, bool& owner, size_t preferredRank = kInvalid,
+                          Status* error = nullptr)
     {
         auto iBucket = HashKey(blockId, offset);
         auto& layout = ctrl_.Layout();
@@ -575,6 +746,7 @@ private:
         auto iNode = LookupOptimistic(layout, iBucket, blockId, offset);
         if (iNode != kInvalid) {
             if (PinHit(layout, iNode, iBucket, blockId, offset, kPinSpinFast, owner, mayOwn)) {
+                if (!TouchTail(blockId, iNode, owner, error)) { return kInvalid; }
                 return iNode;
             }
         }
@@ -589,11 +761,12 @@ private:
         if (iNode != kInvalid) {
             auto pinned = PinHit(layout, iNode, iBucket, blockId, offset, kPinSpinFast, owner);
             targetLock->Unlock();
-            return pinned ? iNode : kInvalid;
+            return pinned && TouchTail(blockId, iNode, owner, error) ? iNode : kInvalid;
         }
-        iNode = Alloc(layout, blockId, offset, iBucket, allowReserved, attempts, 1);
+        iNode = Alloc(layout, blockId, offset, iBucket, allowReserved, attempts, 1, error);
         targetLock->Unlock();
         if (iNode != kInvalid) { owner = true; }
+        if (iNode == kInvalid && tail_ && (!error || error->Success())) { EvictTail(); }
         return iNode;
     }
 
@@ -621,6 +794,7 @@ private:
         auto* meta = &layout.SlotMetaArr()[iNode];
         for (size_t spin = 0; spin < spinBudget;) {
             if (!MatchKey(*meta, iBucket, blockId, offset)) { return false; }
+            if (meta->quarantined.load(std::memory_order_acquire)) { return false; }
             auto reference = meta->reference.load(std::memory_order_acquire);
             if (reference == kSlotClaimed) {
                 ++spin;
@@ -638,7 +812,8 @@ private:
                 ++spin;
                 continue;
             }
-            if (!MatchKey(*meta, iBucket, blockId, offset)) {
+            if (!MatchKey(*meta, iBucket, blockId, offset) ||
+                meta->quarantined.load(std::memory_order_acquire)) {
                 meta->reference.fetch_sub(1, std::memory_order_release);
                 return false;
             }
@@ -679,7 +854,7 @@ private:
     }
 
     size_t Alloc(CtrlLayout& layout, const Detail::BlockId& blockId, size_t offset, size_t iBucket,
-                 bool allowReserved, size_t attempts, size_t initialReference)
+                 bool allowReserved, size_t attempts, size_t initialReference, Status* error = nullptr)
     {
         for (size_t scan = 0; scan < attempts; ++scan) {
             auto iNode = FetchNode(layout, allowReserved);
@@ -693,6 +868,28 @@ private:
             }
 
             auto oldBucket = meta->hash.load(std::memory_order_acquire);
+            if (tail_) {
+                // Tail mode may only bind an actually unlinked slot. It must
+                // never use CLOCK to replace an existing, tracked shard.
+                if (oldBucket != kInvalid) {
+                    meta->reference.store(0, std::memory_order_release);
+                    continue;
+                }
+                TailMetadata::Ref ref;
+                auto registered = tail_->Acquire(blockId, ref);
+                if (registered == TailMetadata::Result::Ok) {
+                    registered = tail_->AddShard(ref, iNode, static_cast<uint32_t>(myRank_));
+                    (void)tail_->Release(ref);
+                }
+                if (registered != TailMetadata::Result::Ok) {
+                    meta->reference.store(0, std::memory_order_release);
+                    if (error && registered != TailMetadata::Result::Busy) {
+                        *error = registered == TailMetadata::Result::Full ? Status::NoSpace()
+                                                                          : Status::InvalidParam();
+                    }
+                    return kInvalid;
+                }
+            }
             const bool evictsReady = oldBucket != kInvalid &&
                 meta->state.load(std::memory_order_acquire) == State::Ready;
             if (oldBucket != iBucket) {
@@ -732,6 +929,9 @@ private:
         auto usable = slotsPerRank_ - (allowReserved ? 0 : reservedSlots_);
         if (usable == 0 || myRank_ == kInvalid) { return kInvalid; }
         auto iNode = layout.NextClockSlot(myRank_, usable);
+        if (tail_ && layout.SlotMetaArr()[iNode].hash.load(std::memory_order_acquire) != kInvalid) {
+            return kInvalid;
+        }
         if (layout.SlotMetaArr()[iNode].accessed.exchange(0, std::memory_order_relaxed) != 0) {
             return kInvalid;
         }
@@ -778,7 +978,9 @@ private:
 
     State GetState(size_t slotIdx) const
     {
-        return ctrl_.Layout().SlotMetaArr()[slotIdx].state.load(std::memory_order_acquire);
+        auto& meta = ctrl_.Layout().SlotMetaArr()[slotIdx];
+        if (meta.quarantined.load(std::memory_order_acquire)) { return State::Failed; }
+        return meta.state.load(std::memory_order_acquire);
     }
 
     void MarkReady(size_t slotIdx)

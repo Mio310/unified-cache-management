@@ -187,6 +187,11 @@ Status HealthBreakerStore::Wait(Detail::TaskHandle taskId)
     }
 }
 
+bool HealthBreakerStore::SupportsBlockRelations() const
+{
+    return store_ != nullptr && store_->SupportsBlockRelations();
+}
+
 // Returns whether the result was counted as a passive health sample.
 bool HealthBreakerStore::RecordPassiveResult(const Status& status, uint64_t generation)
 {

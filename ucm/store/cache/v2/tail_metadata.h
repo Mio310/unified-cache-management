@@ -11,12 +11,12 @@
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <vector>
 
 namespace UC::Cache2 {
 
 // A bounded, relocatable metadata prototype. The caller owns and shares the
 // memory region; View itself is process-local and must never be stored there.
-// This class is not connected to Buffer's eviction path.
 class TailMetadata {
 public:
     using Id = std::array<std::byte, 16>;
@@ -225,6 +225,28 @@ public:
         if (!Valid(r) || !nodes_[r.index].refs) { return Result::Invalid; }
         --nodes_[r.index].refs; Collect(r.index); return Result::Ok;
     }
+    // Acquires an existing registration for a slot operation. The caller must
+    // release it; a task-level registration keeps a not-yet-resident ID alive.
+    Result Acquire(const Id& id, Ref& out)
+    {
+        Guard guard(h_);
+        const auto i = Find(id);
+        if (i == kNil) { return Result::NotFound; }
+        auto& n = nodes_[i];
+        if (n.evicting) { return Result::Busy; }
+        if (n.refs == UINT32_MAX) { return Result::Full; }
+        ++n.refs;
+        out = MakeRef(i);
+        return Result::Ok;
+    }
+    Result EvictionId(Ref r, Id& id)
+    {
+        Guard guard(h_);
+        if (!ValidEviction(r)) { return Result::Invalid; }
+        id = nodes_[r.index].id;
+        return Result::Ok;
+    }
+    uint32_t NodeCapacity() const { return h_->nodes; }
     // The caller must reserve the slot before adding it and must never attach
     // the same slot to two blocks. A failed add must roll back that reservation.
     Result AddShard(Ref r, uint64_t slot, uint32_t rank)
@@ -314,6 +336,26 @@ public:
         while (s != kNil && ordinal) { s = shards_[s].next; --ordinal; }
         if (s == kNil) { return Result::NotFound; }
         out = {shards_[s].slot, shards_[s].rank}; return Result::Ok;
+    }
+    // The evicting marker freezes this node's shard list. Reserve outside the
+    // shared lock, then copy in one linear traversal while holding the lock.
+    // If reserve throws, the caller still owns r and must AbortEvict it.
+    Result GetShards(Ref r, std::vector<Shard>& out)
+    {
+        uint32_t count = 0;
+        {
+            Guard guard(h_);
+            if (!ValidEviction(r)) { return Result::Invalid; }
+            count = nodes_[r.index].shards;
+        }
+        out.clear();
+        out.reserve(count);
+        Guard guard(h_);
+        if (!ValidEviction(r) || nodes_[r.index].shards != count) { return Result::Invalid; }
+        for (auto s = nodes_[r.index].shardHead; s != kNil; s = shards_[s].next) {
+            out.push_back({shards_[s].slot, shards_[s].rank});
+        }
+        return Result::Ok;
     }
     Result AbortEvict(Ref r)
     {

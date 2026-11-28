@@ -116,6 +116,11 @@ public:
             state_ = SlotState::Failed;
             buf_->markedFailed_.fetch_add(1, std::memory_order_relaxed);
         }
+        void Quarantine()
+        {
+            MarkFailed();
+            buf_->quarantined_.fetch_add(1, std::memory_order_relaxed);
+        }
 
     private:
         FakeBuffer* buf_{nullptr};
@@ -167,6 +172,7 @@ public:
     size_t LiveHandles() const { return liveHandles_.load(std::memory_order_relaxed); }
     size_t MarkedReady() const { return markedReady_.load(std::memory_order_relaxed); }
     size_t MarkedFailed() const { return markedFailed_.load(std::memory_order_relaxed); }
+    size_t Quarantined() const { return quarantined_.load(std::memory_order_relaxed); }
     const std::vector<GetCall>& GetCalls() const { return getCalls_; }
 
 private:
@@ -184,6 +190,7 @@ private:
     std::atomic<size_t> liveHandles_{0};
     std::atomic<size_t> markedReady_{0};
     std::atomic<size_t> markedFailed_{0};
+    std::atomic<size_t> quarantined_{0};
     std::vector<GetCall> getCalls_{};
 };
 
@@ -527,6 +534,7 @@ TEST_F(UCCache2DumpQueueTest, DumpFailsWhenSyncFails)
     EXPECT_EQ(FakeStream::gathers.size(), 1);
     EXPECT_EQ(FakeStream::syncs.load(), 1);
     EXPECT_EQ(buffer_.MarkedFailed(), 1);
+    EXPECT_EQ(buffer_.Quarantined(), 1u);
     EXPECT_EQ(buffer_.MarkedReady(), 0);
     EXPECT_EQ(buffer_.LiveHandles(), 0);
     auto stats = UC::Metrics::GetAllStatsAndClear();
@@ -701,6 +709,38 @@ TEST_F(UCCache2DumpQueueTest, BackendWaitFailureReleasesHandles)
     EXPECT_TRUE(AwaitTrue([this] { return buffer_.LiveHandles() == 0; }));
     auto stats = UC::Metrics::GetAllStatsAndClear();
     EXPECT_EQ(std::get<0>(stats).at("cache_backend_dump_wait_errors_total"), 1);
+}
+
+TEST_F(UCCache2DumpQueueTest, TailModeReportsBackendWaitFailureBeforeCompleting)
+{
+    TestedQueue queue;
+    auto config = config_;
+    config.enableDramTailEviction = true;
+    ASSERT_TRUE(queue.Setup(config, &failureSet_, &buffer_).Success());
+    std::atomic_bool entered{false};
+    UC::Latch release;
+    release.Up();
+    EXPECT_CALL(backend_, Dump).WillOnce(testing::Invoke([](UC::Detail::TaskDesc) {
+        return UC::Expected<UC::Detail::TaskHandle>(NextBackendHandle());
+    }));
+    EXPECT_CALL(backend_, Wait).WillOnce(testing::Invoke([&](UC::Detail::TaskHandle) {
+        entered.store(true, std::memory_order_release);
+        release.WaitFor(kWaitMs);
+        return UC::Status::Error("backend wait failure");
+    }));
+    auto task = std::make_shared<Task>(Task::Type::DUMP,
+        MakeDesc(TypesHelper::MakeBlockIdRandomly()));
+    auto waiter = std::make_shared<UC::Latch>();
+    queue.Submit(task, waiter);
+    EXPECT_TRUE(AwaitTrue([&] { return entered.load(std::memory_order_acquire); }));
+    EXPECT_FALSE(waiter->WaitFor(20));
+    EXPECT_EQ(buffer_.LiveHandles(), 1u);
+    release.Done();
+    ASSERT_TRUE(waiter->WaitFor(kWaitMs));
+    EXPECT_TRUE(failureSet_.Contains(task->id));
+    EXPECT_EQ(task->FailureStatus(), UC::Status::Error());
+    queue.Close();
+    EXPECT_EQ(buffer_.LiveHandles(), 0u);
 }
 
 TEST_F(UCCache2DumpQueueTest, SubmitFailsWhenWaitingQueueFull)

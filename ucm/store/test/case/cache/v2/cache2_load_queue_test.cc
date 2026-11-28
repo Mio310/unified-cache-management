@@ -113,6 +113,7 @@ public:
             buf_->SetSlotStateByIdx(slotIdx_, SlotState::Failed);
             buf_->markedFailed_.fetch_add(1, std::memory_order_relaxed);
         }
+        void Quarantine() { buf_->quarantined_.fetch_add(1, std::memory_order_relaxed); }
 
     private:
         FakeBuffer* buf_{nullptr};
@@ -193,6 +194,7 @@ public:
     size_t LiveHandles() const { return liveHandles_.load(std::memory_order_relaxed); }
     size_t MarkedReady() const { return markedReady_.load(std::memory_order_relaxed); }
     size_t MarkedFailed() const { return markedFailed_.load(std::memory_order_relaxed); }
+    size_t Quarantined() const { return quarantined_.load(std::memory_order_relaxed); }
     size_t SegmentOf(size_t slotIdx) const { return slotSegments_[slotIdx]; }
     const std::vector<GetCall>& GetCalls() const { return getCalls_; }
     const std::vector<PreallocCall>& PreallocCalls() const { return preallocCalls_; }
@@ -221,6 +223,7 @@ private:
     std::atomic<size_t> liveHandles_{0};
     std::atomic<size_t> markedReady_{0};
     std::atomic<size_t> markedFailed_{0};
+    std::atomic<size_t> quarantined_{0};
     std::vector<GetCall> getCalls_{};
     std::vector<PreallocCall> preallocCalls_{};
 };
@@ -752,7 +755,7 @@ TEST_F(UCCache2LoadQueueTest, LoadFailsWhenScatterFails)
     EXPECT_TRUE(failureSet_.Contains(task->id));
     EXPECT_EQ(buffer_.MarkedReady(), 1);
     EXPECT_EQ(FakeStream::scatters.size(), 1);
-    EXPECT_EQ(FakeStream::syncs.load(), 0);
+    EXPECT_EQ(FakeStream::syncs.load(), 1);
     auto stats = UC::Metrics::GetAllStatsAndClear();
     const auto& counters = std::get<0>(stats);
     EXPECT_EQ(counters.at("cache_h2d_errors_total"), 1);
@@ -775,7 +778,8 @@ TEST_F(UCCache2LoadQueueTest, LoadFailsWhenSyncFails)
     ASSERT_TRUE(waiter->WaitFor(kWaitMs));
     EXPECT_TRUE(failureSet_.Contains(task->id));
     EXPECT_EQ(FakeStream::scatters.size(), 1);
-    EXPECT_EQ(FakeStream::syncs.load(), 1);
+    EXPECT_EQ(FakeStream::syncs.load(), 2);
+    EXPECT_EQ(buffer_.Quarantined(), 1u);
     auto stats = UC::Metrics::GetAllStatsAndClear();
     const auto& counters = std::get<0>(stats);
     EXPECT_EQ(counters.at("cache_h2d_errors_total"), 1);

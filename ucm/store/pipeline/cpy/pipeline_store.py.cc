@@ -185,9 +185,17 @@ class PipelineStore {
             if (!relation.isRoot) { relation.parent = parseId(parent); }
             desc.blockRelations.push_back(relation);
         }
-        // The Cache Store is not connected to this metadata yet. Fail closed:
-        // an arbitrary StoreV1 implementation may otherwise ignore it silently.
-        throw std::runtime_error("block relations are not supported by this pipeline yet");
+    }
+
+    void RequireBlockRelationsSupport(const Detail::TaskDesc& desc) const
+    {
+        // Do not hand relations to a store that might silently discard them.
+        // Wrapper stores must explicitly forward the capability from the
+        // consuming store; all other stores default to unsupported.
+        if (!desc.blockRelations.empty() &&
+            (StoreBack() == nullptr || !StoreBack()->SupportsBlockRelations())) {
+            throw std::runtime_error("block relations are not supported by this pipeline");
+        }
     }
 
 public:
@@ -282,6 +290,7 @@ public:
         desc.prerequisiteHandle = prerequisite_handle;
         desc.distributeBackendLoad = distribute_backend_load;
         SetBlockRelations(desc, block_relations);
+        RequireBlockRelationsSupport(desc);
         auto res = StoreBack()->Load(std::move(desc));
         if (res) { return res.Value(); }
         ThrowError(res.Error());
@@ -294,6 +303,7 @@ public:
         desc.brief = "Dump";
         desc.prerequisiteHandle = prerequisite_handle;
         SetBlockRelations(desc, block_relations);
+        RequireBlockRelationsSupport(desc);
         auto res = StoreBack()->Dump(desc);
         if (res) { return res.Value(); }
         if (res.Error() == Status::StoreUnhealthy()) { return UNHEALTHY_DUMP_TASK; }

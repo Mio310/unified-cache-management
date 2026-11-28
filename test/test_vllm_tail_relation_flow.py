@@ -23,7 +23,7 @@ methods = [n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "UC
 assert {n.name for n in methods} == names
 proxy = ast.ClassDef(name="Proxy", bases=[], keywords=[], body=methods, decorator_list=[])
 module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *classes, proxy], type_ignores=[])
-namespace = {"dataclass": dataclass, "field": field, "math": math, "logger": SimpleNamespace(warning=lambda *a, **k: None), "relations_for_slice": relations.relations_for_slice, "select_relations": relations.select_relations, "map_relation_keys": relations.map_relation_keys}
+namespace = {"dataclass": dataclass, "field": field, "math": math, "logger": SimpleNamespace(warning=lambda *a, **k: None), "relations_for_slice": relations.relations_for_slice, "select_relations": relations.select_relations, "map_relation_keys": relations.map_relation_keys, "validate_tail_eviction_scope": relations.validate_tail_eviction_scope}
 exec(compile(ast.fix_missing_locations(module), str(ROOT / "ucm/integration/vllm/ucm_connector.py"), "exec"), namespace)
 namespace["UCMDirectConnector"] = namespace["Proxy"]
 namespace["UCMLayerWiseConnector"] = type("Layerwise", (), {})

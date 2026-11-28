@@ -196,6 +196,7 @@ public:
         }
         if (stopped) {
             task->Fail(Status::Error("load queue closed"));
+            task->relationLease.reset();
             failureSet_->Insert(task->id);
             waiter->Done();
             return;
@@ -203,6 +204,7 @@ public:
         UC_ERROR("Waiting queue full, submit load task({}) failed.", task->id);
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_queue_full_total"), 1.0);
         RecordFailedShards(task->desc.size());
+        task->relationLease.reset();
         failureSet_->Insert(task->id);
         waiter->Done();
     }
@@ -248,6 +250,7 @@ private:
         auto queueWaitMs = (NowTime::Now() - waiter->startTp) * 1e3;
         Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_queue_wait_duration_ms"), queueWaitMs);
         if (failureSet_->Contains(task->id)) {
+            task->relationLease.reset();
             waiter->Done();
             return;
         }
@@ -259,6 +262,9 @@ private:
             }
         }
         DispatchShards(task, waiter);
+        // The transfer stage owns pins for every dispatched shard. Parent
+        // relations no longer need a task reference once preallocation ends.
+        task->relationLease.reset();
         {
             std::lock_guard<std::mutex> lock(activeMutex_);
             activeTask_.reset();
@@ -450,7 +456,7 @@ private:
         }
         s = SynchronizeH2d(stream, task);
         RecordShardResults(holder_, &task, s.Success());
-        holder_.clear();
+        if (s.Success()) { holder_.clear(); }
         FinishShard(stream, std::move(task), s);
     }
     void DiscardFailedShard(ShardTask& task)
@@ -533,15 +539,24 @@ private:
         if (s.Failure()) [[unlikely]] {
             task.task->Fail(s);
             failureSet_->Insert(task.task->id);
-            ReleaseHolder(stream);
+            if (!ReleaseHolder(stream, task.bufferHandle.has_value()) && task.bufferHandle) {
+                task.bufferHandle->Quarantine();
+            }
         }
         if (task.waiter) { task.waiter->Done(); }
     }
-    void ReleaseHolder(StreamT& stream)
+    bool ReleaseHolder(StreamT& stream, bool currentMayBeInFlight = false)
     {
-        if (holder_.empty()) { return; }
-        stream.Synchronize();
+        if (holder_.empty() && !currentMayBeInFlight) { return true; }
+        const auto status = stream.Synchronize();
+        if (status.Failure()) {
+            UC_ERROR("Failed({}) to drain cache load stream; quarantining slots.", status);
+            for (auto& item : holder_) {
+                if (item.bufferHandle) { item.bufferHandle->Quarantine(); }
+            }
+        }
         holder_.clear();
+        return status.Success();
     }
     void RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
                             bool success)
@@ -616,6 +631,7 @@ private:
         TaskPair pair;
         while (waiting_.TryPop(pair)) {
             UC_WARN("Cache2 load task({}) discarded on close.", pair.first->id);
+            pair.first->relationLease.reset();
             failureSet_->Insert(pair.first->id);
             pair.second->Done();
         }

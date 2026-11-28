@@ -51,7 +51,7 @@ TEST(UCCache2CopyConfigTest, DefaultsFollowRuntime)
     EXPECT_TRUE(config.Validate().Success());
 }
 
-TEST(UCCache2CopyConfigTest, TailEvictionRequestFailsClosed)
+TEST(UCCache2CopyConfigTest, TailEvictionIsOptIn)
 {
     auto dict = MakeWorkerConfig();
     EXPECT_FALSE(UC::Cache2::Config::From(dict).enableDramTailEviction);
@@ -59,7 +59,7 @@ TEST(UCCache2CopyConfigTest, TailEvictionRequestFailsClosed)
     EXPECT_TRUE(UC::Cache2::Config::From(dict).enableDramTailEviction);
     std::unique_ptr<UC::StoreV1> store(MakeCacheStore());
     ASSERT_NE(store, nullptr);
-    EXPECT_EQ(store->Setup(dict), UC::Status::Unsupported());
+    EXPECT_FALSE(store->SupportsBlockRelations());
 }
 
 TEST(UCCache2CopyConfigTest, HmaFaAggregationDefaultRespectsRuntime)

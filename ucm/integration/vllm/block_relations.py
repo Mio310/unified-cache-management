@@ -12,12 +12,8 @@ from collections.abc import Callable, Iterable, Sequence
 BlockRelation = tuple[bytes, bytes | None]
 
 
-def validate_tail_eviction_config(launch_config: dict) -> None:
-    """Reject attempts to enable the unfinished Store protocol at startup.
-
-    Keep the opt-in at the connector level so scheduler and workers observe the
-    same setting. In particular, never silently run CLOCK when it is requested.
-    """
+def validate_tail_eviction_config(launch_config: dict) -> bool:
+    """Validate the connector-wide opt-in before scheduler/worker startup."""
     key = "enable_dram_tail_eviction"
     for connector in launch_config.get("ucm_connectors", []):
         if key in connector.get("ucm_connector_config", {}):
@@ -26,10 +22,38 @@ def validate_tail_eviction_config(launch_config: dict) -> None:
     if not isinstance(enabled, bool):
         raise ValueError(f"{key} must be a boolean")
     if enabled:
-        raise RuntimeError(
-            "enable_dram_tail_eviction is not supported yet: the shared Store "
-            "metadata and slot eviction protocol are incomplete"
-        )
+        connectors = launch_config.get("ucm_connectors", [])
+        if len(connectors) != 1:
+            raise ValueError(f"{key} requires exactly one UcmPipelineStore")
+        connector = connectors[0]
+        pipeline = connector.get("ucm_connector_config", {}).get("store_pipeline")
+        if connector.get("ucm_connector_name") != "UcmPipelineStore" or pipeline not in {
+            "Cache", "Cache|Posix", "Cache|Empty", "Cache|Fake"
+        }:
+            raise ValueError(f"{key} does not support this store pipeline")
+    return enabled
+
+
+def validate_tail_eviction_scope(parallel_config, kv_cache_config=None) -> None:
+    if getattr(parallel_config, "pipeline_parallel_size", 1) != 1:
+        raise ValueError("tail eviction does not support pipeline parallelism")
+    for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+        if getattr(parallel_config, name, 1) != 1:
+            raise ValueError("tail eviction does not support context parallelism")
+    for group in getattr(kv_cache_config, "kv_cache_groups", ()) or ():
+        spec = getattr(group, "kv_cache_spec", None)
+        specs = [spec, *(getattr(spec, "kv_cache_specs", {}) or {}).values()]
+        if any(
+            any(cls.__name__ == "MambaSpec" for cls in type(item).__mro__)
+            for item in specs
+        ):
+            raise ValueError("tail eviction does not support Mamba cache")
+
+
+def apply_tail_eviction_store_config(launch_config: dict, store_config: dict) -> None:
+    """Forward the switch only for the explicitly enabled path."""
+    if launch_config.get("enable_dram_tail_eviction", False):
+        store_config["enable_dram_tail_eviction"] = True
 
 
 def _deduplicate(relations: Iterable[BlockRelation]) -> dict[bytes, bytes | None]:

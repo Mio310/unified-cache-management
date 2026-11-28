@@ -45,10 +45,12 @@ from vllm.v1.request import RequestStatus
 import ucm.integration.vllm.request_hasher as request_hasher_module
 from ucm.integration.vllm.block_relations import (
     BlockRelation,
+    apply_tail_eviction_store_config,
     map_relation_keys,
     relations_for_slice,
     select_relations,
     validate_tail_eviction_config,
+    validate_tail_eviction_scope,
 )
 from ucm.integration.vllm.cache_config import (
     cache_rank_count,
@@ -1709,9 +1711,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self.launch_config = ucm_config.get_config()
-        validate_tail_eviction_config(self.launch_config)
-        # Internal only until the Store's strict eviction protocol is complete.
-        self._tail_relations_enabled = False
+        self._tail_relations_enabled = validate_tail_eviction_config(self.launch_config)
+        self.cp_world_size = 1
+        if self._tail_relations_enabled:
+            self._validate_tail_scope()
         _apply_cuda_indexer_io_config(
             self.launch_config,
             kv_cache_config,
@@ -1895,6 +1898,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         name = self.connector_configs[0]["ucm_connector_name"]
         module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
         config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
+        apply_tail_eviction_store_config(self.launch_config, config)
         config.setdefault("share_buffer_enable", self.is_mla)
         config["local_rank_size"] = self._get_world_size()
         self._configure_numa_placement(config)
@@ -2414,8 +2418,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
             raise ValueError("tail relations do not support this connector")
         if self.cp_world_size != 1:
             raise ValueError("tail relations do not support context parallelism")
-        if self._vllm_config.parallel_config.pipeline_parallel_size != 1:
-            raise ValueError("tail relations do not support pipeline parallelism")
+        validate_tail_eviction_scope(
+            self._vllm_config.parallel_config, getattr(self, "_kv_cache_config", None)
+        )
 
     def _store_block_relations(
         self, relations: list[BlockRelation] | None, block_ids: list[bytes]
@@ -3847,7 +3852,13 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id.rsplit("_dp", 1)[0]
         self.launch_config = ucm_config.get_config()
-        validate_tail_eviction_config(self.launch_config)
+        tail_enabled = validate_tail_eviction_config(self.launch_config)
+        if tail_enabled:
+            validate_tail_eviction_scope(vllm_config.parallel_config, kv_cache_config)
+            if self.launch_config.get("use_lite", False) or self.launch_config.get(
+                "use_inference_duration_monitor", False
+            ):
+                raise ValueError("tail eviction does not support this connector")
         _apply_cuda_indexer_io_config(
             self.launch_config,
             kv_cache_config,

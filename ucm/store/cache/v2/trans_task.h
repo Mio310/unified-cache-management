@@ -44,7 +44,8 @@ struct Task {
           type{other.type},
           desc{std::move(other.desc)},
           failureStatus{other.failureStatus.load()},
-          cancelled{other.cancelled.load()}
+          cancelled{other.cancelled.load()},
+          relationLease{std::move(other.relationLease)}
     {
     }
 
@@ -53,6 +54,10 @@ struct Task {
     Detail::TaskDesc desc;
     std::atomic<int32_t> failureStatus{Status::OK().Underlying()};
     std::atomic_bool cancelled{false};
+    // Keeps all parent relations registered until the dispatcher has acquired
+    // its last slot (including preallocations). Type-erased to keep Task
+    // independent of Buffer and its test doubles.
+    std::shared_ptr<void> relationLease{};
 
     void Fail(const Status& status)
     {

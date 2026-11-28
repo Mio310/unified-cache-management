@@ -138,6 +138,25 @@ TEST(TailMetadataTest, StaleEvictionAttemptCannotControlNextAttempt)
     EXPECT_EQ(f.metadata.GetStats().shards, 0u);
 }
 
+TEST(TailMetadataTest, SnapshotCopiesAllShardsOnlyForCurrentEviction)
+{
+    Fixture f(1, 3);
+    M::Ref node, selected;
+    ASSERT_EQ(f.metadata.Register(Id(1), {}, true, node), M::Result::Ok);
+    ASSERT_EQ(f.metadata.AddShard(node, 10, 0), M::Result::Ok);
+    ASSERT_EQ(f.metadata.AddShard(node, 20, 1), M::Result::Ok);
+    ASSERT_EQ(f.metadata.AddShard(node, 30, 2), M::Result::Ok);
+    ASSERT_EQ(f.metadata.Select(0, 2, false, selected), M::Result::Ok);
+    std::vector<M::Shard> shards;
+    ASSERT_EQ(f.metadata.GetShards(selected, shards), M::Result::Ok);
+    ASSERT_EQ(shards.size(), 3u);
+    EXPECT_EQ(shards[0].slot, 30u);
+    EXPECT_EQ(shards[1].slot, 20u);
+    EXPECT_EQ(shards[2].slot, 10u);
+    EXPECT_EQ(f.metadata.AbortEvict(selected), M::Result::Ok);
+    EXPECT_EQ(f.metadata.GetShards(selected, shards), M::Result::Invalid);
+}
+
 TEST(TailMetadataTest, ConcurrentChildAdmissionAndParentSelectionAreExclusive)
 {
     for (int iteration = 0; iteration < 128; ++iteration) {
